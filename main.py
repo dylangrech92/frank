@@ -6,6 +6,7 @@ import sys
 
 from agent import handle_user_message
 from config import Config, load as config_load
+from lsp.manager import LSPManager, LSPUnavailableError
 from llm import LLMClient
 from session import Session
 from runtime.process import reap_all
@@ -43,6 +44,9 @@ SYSTEM_PROMPT = (
     "Answer conversationally otherwise."
 )
 
+# Module-level handle to the LSP manager so tools can reach it later.
+MANAGER: LSPManager | None = None
+
 
 # =============================================================================
 # Main
@@ -77,6 +81,11 @@ def main() -> None:
     session = Session(project_root, cfg.llm.model, SYSTEM_PROMPT)
     session_start_jobs(session)
 
+    global MANAGER
+    MANAGER = LSPManager(cfg.language_servers, project_root)
+    for line in MANAGER.prewarm():
+        print(line, file=sys.stderr)
+
     print(
         f"Starting coding-agent on model '{session.model}' "
         f"with transcript at {session.transcript_path}",
@@ -109,6 +118,9 @@ def main() -> None:
             f'Reaped {len(reaped)} background process(es).',
             file=sys.stderr,
         )
+
+    if MANAGER is not None:
+        MANAGER.shutdown_all()
 
     session_end_jobs(session)
 

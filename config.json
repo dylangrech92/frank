@@ -9,5 +9,14 @@
   },
   "git": {
     "allow_destructive": false
+  },
+  "language_servers": {
+    "python":     {"command": ["pyright-langserver", "--stdio"]},
+    "javascript": {"command": ["typescript-language-server", "--stdio"]},
+    "typescript": {"command": ["typescript-language-server", "--stdio"]},
+    "php":        {"command": ["intelephense", "--stdio"]},
+    "html":       {"command": ["vscode-html-language-server", "--stdio"]},
+    "css":        {"command": ["vscode-css-language-server", "--stdio"]},
+    "scss":       {"command": ["vscode-css-language-server", "--stdio"]}
   }
 }
