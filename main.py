@@ -8,6 +8,7 @@ from agent import handle_user_message
 from config import Config, load as config_load
 from llm import LLMClient
 from session import Session
+from runtime.process import reap_all
 from tools.registry import discover
 
 
@@ -100,6 +101,13 @@ def main() -> None:
         except Exception as exc:
             print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)
             continue
+
+    reaped = reap_all()
+    if reaped:
+        print(
+            f'Reaped {len(reaped)} background process(es).',
+            file=sys.stderr,
+        )
 
     session_end_jobs(session)
 
