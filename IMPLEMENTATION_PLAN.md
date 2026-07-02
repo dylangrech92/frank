@@ -1,0 +1,21 @@
+# coding_agent — Implementation Plan (v3, adversarially verified)
+
+The plan is split into one file per phase under `plan/`. Start with the overview — it holds the ordering rationale, live-test conventions, Chalie lift map, coverage matrix, fixture manifest, settled spec deviations, and the standard Definition of Done that every phase inherits.
+
+- [§0 Overview — rationale, conventions, lift map, coverage, DoD](plan/phase-00-overview.md)
+- [Phase 1 — Conversational skeleton](plan/phase-01-conversational-skeleton.md)
+- [Phase 2 — Sandboxed workspace: file explorer + find/replace](plan/phase-02-sandboxed-workspace-file-explorer-find-replace.md)
+- [Phase 3 — Terminal, processes & git](plan/phase-03-terminal-processes-git.md)
+- [Phase 4 — LSP spine & live diagnostics](plan/phase-04-lsp-spine-live-diagnostics.md)
+- [Phase 5 — Code navigation fleet](plan/phase-05-code-navigation-fleet.md)
+- [Phase 6 — Refactor & fix: workspace edits + formatting](plan/phase-06-refactor-fix-workspace-edits-formatting.md)
+- [Phase 7 — Test explorer + web tools](plan/phase-07-test-explorer-web-tools.md)
+- [Phase 8 — Debugger core (DAP + debugpy)](plan/phase-08-debugger-core-dap-debugpy.md)
+- [Phase 9 — Debugger adapters I: PHP via Xdebug](plan/phase-09-debugger-adapters-i-php-via-xdebug.md)
+- [Phase 10 — Debugger adapters II: JS via js-debug](plan/phase-10-debugger-adapters-ii-js-via-js-debug.md)
+- [Phase 11 — Context economy: pruned assembly + reactive compaction](plan/phase-11-context-economy-pruned-assembly-reactive-compaction.md)
+- [Phase 12 — Memory foundation + atomic recall](plan/phase-12-memory-foundation-atomic-recall.md)
+- [Phase 13 — Episodic memory](plan/phase-13-episodic-memory.md)
+- [Phase 14 — Data-graph memory](plan/phase-14-data-graph-memory.md)
+- [Phase 15 — Flashback, Mem0 extraction & session boundaries](plan/phase-15-flashback-mem0-extraction-session-boundaries.md)
+- [Phase 16 — Whole-system hardening sweep](plan/phase-16-whole-system-hardening-sweep.md)
