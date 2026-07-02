@@ -11,6 +11,120 @@ from typing import Any
 from tools.base import Tool
 from tools.result import ToolResult
 
+_PY_TYPE_MAP: dict[str, type] = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def validate_arguments(tool: Tool, arguments: dict[str, Any]) -> str | None:
+    """Validate *arguments* against the tool's JSON Schema ``parameters``.
+
+    Checks three things:
+
+    1. **Unknown keys rejected** — every key in *arguments* must appear in the
+       schema's ``properties`` mapping.  Unknown keys produce a message naming
+       the bad key followed by `` (allowed: ...)`` with the allowed parameter
+       names listed.
+
+    2. **Required keys checked** — every name in the schema's ``required`` list
+       must be present in *arguments*.  Missing ones produce a message listing
+       all the missing keys and their declared types.
+
+    3. **Type checking** — each provided value is checked against the declared
+       JSON Schema ``type`` for that property, using the mapping below::
+
+          string       → str
+          integer      → int (rejects bool)
+          number       → int or float (rejects bool)
+          boolean      → bool
+          array        → list
+          object       → dict
+
+       Mismatches are rejected with a message naming the parameter, the expected
+       JSON Schema type, and the actual Python type name.
+
+    Returns:
+        ``None`` when arguments are valid, or an error-message string when
+        one or more checks fail (the first failure encountered).
+    """
+    schema: dict = tool.parameters
+    properties: dict[str, Any] = schema.get("properties", {})
+    required: list[str] | None = schema.get("required")
+
+    # 1. Unknown keys
+    allowed_params = list(properties.keys())
+    for key in arguments:
+        if key not in properties:
+            return (
+                f"unknown parameter '{key}'; "
+                f"allowed parameters are {', '.join(allowed_params)}"
+            )
+
+    # 2. Missing required keys
+    if required:
+        missing = [name for name in required if name not in arguments]
+        if missing:
+            parts = [f"{name!r}" for name in missing]
+            type_parts = []
+            for name in missing:
+                param_schema = properties.get(name, {})
+                ptype = param_schema.get("type")
+                if ptype:
+                    type_parts.append(f"({ptype})")
+                else:
+                    type_parts.append("(unknown)")
+            return (
+                f"missing required parameter(s) "
+                f"{', '.join(parts)} {''.join(type_parts)}"
+            )
+
+    # 3. Type validation
+    for key, value in arguments.items():
+        prop_schema = properties.get(key, {})
+        expected_type_str: str | None = prop_schema.get("type")
+        if expected_type_str is None:
+            continue
+
+        python_types = _PY_TYPE_MAP.get(expected_type_str)
+        if python_types is None:
+            continue
+
+        # reject bool for integer/number (bool is subclass of int in Python)
+        if expected_type_str == "integer":
+            if isinstance(value, bool) or not isinstance(value, int):
+                return (
+                    f"parameter '{key}' must be {expected_type_str}, "
+                    f"got {type(value).__name__}"
+                )
+
+        elif expected_type_str == "number":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return (
+                    f"parameter '{key}' must be {expected_type_str}, "
+                    f"got {type(value).__name__}"
+                )
+
+        else:
+            expected_python = python_types
+            if not isinstance(value, expected_python):
+                singular_type = str(expected_python).split(".")[-1].strip("()'")
+                # Handle tuple display like "(int, float)"
+                if "," in singular_type:
+                    type_display = f"{{{expected_type_str} types}}"
+                else:
+                    type_display = f"{expected_type_str}"
+                return (
+                    f"parameter '{key}' must be {type_display}, "
+                    f"got {type(value).__name__}"
+                )
+
+    return None
+
 # populated by discover() — one instance of each concrete tool class
 _registry: dict[str, "Tool"] = {}
 
@@ -76,10 +190,15 @@ def schemas() -> list[dict[str, Any]]:
 
 
 def dispatch(name: str, arguments: dict[str, Any]) -> ToolResult:
-    """Look up tool *name*, call ``run(**arguments)``, and return the result.
+    """Look up tool *name*, validate and call ``run(**arguments)``, and return the result.
 
-    All exceptions from an unknown or a crashed tool are captured as errors;
-    nothing escapes this function.
+    Validation proceeds in three stages before execution: (1) unknown parameter keys
+    are rejected, (2) missing required keys are rejected, and (3) each value is checked
+    against the declared JSON Schema type.  Any validation failure returns a
+    ``bad-arguments`` error immediately without calling ``run``.
+
+    When arguments pass validation the tool's ``run()`` is invoked; all exceptions from
+    an unknown or a crashed tool are captured as errors — nothing escapes this function.
 
     Args:
         name: Registered tool name.
@@ -99,6 +218,14 @@ def dispatch(name: str, arguments: dict[str, Any]) -> ToolResult:
             f"unknown tool: {name!r}",
             code="unknown-tool",
             hint=hint,
+        )
+
+    # Validate arguments against the tool's JSON Schema before execution
+    validation_error = validate_arguments(tool, arguments)
+    if validation_error is not None:
+        return ToolResult.err(
+            validation_error,
+            code="bad-arguments",
         )
 
     # run every tool -- call and catch exceptions
