@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import os
 import shlex
 import subprocess
 from pathlib import Path
 from typing import Any
-
-import json
 
 from tools.base import Tool
 from tools.result import ToolResult
@@ -40,17 +40,19 @@ DESTRUCTIVE_SUBCOMMANDS: frozenset[str] = frozenset(('reset', 'clean', 'restore'
 
 
 def _allow_destructive() -> bool:
-    """Read ``allow_destructive`` from the git section of *config.json* on every call.
+    """Read ``allow_destructive`` from the git section of the config file on every call.
 
-    Re-reads config.json each time so a config change takes effect on REPL relaunch.
+    The config file path is read from the ``CODING_AGENT_CONFIG`` environment variable
+    (set by main.py from the ``--config`` flag), falling back to ``config.json``.
+    Re-reads the config file each time so a config change takes effect on REPL relaunch.
 
     Returns:
-        True when the ``git.allow_destructive`` key in config.json is truthy;
+        True when the ``git.allow_destructive`` key in the config is truthy;
         False when the file, the git section, or the key is missing, or when an
         I/O / parse error occurs.
     """
     try:
-        config_path = Path('config.json')
+        config_path = Path(os.environ.get("CODING_AGENT_CONFIG", "config.json"))
         text = config_path.read_text(encoding='utf-8')
         data = json.loads(text)
     except (FileNotFoundError, json.JSONDecodeError, OSError):

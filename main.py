@@ -63,6 +63,7 @@ def main() -> None:
         help="Path to the config file (default: config.json)",
     )
     args = parser.parse_args()
+    os.environ["CODING_AGENT_CONFIG"] = os.path.abspath(args.config)
 
     try:
         cfg: Config = config_load(args.config)
