@@ -9,6 +9,7 @@ the loop body.
 import json
 import sys
 import time
+import compaction
 
 from llm import ChatResponse, LLMClient, OverCapError, ToolCall
 from session import Session
@@ -205,6 +206,7 @@ def handle_user_message(
     session: Session,
     client: LLMClient,
     verbose: bool = False,
+    compaction_cfg: dict | None = None,
 ) -> str:
     """Execute one agent turn in response to a user message.
 
@@ -241,8 +243,43 @@ def handle_user_message(
     session.append_user(text)
     flashback_maybe_seed(session)
 
+    window = client.config.context_limit
+    comp_cfg = compaction_cfg or {}
+    tool_schemas = schemas()
+    cap = compaction.compute_cap(window, comp_cfg)
+    max_compactions = 5
+    compactions = 0
+
+    def _over_cap_giveup() -> str:
+        msg = (
+            "Context is over the model's token budget and compaction could not "
+            "reduce it further. Start a new session or shorten the request."
+        )
+        session.append_assistant(msg)
+        return msg
+
     while True:
+        # Pre-flight: keep the assembled request at or below the shared cap,
+        # compacting older turns before the call is ever made.
         context = session.assemble_context()
+        est = compaction.estimate_tokens(context, tool_schemas)
+        print(
+            f"context: {len(context)} messages, ~{est} tokens (cap {cap})",
+            file=sys.stderr,
+        )
+        while est > cap:
+            if compactions >= max_compactions or not compaction.compact(
+                session, client, window, comp_cfg
+            ):
+                return _over_cap_giveup()
+            compactions += 1
+            context = session.assemble_context()
+            est = compaction.estimate_tokens(context, tool_schemas)
+            print(
+                f"context: {len(context)} messages, ~{est} tokens "
+                f"(cap {cap}) [post-compaction #{compactions}]",
+                file=sys.stderr,
+            )
 
         if verbose:
             msg_lines: list[str] = []
@@ -255,16 +292,15 @@ def handle_user_message(
             print("\n".join(msg_lines), file=sys.stderr)
 
         try:
-            response: ChatResponse = client.chat(context, schemas())
+            response: ChatResponse = client.chat(context, tool_schemas)
         except OverCapError:
-            cap_msg = (
-                "Context exceeded the model's token limit for this turn. "
-                "Aborting the current retry loop."
-            )
-            # A later phase replaces this branch with compact-then-retry to
-            # trim older messages, rebuild context, and retry the call.
-            session.append_assistant(cap_msg)
-            return cap_msg
+            # Provider rejected on length despite the estimate — compact and retry.
+            if compactions >= max_compactions or not compaction.compact(
+                session, client, window, comp_cfg
+            ):
+                return _over_cap_giveup()
+            compactions += 1
+            continue
 
         tool_calls: list[ToolCall] | None = (
             response.tool_calls if response.tool_calls else None

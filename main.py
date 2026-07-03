@@ -122,7 +122,7 @@ def main() -> None:
             break
 
         try:
-            assistant_text: str = handle_user_message(stripped, session, client, args.verbose)
+            assistant_text: str = handle_user_message(stripped, session, client, args.verbose, cfg.compaction)
             print(assistant_text)
         except Exception as exc:
             print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)
