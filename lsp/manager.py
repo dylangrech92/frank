@@ -87,6 +87,8 @@ class LSPManager:
         self._open_docs: dict[str, int] = {}
         # List of callables taking a URI string, invoked when a document must be purged.
         self._purge_callbacks: list[callable] = []
+        # Optional callback taking a client, invoked after client.initialize() succeeds.
+        self.on_client_start: callable | None = None
 
         # Wire LSPManager into the file-mutation event bus.
         from tools import _sandbox  # pylint: disable=import-outside-toplevel
@@ -182,6 +184,10 @@ class LSPManager:
         # Success: store under both the command cache and language-specific dict.
         self._clients[language] = client
         self._command_cache[cmd_key] = client
+
+        if self.on_client_start is not None:
+            self.on_client_start(client)
+
         return client
 
     def detect_languages(self) -> set[str]:

@@ -8,6 +8,7 @@ the loop body.
 
 import json
 import sys
+import time
 
 from llm import ChatResponse, LLMClient, OverCapError, ToolCall
 from session import Session
@@ -19,23 +20,111 @@ from tools.result import ToolResult
 # Extension hooks — four named no-op seams for later phases
 # =============================================================================
 
+# Module-level list tracking every mutation event since last ``diagnostics_inject_summary`` call.
+_TURN_MUTATIONS: list[dict] = []
+
+
+def _mutate_tracker(event: dict) -> None:
+    """Record a mutation event with its pre-mutation publish baseline.
+
+    Args:
+        event: A mutation event dict with at least ``kind`` and ``path`` keys.
+    """
+    record = dict(event)
+    try:
+        from diagnostics import STORE
+        from lsp.manager import path_to_uri
+
+        uri = path_to_uri(record.get("path", ""))
+        record["uri"] = uri
+        record["baseline"] = STORE.snapshot_counts([uri]).get(uri, 0)
+    except Exception:
+        pass
+    _TURN_MUTATIONS.append(record)
+
+
+from tools import _sandbox
+
+_sandbox.subscribe_mutations(_mutate_tracker)
+
+
+def diagnostics_inject_summary(session: Session) -> None:
+    """After a tool-mutation turn, append the LSP diagnostics summary via session.
+
+    Imports are performed lazily inside the function to avoid circular module
+    imports at load time.
+
+    The flow is:
+        1.  Take accumulated mutation events and clear the list.
+        2.  For each event whose kind is ``created``, ``changed`` or ``renamed``,
+            check that a running LSP server serves the file's language and that
+            the URI is in ``MANAGER._open_docs`` (i.e. an open document).
+            Collect all such URIs.
+        3.  Poll STORE until every collected URI has appeared in the diagnostics
+            store, up to a 2-second deadline.
+        4.  Call ``STORE.summary()`` and, when non-None, append the formatted
+            string to the last tool-result message via
+            ``session.amend_last_tool_result``.
+
+    Args:
+        session: Active ``Session`` holding the conversation transcript.
+    """
+    try:
+        from diagnostics import STORE
+        from lsp.manager import path_to_uri
+        import main as main_module
+
+        events = list(_TURN_MUTATIONS)
+        _TURN_MUTATIONS.clear()
+
+        if not events:
+            return
+
+        manager = main_module.MANAGER
+        seen_uris: set[str] = set()
+        filtered_uris: list[str] = []
+        baselines: dict[str, int] = {}
+
+        for event in events:
+            kind = event.get("kind")
+            path_val = event.get("path", "")
+
+            if kind not in ("created", "changed", "renamed"):
+                continue
+
+            if manager is None:
+                break
+
+            lang_id = manager.language_for_path(path_val)
+            if lang_id is None:
+                continue
+
+            uri_str = event.get("uri") or path_to_uri(path_val)
+            open_docs = getattr(manager, "_open_docs", {})
+
+            if uri_str in seen_uris or uri_str not in open_docs:
+                continue
+
+            seen_uris.add(uri_str)
+            filtered_uris.append(uri_str)
+            baselines[uri_str] = event.get("baseline", 0)
+
+        if filtered_uris:
+            STORE.wait_for_publish(filtered_uris, baselines, 2.0)
+
+        s = STORE.summary()
+        if s is not None:
+            session.amend_last_tool_result(s)
+
+    except Exception as exc:  # noqa: E722
+        print(f"diagnostics-inject-error: {exc}", file=sys.stderr, flush=True)
+
+
 def flashback_maybe_seed(session: Session) -> None:
     """Turn-zero memory recall injection seam (phase N).
 
     Reads long-term episodic memory and optionally seeds the session with
     retrieved context before processing the user's request.
-
-    Currently a no-op extension point.
-    """
-    pass
-
-
-def diagnostics_inject_summary(session: Session) -> None:
-    """Post-mutation diagnostics summary seam (phase N).
-
-    Inspects file-system or other side-effects produced during this session and
-    appends a diagnostics summary as an assistant message so the model remains
-    accurate about the world state.
 
     Currently a no-op extension point.
     """
@@ -65,7 +154,7 @@ def episodic_maybe_extract(session: Session) -> None:
 def render_tool_result(name: str, result: ToolResult) -> str:
     """Render a ``ToolResult`` value as plain text for a tool message content slot.
 
-    The rendered string follows this shape:
+    The rendered string follows this shape::
 
         [name(STATUS code=CODE)]       # error status with code
         [name(STATUS)]                  # success status, no code
@@ -136,7 +225,7 @@ def handle_user_message(
               - dispatch via registry (dispatch(name, arguments)).
               - echo rendered result to stderr via render_tool_result().
               - store append_tool_result(call.id, call.name, rendered_result).
-          iii. After all calls → diagnostics_inject_summary(session); continue loop.
+          iii. After all calls -> diagnostics_inject_summary(session); continue loop.
 
     Args:
         text: User message string to begin the turn with.
@@ -177,7 +266,9 @@ def handle_user_message(
             session.append_assistant(cap_msg)
             return cap_msg
 
-        tool_calls: list[ToolCall] | None = response.tool_calls if response.tool_calls else None
+        tool_calls: list[ToolCall] | None = (
+            response.tool_calls if response.tool_calls else None
+        )
         session.append_assistant(response.text or "", tool_calls=tool_calls)
 
         if not response.tool_calls:

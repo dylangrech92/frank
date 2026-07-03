@@ -11,6 +11,7 @@ from llm import LLMClient
 from session import Session
 from runtime.process import reap_all
 from tools.registry import discover
+from diagnostics import STORE
 
 
 # =============================================================================
@@ -83,6 +84,10 @@ def main() -> None:
 
     global MANAGER
     MANAGER = LSPManager(cfg.language_servers, project_root)
+    MANAGER.on_client_start = lambda client: client.on_notification(
+        "textDocument/publishDiagnostics", STORE.handle_publish
+    )
+    MANAGER.on_purge(STORE.purge)
     for line in MANAGER.prewarm():
         print(line, file=sys.stderr)
 

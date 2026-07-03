@@ -101,6 +101,22 @@ class Session:
         })
         self._persist()
 
+    def amend_last_tool_result(self, extra_text: str) -> None:
+        """Append *extra_text* to the last tool message content if one exists.
+
+        Only modifies the transcript when the final message in ``_messages`` has
+        role ``"tool"``.  No-op otherwise.
+
+        Args:
+            extra_text: Text to append (prefixed by a newline).
+        """
+        if not self._messages or self._messages[-1]["role"] != "tool":
+            return
+
+        existing = self._messages[-1]["content"]
+        self._messages[-1]["content"] = existing + "\n" + extra_text
+        self._persist()
+
     def assemble_context(self) -> List[Dict[str, str]]:
         """Return the list of message dicts to send to the LLM.
 
