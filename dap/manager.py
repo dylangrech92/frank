@@ -40,6 +40,9 @@ class DAPManager:
         self._synthesizers: dict[str, Any] = {}
         self._synthesizers["python"] = self._synthesize_python
         self._synthesizers["php"] = self._synthesize_php
+        self._synthesizers["javascript"] = self._synthesize_js
+        self._parent_client: DAPClient | None = None
+        self._server_proc = None
 
     @property
     def active(self) -> bool:
@@ -165,6 +168,10 @@ class DAPManager:
                 )
             if os.sep in tok and tok.rsplit(".", 1)[-1] in ("js", "py") and not os.path.exists(tok):
                 raise DebugUnavailableError(f"debug adapter script not found for {language}: {tok}")
+
+        if cmd_entry.get("transport") == "tcp":
+            return self._start_tcp_session(target, config, language, command)
+
         try:
             self._client = DAPClient.spawn_stdio(command, cwd=self._root, name=f"debug-{language}")
         except FileNotFoundError as exc:
@@ -297,6 +304,23 @@ class DAPManager:
             finally:
                 self._client = None
 
+        if self._parent_client is not None:
+            try:
+                self._parent_client.shutdown()
+            finally:
+                self._parent_client = None
+
+        if self._server_proc is not None:
+            try:
+                if self._server_proc.poll() is None:
+                    self._server_proc.terminate()
+                    try:
+                        self._server_proc.wait(timeout=3)
+                    except Exception:
+                        self._server_proc.kill()
+            finally:
+                self._server_proc = None
+
         self._thread_id = None
         self._frame_id = None
         self._frames = []
@@ -358,6 +382,109 @@ class DAPManager:
             "externalConsole": False,
         }
 
+    def _synthesize_js(self, target: str) -> dict:
+        """Build a js-debug (pwa-node) ``launch`` config from a *target* path.
+
+        js-debug runs as a TCP DAP server (the parent session); the actual Node
+        process stops in a child session opened via the ``startDebugging`` reverse
+        request, where breakpoints bind.
+        """
+        program = os.path.realpath(os.path.join(self._root, target)) if not os.path.isabs(target) else target
+        return {
+            "type": "pwa-node",
+            "request": "launch",
+            "name": "coding-agent-node",
+            "program": program,
+            "cwd": self._root,
+            "console": "internalConsole",
+            "stopOnEntry": False,
+        }
+
+    def _start_tcp_session(self, target, config, language, command) -> dict:
+        """Start a TCP DAP-server adapter (js-debug) and drive its parent/child flow.
+
+        Spawns ``command <port> 127.0.0.1`` as a DAP server, connects the parent
+        session, then answers the adapter's ``startDebugging`` reverse request by
+        opening the child session (same port) where breakpoints bind and Node stops.
+        The child is promoted to ``self._client`` so all debuggee operations
+        (breakpoints, control, evaluate, stack) target it.
+        """
+        import socket as _socket
+        import subprocess as _subprocess
+        import time as _time
+
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
+            _s.bind(("127.0.0.1", 0))
+            port = _s.getsockname()[1]
+        host = "127.0.0.1"
+
+        init_args = {
+            "clientID": "coding-agent",
+            "adapterID": language,
+            "linesStartAt1": True,
+            "columnsStartAt1": True,
+            "pathFormat": "path",
+            "supportsRunInTerminalRequest": True,
+            "supportsStartDebuggingRequest": True,
+        }
+
+        try:
+            self._server_proc = _subprocess.Popen(
+                list(command) + [str(port), host],
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+                cwd=self._root,
+            )
+        except FileNotFoundError as exc:
+            raise DebugUnavailableError(f"debug adapter binary not found: {command[0]}") from exc
+
+        deadline = _time.monotonic() + 15.0
+        while _time.monotonic() < deadline:
+            try:
+                with _socket.create_connection((host, port), timeout=0.5):
+                    break
+            except OSError:
+                if self._server_proc.poll() is not None:
+                    raise DebugUnavailableError(
+                        f"debug adapter server for {language} exited before listening"
+                    )
+                _time.sleep(0.2)
+        else:
+            raise DebugUnavailableError(
+                f"debug adapter server for {language} did not start listening"
+            )
+
+        parent = DAPClient.connect_tcp(host, port, name=f"debug-{language}-parent")
+        self._parent_client = parent
+        launch_config = config if config is not None else self._synthesize(target, language)
+
+        def _on_start_debugging(args: dict) -> dict:
+            child_cfg = args.get("configuration") or {}
+            child_req = args.get("request", "launch")
+            child = DAPClient.connect_tcp(host, port, name=f"debug-{language}-child")
+            child.on_event("stopped", lambda body: self._stop_queue.put(("stopped", body)))
+            child.on_event("terminated", lambda body: self._stop_queue.put(("terminated", body)))
+            child.on_event("exited", lambda body: None)
+            child.request("initialize", init_args, timeout=15.0)
+            cseq = child.send_request_nowait(child_req, child_cfg)
+            child.wait_event("initialized", timeout=15.0)
+            self._client = child
+            self._send_all_breakpoints()
+            child.request("configurationDone", {}, timeout=15.0)
+            child.get_response(cseq, timeout=20.0)
+            return {}
+
+        parent.on_reverse_request("startDebugging", _on_start_debugging)
+
+        caps = parent.request("initialize", init_args, timeout=15.0)
+        self._caps = caps
+        launch_seq = parent.send_request_nowait("launch", launch_config)
+        parent.wait_event("initialized", timeout=15.0)
+        parent.request("configurationDone", {}, timeout=15.0)
+        parent.get_response(launch_seq, timeout=20.0)
+
+        return self._await_stop(timeout=25.0)
+
     def _send_all_breakpoints(self) -> None:
         """Push all registered breakpoints to a live adapter."""
         for abspath in list(self._breakpoints):
@@ -398,7 +525,9 @@ class DAPManager:
             return {"state": "terminated", "reason": "terminated"}
 
         # stopped
-        self._thread_id = body.get("threadId") or self._thread_id
+        tid = body.get("threadId")
+        if tid is not None:
+            self._thread_id = tid
         st_body = self._client.request(
             "stackTrace",
             {"threadId": self._thread_id, "startFrame": 0, "levels": 20},
