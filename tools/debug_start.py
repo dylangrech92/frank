@@ -1,0 +1,90 @@
+"""debug_start tool — launch a debug session for a target script."""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from tools.base import Tool
+from tools.result import ToolResult
+from dap.manager import DebugUnavailableError
+
+
+def _format_stop(d: dict, root: str) -> str:
+    state = d.get("state")
+    if state == "terminated":
+        return "program terminated"
+    loc = d.get("location") or {}
+    f = loc.get("file")
+    ln = loc.get("line")
+    try:
+        rel = os.path.relpath(f, root) if f else "?"
+    except Exception:
+        rel = f or "?"
+    lines = [f"stopped ({d.get('reason','?')}) at {rel}:{ln}"]
+    stack = d.get("stack") or []
+    if stack:
+        lines.append("call stack (top first):")
+        for i, fr in enumerate(stack[:8]):
+            try:
+                frel = os.path.relpath(fr.get('file'), root) if fr.get('file') else '?'
+            except Exception:
+                frel = fr.get('file') or '?'
+            lines.append(f"  #{i} {fr.get('name','?')} at {frel}:{fr.get('line')}")
+    return "\n".join(lines)
+
+
+class DebugStart(Tool):
+    """Start a debug session for a target script (or a raw launch-config dict).
+
+    Runs to the first breakpoint or program end and reports where execution stopped,
+    with the call stack.
+    """
+
+    name = "debug_start"
+    description = (
+        'Start a debug session for a target script (or a raw launch-config dict). '
+        'Runs to the first breakpoint or program end and reports where execution stopped, '
+        'with the call stack.'
+    )
+    parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Path to the script to debug (relative to project root or absolute).",
+            },
+            "config": {
+                "type": "object",
+                "description": "A raw DAP launch-config dict (advanced; used instead of target).",
+            },
+            "language": {
+                "type": "string",
+                "default": "python",
+                "description": "Debug adapter language.",
+            },
+        },
+    }
+
+    def run(self, **kwargs: Any) -> ToolResult:
+        import main as main_module  # pylint: disable=import-outside-toplevel
+
+        if main_module.DEBUG_MANAGER is None:
+            return ToolResult.err(
+                "debugger not initialised",
+                code="debug-unavailable",
+            )
+
+        target = kwargs.get("target")
+        config = kwargs.get("config")
+        language = kwargs.get("language", "python")
+
+        try:
+            d = main_module.DEBUG_MANAGER.start(target=target, config=config, language=language)
+        except DebugUnavailableError as exc:
+            return ToolResult.err(str(exc), code="debug-adapter-unavailable")
+        except Exception as exc:
+            return ToolResult.err(f"debug session failed to start: {exc}", code="debug-error")
+
+        root = main_module.DEBUG_MANAGER._root
+        return ToolResult.ok(_format_stop(d, root), state=d.get("state", "?"))
