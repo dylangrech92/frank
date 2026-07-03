@@ -6,6 +6,7 @@ import sys
 
 from agent import handle_user_message
 from config import Config, load as config_load
+from dap.manager import DAPManager, DebugUnavailableError
 from lsp.manager import LSPManager, LSPUnavailableError
 from llm import LLMClient
 from session import Session
@@ -51,6 +52,9 @@ SYSTEM_PROMPT = (
 
 # Module-level handle to the LSP manager so tools can reach it later.
 MANAGER: LSPManager | None = None
+
+# Module-level handle to the DAP debug manager so tools/repl can drive debugging.
+DEBUG_MANAGER: DAPManager | None = None
 
 
 # =============================================================================
@@ -101,6 +105,9 @@ def main() -> None:
         file=sys.stderr,
     )
 
+    global DEBUG_MANAGER
+    DEBUG_MANAGER = DAPManager(cfg.debug_adapters, project_root)
+
     while True:
         try:
             text: str = input("> ")
@@ -130,6 +137,9 @@ def main() -> None:
 
     if MANAGER is not None:
         MANAGER.shutdown_all()
+
+    if DEBUG_MANAGER is not None and DEBUG_MANAGER.active:
+        DEBUG_MANAGER.stop()
 
     session_end_jobs(session)
 

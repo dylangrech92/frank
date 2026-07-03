@@ -19,5 +19,8 @@
     "html":       {"command": ["vscode-html-language-server", "--stdio"]},
     "css":        {"command": ["vscode-css-language-server", "--stdio"]},
     "scss":       {"command": ["vscode-css-language-server", "--stdio"]}
+  },
+  "debug_adapters": {
+    "python": {"command": ["python3", "-m", "debugpy.adapter"]}
   }
 }
