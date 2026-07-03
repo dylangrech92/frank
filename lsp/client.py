@@ -289,7 +289,11 @@ class LSPClient:
                     "hover": {"contentFormat": ["markdown", "plaintext"]},
                     "synchronization": {"didSave": True},
                 },
-                "workspace": {"configuration": True, "workspaceFolders": True},
+                "workspace": {
+                    "configuration": True,
+                    "workspaceFolders": True,
+                    "fileOperations": {"willRename": True},
+                },
             },
         }
 

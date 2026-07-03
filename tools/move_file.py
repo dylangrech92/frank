@@ -11,24 +11,55 @@ from tools.base import Tool
 from tools.result import ToolResult
 
 
-def pre_move_hook(source: Path, destination: Path) -> None:
-    """No-op seam for a later phase.
+def pre_move_hook(source: Path, destination: Path) -> list[str]:
+    """Fire workspace/willRenameFiles on the source file's language server and apply any returned import-fixing WorkspaceEdit before the filesystem move; returns human-readable note lines (edited files or a degrade warning), empty when there is nothing to report."""
+    try:
+        import main as main_module
 
-    A later phase wires the LSP workspace/prepareSupportDefaultBehavior =
-    true, workspace/preRenameFiles (or workspace/willRenameFiles) request
-    here so language servers can prepare import updates before the move takes
-    place.
+        if main_module.MANAGER is None:
+            return []
 
-    Args:
-        source: The resolved absolute source path.
-        destination: The resolved absolute destination path.
-    """
+        MANAGER = main_module.MANAGER
+        language = MANAGER.language_for_path(str(source))
+        if language is None:
+            return []
+
+        from lsp.manager import LSPUnavailableError, path_to_uri
+
+        try:
+            client = MANAGER.get_client(language)
+        except LSPUnavailableError:
+            return []
+
+        capabilities = client.server_capabilities.get('capabilities', {}).get('workspace', {}).get('fileOperations', {}).get('willRename') if isinstance(client.server_capabilities, dict) else None
+        if not capabilities:
+            return [f'note: the {language} language server does not support willRenameFiles; imports were NOT updated']
+
+        params = {'files': [{'oldUri': path_to_uri(str(source)), 'newUri': path_to_uri(str(destination))}]}
+        try:
+            result = client.request('workspace/willRenameFiles', params, timeout=10.0)
+        except Exception as exc:
+            return [f'note: willRenameFiles failed ({exc}); imports were NOT updated']
+
+        if result is None or (isinstance(result, dict) and not result.get('changes') and not result.get('documentChanges')):
+            return []
+
+        from lsp.edits import WorkspaceEditError, apply_workspace_edit
+
+        try:
+            files = apply_workspace_edit(result, str(Path.cwd()))
+        except WorkspaceEditError as exc:
+            return [f'note: could not apply import updates ({exc}); moving anyway']
+
+        return [f'updated imports in {rel}' for rel in files]
+    except Exception as exc:
+        return [f'note: import update skipped ({exc})']
 
 
 class MoveFile(Tool):
     """Moves or renames a file or directory inside the project.
 
-    Uses a plain filesystem move with no import fixing.  Both the source and
+    Uses a plain filesystem move that updates imports via the language server where supported.  Both the source and
     destination must be given as paths relative to the project root.  The
     source must exist and the destination must not already exist.
     """
@@ -36,7 +67,7 @@ class MoveFile(Tool):
     name = 'move_file'
     description = (
         'Moves or renames a file or directory inside the project (plain filesystem move, '
-        'no import fixing). Paths must be relative to the project root.'
+        'updates imports via the language server where supported). Paths must be relative to the project root.'
     )
     parameters: dict[str, Any] = {
         'type': 'object',
@@ -94,13 +125,16 @@ class MoveFile(Tool):
 
         resolved_destination.parent.mkdir(parents=True, exist_ok=True)
 
-        pre_move_hook(resolved_source, resolved_destination)
+        hook_notes = pre_move_hook(resolved_source, resolved_destination)
 
         shutil.move(str(resolved_source), str(resolved_destination))
 
         emit_mutation('renamed', resolved_destination, extra={'old_path': str(resolved_source)})
 
+        body = f'Moved {raw_source} -> {raw_destination}'
+        for note in hook_notes:
+            body += f'\n{note}'
         return ToolResult.ok(
-            f'Moved {raw_source} -> {raw_destination}',
+            body,
             path=raw_destination,
         )
