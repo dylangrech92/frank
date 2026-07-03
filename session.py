@@ -97,6 +97,12 @@ class Session:
         session_dir.mkdir(parents=True, exist_ok=True)
         self.transcript_path: Path = session_dir / f"{self.session_id}.json"
 
+        # Compaction watermark: when a summary is set, the first ``_summary_covers``
+        # entries of ``_messages`` are replaced by ``_summary`` in the ASSEMBLED
+        # view only. The on-disk transcript (_messages) always stays full-fidelity.
+        self._summary: str | None = None
+        self._summary_covers: int = 0
+
     def append_user(self, text: str) -> None:
         """Append a user message and persist.
 
@@ -161,6 +167,20 @@ class Session:
         self._messages[-1]["content"] = existing + "\n" + extra_text
         self._persist()
 
+    def set_summary(self, summary_text: str, covers_count: int) -> None:
+        """Install a compaction summary covering the first *covers_count* messages.
+
+        Affects the assembled view only — the on-disk transcript is never
+        rewritten, so nothing is persisted here.
+
+        Args:
+            summary_text: The six-section summary of the covered messages.
+            covers_count: Number of leading ``_messages`` entries the summary
+                replaces in the assembled view.
+        """
+        self._summary = summary_text
+        self._summary_covers = covers_count
+
     def assemble_context(self) -> List[Dict[str, str]]:
         """Return the list of message dicts to send to the LLM.
 
@@ -180,10 +200,24 @@ class Session:
 
         system_content = "\n\n".join(blocks)
 
-        return [
-            {"role": "system", "content": system_content},
-            *_prune_messages(self._messages),
+        result: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_content}
         ]
+
+        if self._summary:
+            result.append({
+                "role": "user",
+                "content": (
+                    "Summary of the earlier conversation "
+                    "(older turns compacted to fit context):\n\n" + self._summary
+                ),
+            })
+            tail = self._messages[self._summary_covers:]
+        else:
+            tail = self._messages
+
+        result.extend(_prune_messages(tail))
+        return result
 
     # ------------------------------------------------------------------ private
 
