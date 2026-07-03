@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,25 @@ def pre_move_hook(source: Path, destination: Path) -> list[str]:
         capabilities = client.server_capabilities.get('capabilities', {}).get('workspace', {}).get('fileOperations', {}).get('willRename') if isinstance(client.server_capabilities, dict) else None
         if not capabilities:
             return [f'note: the {language} language server does not support willRenameFiles; imports were NOT updated']
+
+        # Inferred-project servers (ts-ls) only consider open documents, so
+        # surface every same-language workspace file before asking for edits.
+        _skip_dirs = {'.git', 'node_modules', '__pycache__', '.coding_agent'}
+        opened = 0
+        for dirpath, dirnames, filenames in os.walk(str(Path.cwd())):
+            dirnames[:] = [d for d in dirnames if d not in _skip_dirs and not d.startswith('.')]
+            for fname in filenames:
+                fpath = os.path.join(dirpath, fname)
+                if MANAGER.language_for_path(fpath) != language:
+                    continue
+                if path_to_uri(fpath) in MANAGER._open_docs:
+                    continue
+                MANAGER._did_open(fpath)
+                opened += 1
+                if opened >= 30:
+                    break
+            if opened >= 30:
+                break
 
         params = {'files': [{'oldUri': path_to_uri(str(source)), 'newUri': path_to_uri(str(destination))}]}
         try:
