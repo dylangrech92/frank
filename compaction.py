@@ -195,7 +195,14 @@ def compact(session: "Session", client, window: int, compaction_cfg=None) -> boo
         {"role": "user", "content": material},
     ]
     response = client.chat(request, None)
-    summary_text = response.text or ""
+    summary_text = (response.text or "").strip()
+
+    # A blank summary (e.g. a reasoning model that emitted only hidden reasoning
+    # and no content) cannot reduce the context. Do not install it; report that
+    # compaction made no progress so the caller gives up honestly instead of
+    # silently looping on an empty, ignored summary.
+    if not summary_text:
+        return False
 
     session.set_summary(summary_text, cut)
     return True
