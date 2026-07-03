@@ -60,8 +60,7 @@ class DebugStart(Tool):
             },
             "language": {
                 "type": "string",
-                "default": "python",
-                "description": "Debug adapter language.",
+                "description": "Debug adapter language. If omitted, it is inferred from the target file extension (e.g. .py->python, .php->php, .js->javascript); an unknown extension yields no adapter and a clear refusal.",
             },
         },
     }
@@ -77,7 +76,20 @@ class DebugStart(Tool):
 
         target = kwargs.get("target")
         config = kwargs.get("config")
-        language = kwargs.get("language", "python")
+        language = kwargs.get("language")
+        if not language:
+            if isinstance(target, str) and target:
+                ext = os.path.splitext(target)[1].lstrip(".").lower()
+                language = {
+                    "py": "python",
+                    "php": "php",
+                    "js": "javascript",
+                    "mjs": "javascript",
+                    "cjs": "javascript",
+                    "ts": "typescript",
+                }.get(ext, ext or "python")
+            else:
+                language = "python"
 
         try:
             d = main_module.DEBUG_MANAGER.start(target=target, config=config, language=language)
