@@ -311,7 +311,7 @@ def run_pytest(
                 tests=[],
                 summary={"passed": 0, "failed": 0, "skipped": 0, "errors": 0, "total": 0},
                 output_tail=f"TIMED OUT after {timeout}s\n{fb_output.strip()[-2000:]}",
-                note="note: degraded pytest parse (pytest-json-report plugin unavailable) -- per-test durations unavailable",
+                note="degraded pytest parse (pytest-json-report plugin unavailable) -- per-test durations unavailable",
             )
 
         # Parse verbose lines.
@@ -398,7 +398,7 @@ def run_pytest(
             tests=tests_list,
             summary=parsed_statuses,
             output_tail=fb_output[-2000:],
-            note="note: degraded pytest parse (pytest-json-report plugin unavailable) -- per-test durations unavailable",
+            note="degraded pytest parse (pytest-json-report plugin unavailable) -- per-test durations unavailable",
         )
 
     except Exception as exc:
