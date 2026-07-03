@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import pathlib
+import urllib.parse
+import urllib.request
 from typing import Any
 
 from lsp.client import LSPClient
@@ -24,6 +26,32 @@ EXTENSION_LANGUAGES: dict[str, str] = {
     ".css": "css",
     ".scss": "scss",
 }
+
+
+def path_to_uri(path: str) -> str:
+    """Convert *path* to a ``file://`` URI.
+
+    Args:
+        path: Absolute file path on disk.
+
+    Returns:
+        A ``file://`` URI string for the resolved absolute path.
+    """
+    return pathlib.Path(path).resolve().as_uri()
+
+
+def uri_to_path(uri: str) -> str:
+    """Convert a ``file://`` URI back to an Absolute path string.
+
+    Args:
+        uri: A ``file://`` URI string.
+
+    Returns:
+        The resolved absolute file path string.
+    """
+    parts = urllib.parse.urlparse(uri)
+    path_component = parts.path
+    return urllib.request.url2pathname(path_component)
 
 
 class LSPUnavailableError(Exception):
@@ -55,6 +83,14 @@ class LSPManager:
         self._failed: dict[str, str] = {}
         # Internal cache keyed by tuple of command args to ensure shared instances.
         self._command_cache: dict[tuple[str, ...], LSPClient] = {}
+        # URI -> version number for open documents.
+        self._open_docs: dict[str, int] = {}
+        # List of callables taking a URI string, invoked when a document must be purged.
+        self._purge_callbacks: list[callable] = []
+
+        # Wire LSPManager into the file-mutation event bus.
+        from tools import _sandbox  # pylint: disable=import-outside-toplevel
+        _sandbox.subscribe_mutations(self.handle_mutation)
 
     # ------------------------------------------------------------------ public
 
@@ -70,11 +106,16 @@ class LSPManager:
         ext = pathlib.Path(path).suffix.lower()
         return EXTENSION_LANGUAGES.get(ext)
 
-    def get_client(self, language: str) -> LSPClient:
+    def get_client(self, language: str, *, spawn: bool = True) -> LSPClient:
         """Ensure a running client for *language*, returning it or raising ``LSPUnavailableError``.
 
         Args:
             language: The LSP language id (e.g. ``"python"``).
+            spawn: When ``True`` (default), spawns a new server process if none is
+                already cached or previously failed.  When ``False``, returns the
+                cached running client for *language* without spawning — raises
+                ``LSPUnavailableError`` with message ``"server not running for <lang>"``
+                when no pre-warmed or previously-requested client exists.
 
         Returns:
             An :class:`LSPClient` instance wired to the configured server process.
@@ -90,6 +131,9 @@ class LSPManager:
         # Failed earlier in this session — do not retry.
         if language in self._failed:
             raise LSPUnavailableError(self._failed[language])
+
+        if not spawn:
+            raise LSPUnavailableError(f"server not running for {language}")
 
         # Is this language even configured?
         config_entry = self._config_servers.get(language)
@@ -214,3 +258,167 @@ class LSPManager:
                 client.shutdown()
             except Exception:  # noqa: E722
                 pass
+
+    def on_purge(self, callback: callable) -> None:
+        """Register *callback* to be invoked with a URI whenever diagnostics must be discarded.
+
+        Args:
+            callback: A callable accepting a single URI string argument.
+        """
+        self._purge_callbacks.append(callback)
+
+    def _client_for_file(self, path: str) -> LSPClient | None:
+        """Return a running client for *path*, or ``None`` when no pre-warmed server exists.
+
+        Does **not** trigger a new server spawn for unmapped languages — uses ``spawn=False``
+        so that only pre-warmed and previously-requested servers receive document sync.
+
+        Args:
+            path: Absolute file path on disk.
+
+        Returns:
+            An :class:`LSPClient` instance, or ``None`` when the extension is unknown or
+            no server is running for that language.
+        """
+        language = self.language_for_path(path)
+        if language is None:
+            return None
+
+        try:
+            return self.get_client(language, spawn=False)
+        except LSPUnavailableError:
+            return None
+
+    def _did_open(self, path: str) -> None:
+        """Send ``textDocument/didOpen`` for *path* to its language server.
+
+        Also records the URI and version in ``_open_docs``.  Reads the file text from disk;
+        errors are silently ignored so a dead file never breaks an event branch.
+
+        Args:
+            path: Absolute file path on disk.
+        """
+        try:
+            text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+
+        uri = path_to_uri(path)
+        language = self.language_for_path(path)  # type: ignore[assignment]
+        self._open_docs[uri] = 1
+
+        client = self.get_client(language, spawn=False)
+        client.notify(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language,
+                    "version": 1,
+                    "text": text,
+                }
+            },
+        )
+
+    def _did_change(self, path: str) -> None:
+        """Send ``textDocument/didChange`` (full-document sync) for *path*.
+
+        Bumps the stored version number.  If the URI is not yet open delegates to ``_did_open``.
+
+        Args:
+            path: Absolute file path on disk.
+        """
+        uri = path_to_uri(path)
+        language = self.language_for_path(path)  # type: ignore[assignment]
+
+        if uri not in self._open_docs:
+            self._did_open(path)
+            return
+
+        self._open_docs[uri] += 1
+        n = self._open_docs[uri]
+
+        try:
+            text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+
+        client = self.get_client(language, spawn=False)
+        client.notify(
+            "textDocument/didChange",
+            {
+                "textDocument": {"uri": uri, "version": n},
+                "contentChanges": [{"text": text}],
+            },
+        )
+
+    def _did_close(self, path: str) -> None:
+        """Send ``textDocument/didClose`` for *path* and invoke purge callbacks.
+
+        Removes the URI from ``_open_docs`` if present.  **Always** calls every registered
+        purge callback with the URI because stale diagnostics may exist regardless of open state.
+
+        Args:
+            path: Absolute file path on disk.
+        """
+        uri = path_to_uri(path)
+        language = self.language_for_path(path)  # type: ignore[assignment]
+
+        if uri in self._open_docs:
+            del self._open_docs[uri]
+            client = self.get_client(language, spawn=False)
+            client.notify(
+                "textDocument/didClose",
+                {"textDocument": {"uri": uri}},
+            )
+
+        for callback in self._purge_callbacks:
+            try:
+                callback(uri)
+            except Exception:  # noqa: E722
+                pass
+
+    def handle_mutation(self, event: dict) -> None:
+        """Bus subscriber — route file-mutation events to the appropriate did* handler.
+
+        Matches the exact ``kind`` strings and ``extra`` payload keys emitted by the file tools:
+
+        * ``created`` -- from ``tools.create_file.CreateFile`` (no extra keys)
+        * ``changed`` -- from ``tools.update_file.UpdateFile`` (no extra keys)
+        * ``deleted`` -- from ``tools.delete_file.DeleteFile`` (no extra keys)
+        * ``renamed`` -- from ``tools.move_file.MoveFile`` with extra key **``old_path``**
+
+        Every branch is wrapped so an exception inside LSP sync never breaks the tool that
+        emitted the event; only a single stderr line is printed on failure.
+
+        Args:
+            event: A dict with at least ``kind`` (str) and ``path`` (str) keys.
+        """
+        kind = event["kind"]
+        path = event["path"]
+
+        try:
+            if kind == "created":
+                client = self._client_for_file(path)
+                if client is not None:
+                    self._did_open(path)
+
+            elif kind == "changed":
+                client = self._client_for_file(path)
+                if client is not None:
+                    self._did_change(path)
+
+            elif kind == "deleted":
+                self._did_close(path)
+
+            elif kind == "renamed":
+                old_path = event["extra"]["old_path"]
+
+                self._did_close(old_path)
+
+                post_client = self._client_for_file(path)
+                if post_client is not None:
+                    self._did_open(path)
+        except Exception as exc:  # noqa: E722
+            import sys
+            print(f"lsp-mutation-error: {exc}", file=sys.stderr, flush=True)
