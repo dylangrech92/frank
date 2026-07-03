@@ -13,6 +13,10 @@ from runtime.process import reap_all
 from tools.registry import discover
 from diagnostics import STORE
 
+# When run as a script this module is "__main__"; alias it as "main" so that
+# `import main` inside tools resolves to this running instance, not a copy.
+sys.modules.setdefault("main", sys.modules[__name__])
+
 
 # =============================================================================
 # Module-level hook hooks — no-op seams for later phases
