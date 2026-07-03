@@ -27,6 +27,50 @@ def _format_json(obj: Any) -> str:
     return json.dumps(obj, indent=2) + "\n"
 
 
+def _prune_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse completed prior turns to ``[user, final answer]`` for the sent view.
+
+    The in-flight turn — everything from the last ``user`` message onward — is
+    returned unchanged (full native scaffolding: assistant tool_calls and their
+    tool-result messages). Every completed turn before it keeps only its user
+    message and its final assistant answer (the assistant message with no tool
+    calls); tool-result messages and mid-chain assistant messages that carried
+    tool calls are dropped, and any ``tool_calls`` field is stripped from kept
+    messages so no dangling tool-call ids remain.
+
+    The input list is never mutated; kept messages are shallow-copied when a
+    field must be stripped.
+    """
+    if not messages:
+        return []
+
+    last_user = -1
+    for i, m in enumerate(messages):
+        if m.get("role") == "user":
+            last_user = i
+
+    # No user message yet: treat the whole thing as in-flight.
+    if last_user < 0:
+        return list(messages)
+
+    completed = messages[:last_user]
+    in_flight = messages[last_user:]
+
+    pruned: List[Dict[str, Any]] = []
+    for m in completed:
+        role = m.get("role")
+        if role == "user":
+            pruned.append(m)
+        elif role == "assistant" and not m.get("tool_calls") and m.get("content"):
+            # Final answer of a completed turn — keep without any tool_calls key.
+            if "tool_calls" in m:
+                m = {k: v for k, v in m.items() if k != "tool_calls"}
+            pruned.append(m)
+        # else: tool results and mid-chain (tool-calling / empty) assistants dropped.
+
+    return pruned + list(in_flight)
+
+
 class Session:
     """A conversation transcript stored with full fidelity on disk.
 
@@ -138,7 +182,7 @@ class Session:
 
         return [
             {"role": "system", "content": system_content},
-            *self._messages,
+            *_prune_messages(self._messages),
         ]
 
     # ------------------------------------------------------------------ private
