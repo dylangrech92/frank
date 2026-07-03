@@ -39,6 +39,7 @@ class DAPManager:
         self._stop_queue: queue.Queue = queue.Queue()
         self._synthesizers: dict[str, Any] = {}
         self._synthesizers["python"] = self._synthesize_python
+        self._synthesizers["php"] = self._synthesize_php
 
     @property
     def active(self) -> bool:
@@ -156,6 +157,14 @@ class DAPManager:
             self.stop()
 
         command = cmd_entry["command"]
+        for tok in command:
+            if "${" in tok:
+                raise DebugUnavailableError(
+                    f"debug adapter for {language} is not fully configured (unresolved {tok}); "
+                    f"set the required environment variable"
+                )
+            if os.sep in tok and tok.rsplit(".", 1)[-1] in ("js", "py") and not os.path.exists(tok):
+                raise DebugUnavailableError(f"debug adapter script not found for {language}: {tok}")
         try:
             self._client = DAPClient.spawn_stdio(command, cwd=self._root, name=f"debug-{language}")
         except FileNotFoundError as exc:
@@ -322,6 +331,31 @@ class DAPManager:
             "console": "internalConsole",
             "justMyCode": False,
             "stopOnEntry": False,
+        }
+
+    def _synthesize_php(self, target: str) -> dict:
+        """Build a vscode-php-debug ``launch`` config from a *target* path.
+
+        Uses Xdebug listen-mode: the adapter listens on ``port`` and the PHP
+        process (started by the adapter with the given ``runtimeArgs``) connects
+        back via ``xdebug.start_with_request``.
+        """
+        program = os.path.realpath(os.path.join(self._root, target)) if not os.path.isabs(target) else target
+        return {
+            "type": "php",
+            "request": "launch",
+            "program": program,
+            "cwd": self._root,
+            "runtimeExecutable": "php",
+            "runtimeArgs": [
+                "-dxdebug.mode=debug",
+                "-dxdebug.start_with_request=yes",
+                "-dxdebug.client_host=127.0.0.1",
+                "-dxdebug.client_port=9003",
+            ],
+            "port": 9003,
+            "stopOnEntry": False,
+            "externalConsole": False,
         }
 
     def _send_all_breakpoints(self) -> None:

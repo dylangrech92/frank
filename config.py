@@ -62,4 +62,16 @@ def load(path: str | Path = 'config.json') -> Config:
         if k in data and isinstance(data[k], dict):
             passthru[k] = data[k]
 
+    # Expand ~ and ${ENV} in debug-adapter command tokens so machine-specific
+    # adapter paths stay out of the committed config (env-var indirection).
+    import os as _os
+    adapters = passthru.get('debug_adapters')
+    if isinstance(adapters, dict):
+        for _lang, _entry in adapters.items():
+            if isinstance(_entry, dict) and isinstance(_entry.get('command'), list):
+                _entry['command'] = [
+                    _os.path.expanduser(_os.path.expandvars(_tok)) if isinstance(_tok, str) else _tok
+                    for _tok in _entry['command']
+                ]
+
     return Config(llm=llm, **passthru)
