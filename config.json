@@ -21,7 +21,8 @@
     "scss":       {"command": ["vscode-css-language-server", "--stdio"]}
   },
   "debug_adapters": {
-    "python": {"command": ["python3", "-m", "debugpy.adapter"]},
-    "php":    {"command": ["node", "${CODING_AGENT_PHP_ADAPTER}"]}
+    "python":     {"command": ["python3", "-m", "debugpy.adapter"]},
+    "php":        {"command": ["node", "${CODING_AGENT_PHP_ADAPTER}"]},
+    "javascript": {"command": ["node", "${CODING_AGENT_JS_ADAPTER}"], "transport": "tcp"}
   }
 }
