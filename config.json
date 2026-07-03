@@ -11,6 +11,7 @@
     "allow_destructive": false
   },
   "test_runners": {},
+  "compaction": {"reserve_ratio": 0.10, "reserve_min_tokens": 8000},
   "language_servers": {
     "python":     {"command": ["pyright-langserver", "--stdio"]},
     "javascript": {"command": ["typescript-language-server", "--stdio"]},
