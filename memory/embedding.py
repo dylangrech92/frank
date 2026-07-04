@@ -124,10 +124,14 @@ class EmbeddingService:
 
         if self._loaded:
             return True
+        if self._failed:
+            return False
 
         with self._lock:
             if self._loaded:
                 return True
+            if self._failed:
+                return False
             try:
                 # Resolve model path.
                 model_dir = None
