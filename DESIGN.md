@@ -259,7 +259,7 @@ Chalie runs a 5-minute idle "subconscious" worker; a session-based CLI has no su
 - **Decay is computed lazily at read-time** — it is a pure time formula, so no cron is needed; `retrieval_weight` is derived on recall from `last_relevant_at`.
 - **Eviction + fact-extraction** run at **session boundaries** (start and/or end).
 - **Episodic extraction** runs at **turn-end**, off-thread, count-gated.
-- **Injection** uses Chalie's **turn-0 flashback** pattern: two zero-LLM gates first (skip on terse messages < 8 tokens; skip on continuations where the message embedding is close to the recent-conversation centroid), then render a compact block — active Rules + top Decisions/Specs + ≤ 3 dated episode gists + ≤ 5 atoms — recorded as context the model reads before iteration 0.
+- **Injection** uses Chalie's **turn-0 flashback** pattern: two zero-LLM gates first (skip on terse messages < 8 tokens; skip on continuations where the message embedding is close to the recent-conversation centroid), then render a compact recall bundle — top Decisions/Specs + ≤ 3 dated episode gists + ≤ 5 atoms — that the model reads before iteration 0. Active **Rules** are injected separately and unconditionally by the always-on graph provider (they apply on *every* turn, gate or no gate); the flashback bundle reads them only to de-duplicate, never to re-emit. Both are stitched into the system message by the same `CONTEXT_PROVIDERS` seam, so the model sees rules + recall together.
 
 **LLM-facing memory tools:** `remember` / `recall` / `forget` (atoms + episodes) and the four `record_*` graph tools (+ optional `link_nodes`).
 
