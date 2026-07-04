@@ -489,3 +489,164 @@ def recall_facts(ctx: "MemoryContext", query: str, limit: int) -> list[dict]:
             pass  # Non-critical; ignore failures.
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Mem0-style auto-extractor: mine episode gists into durable facts
+# ---------------------------------------------------------------------------
+
+_EXTRACTOR_SYSTEM_PROMPT = """You maintain a project's long-term FACTS from what happened in a work session.
+
+You are given ONE episode gist (a short summary of a slice of work) and the existing facts most similar to it. Decide what durable, reusable facts about THIS project the gist establishes, and return operations against the facts store.
+
+Return ONLY a JSON array of operation objects (no prose, no markdown fences). Each object:
+{
+  "op": "ADD" | "UPDATE" | "DELETE" | "NOOP",
+  "kind": "project" | "convention",
+  "key": "short-stable-identifier",
+  "value": "the fact, stated atomically"
+}
+
+Rules:
+- ADD: a new durable fact not already present (e.g. "tests run via pytest", "web layer uses FastAPI").
+- UPDATE: the gist refines/corrects an existing fact -- reuse that fact's EXACT key so it supersedes the old value.
+- DELETE: an existing fact is now wrong/abandoned -- give its key (value may be empty).
+- NOOP: nothing durable to record (transient chatter, already-known facts). Return [{"op":"NOOP"}] or [].
+- kind is ALWAYS "project" (facts about this codebase) or "convention" (observed coding conventions). NEVER anything else.
+- Keys are short, stable, kebab-or-snake identifiers you can reuse later (e.g. "test-runner", "api-framework"). Reuse an existing key when refining it.
+- Prefer FEW high-value facts over many trivial ones. Do not restate facts already shown as existing unless correcting them."""
+
+
+_EXTRACTOR_KINDS = ("project", "convention")
+
+
+def _coerce_extractor_kind(raw) -> str:
+    """Clamp an auto-mined fact kind to a durable kind (never discovery/misc TTLs)."""
+    if isinstance(raw, str) and raw.strip().lower() in _EXTRACTOR_KINDS:
+        return raw.strip().lower()
+    return "convention"
+
+
+def _unmined_episodes(conn, limit: int) -> list:
+    """Return up to *limit* non-deleted episodes with no facts_extracted_at stamp."""
+    return conn.execute(
+        """
+        SELECT id, gist FROM episodes
+        WHERE facts_extracted_at IS NULL AND deleted_at IS NULL
+        ORDER BY created_at
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def extract_facts(ctx: "MemoryContext", client, *, limit: int = 25, now: str | None = None) -> dict:
+    """Mine unmined episode gists into durable facts via the LLM (Mem0-style).
+
+    For each episode with ``facts_extracted_at IS NULL``: show the gist plus the
+    most-similar existing facts, ask the model for ADD/UPDATE/DELETE/NOOP ops
+    (kind clamped to project/convention -- never a TTL kind), apply them through
+    the keyed bi-temporal ``remember``/``forget`` path, then stamp
+    ``facts_extracted_at`` so the episode is never re-mined. An LLM/parse failure
+    on one episode leaves it UNSTAMPED for a later retry and never writes.
+
+    Returns ``{"processed", "added", "updated", "deleted", "noop"}``.
+    """
+    import sys as _sys
+
+    now = now or _now_iso()
+    conn = ctx.store.conn
+    from memory.episodic import _safe_json_array
+
+    episodes = _unmined_episodes(conn, limit)
+    stats = {"processed": 0, "added": 0, "updated": 0, "deleted": 0, "noop": 0}
+
+    for ep in episodes:
+        eid = ep["id"]
+        gist = ep["gist"] or ""
+        if not gist.strip():
+            # Nothing to mine, but stamp so we skip it next time.
+            conn.execute("UPDATE episodes SET facts_extracted_at = ? WHERE id = ?", (now, eid))
+            conn.commit()
+            continue
+
+        # Show the model the most-similar existing facts (for UPDATE/DELETE/dedupe).
+        try:
+            existing = recall_facts(ctx, gist, 8)
+        except Exception:
+            existing = []
+        existing_block = "\n".join(
+            f'- kind={f.get("kind")} key={f.get("key")!r}: {f.get("value")}' for f in existing
+        ) or "(none)"
+
+        user_msg = (
+            f"Episode gist:\n{gist}\n\n"
+            f"Existing facts most similar to this gist:\n{existing_block}"
+        )
+        messages = [
+            {"role": "system", "content": _EXTRACTOR_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ]
+
+        # LLM call -- on failure, leave the episode UNSTAMPED and move on.
+        try:
+            resp = client.chat(messages, tools=None)
+            raw = resp.text
+        except Exception as exc:
+            print(f"extractor: episode {str(eid)[:8]} llm-error: {exc}", file=_sys.stderr, flush=True)
+            continue
+
+        ops = _safe_json_array(raw)  # unparseable -> [] -> counted as NOOP below
+
+        applied_any = False
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            action = str(op.get("op", "")).strip().upper()
+            key = op.get("key")
+            key = key.strip() if isinstance(key, str) else ""
+            value = op.get("value")
+            value = value if isinstance(value, str) else ""
+            kind = _coerce_extractor_kind(op.get("kind"))
+
+            if action in ("ADD", "UPDATE") and key and value.strip():
+                # Distinguish add vs update by whether a live row already holds this key.
+                pre = conn.execute(
+                    "SELECT 1 FROM facts WHERE kind=? AND key=? AND valid_to IS NULL AND active=1 AND deleted_at IS NULL",
+                    (kind, key),
+                ).fetchone()
+                try:
+                    remember(ctx, kind, key, value, now=now)
+                except Exception as exc:
+                    print(f"extractor: episode {str(eid)[:8]} write-error op={action} key={key!r}: {exc}", file=_sys.stderr, flush=True)
+                    continue
+                if pre is not None:
+                    stats["updated"] += 1
+                    print(f"extractor: episode {str(eid)[:8]} UPDATE kind={kind} key={key!r}", file=_sys.stderr, flush=True)
+                else:
+                    stats["added"] += 1
+                    print(f"extractor: episode {str(eid)[:8]} ADD kind={kind} key={key!r}", file=_sys.stderr, flush=True)
+                applied_any = True
+            elif action == "DELETE" and key:
+                try:
+                    n = forget(ctx, key, kind, now=now)
+                except Exception as exc:
+                    print(f"extractor: episode {str(eid)[:8]} delete-error key={key!r}: {exc}", file=_sys.stderr, flush=True)
+                    continue
+                if n:
+                    stats["deleted"] += n
+                    print(f"extractor: episode {str(eid)[:8]} DELETE kind={kind} key={key!r} ({n})", file=_sys.stderr, flush=True)
+                applied_any = True
+            else:
+                # NOOP or malformed -> no write.
+                print(f"extractor: episode {str(eid)[:8]} NOOP", file=_sys.stderr, flush=True)
+
+        if not applied_any:
+            stats["noop"] += 1
+
+        # Stamp the episode as mined (success path, even when the decision was NOOP).
+        conn.execute("UPDATE episodes SET facts_extracted_at = ? WHERE id = ?", (now, eid))
+        conn.commit()
+        stats["processed"] += 1
+
+    return stats
