@@ -319,30 +319,96 @@ def _soft_delete(store, episode_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _repair_json(text: str) -> str | None:
+    """Repair a truncated JSON array/object by closing brackets opened outside of
+    strings (after dropping a dangling trailing comma). Returns None when nothing
+    needs closing."""
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    backslash = chr(92)
+    for ch in text:
+        if escape:
+            escape = False
+            continue
+        if ch == backslash:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "[{":
+            stack.append(ch)
+        elif ch == "]":
+            if stack and stack[-1] == "[":
+                stack.pop()
+        elif ch == "}":
+            if stack and stack[-1] == "{":
+                stack.pop()
+    if not stack:
+        return None
+    repaired = text.rstrip()
+    if repaired.endswith(","):
+        repaired = repaired[:-1].rstrip()
+    closers = {"[": "]", "{": "}"}
+    for opener in reversed(stack):
+        repaired += closers[opener]
+    return repaired
+
+
 def _safe_json_array(raw: str) -> list:
-    """Best-effort parse of an LLM JSON array response."""
+    """Best-effort parse of an LLM JSON array response.
+
+    Tolerant of reasoning-model output: drops a leading think block, strips prose
+    and markdown fences around the JSON, isolates the first array/object, and
+    repairs a truncated (unclosed) array before parsing.
+    """
     text = raw.strip()
+
+    # Drop a reasoning-model think block: keep only what follows the closing tag.
+    close_tag = chr(60)+"/think"+chr(62)
+    if close_tag in text:
+        text = text.rsplit(close_tag, 1)[-1].strip()
+
     # Strip ```json / ``` fences if present.
     if text.startswith("```"):
-        lines = text.split("\n")
-        # Skip first fence line, find last fence line.
+        lines = text.splitlines()
+        newline = chr(10)
         for i in range(1, len(lines)):
             if lines[i].strip().startswith("```"):
-                text = "\n".join(lines[1:i])
+                text = newline.join(lines[1:i])
                 break
         else:
-            text = "\n".join(lines[1:])
+            text = newline.join(lines[1:])
+        text = text.strip()
 
-    try:
-        result = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
+    # Isolate the JSON payload from the first '[' or '{' onward (also drops any
+    # unclosed think block or prose preamble).
+    start = -1
+    for i, ch in enumerate(text):
+        if ch in "[{":
+            start = i
+            break
+    if start == -1:
         return []
+    text = text[start:].strip()
 
-    if isinstance(result, dict):
-        return [result]
-    if not isinstance(result, list):
+    # Try a strict parse first, then a bracket-repaired variant.
+    for candidate in (text, _repair_json(text)):
+        if candidate is None:
+            continue
+        try:
+            result = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(result, dict):
+            return [result]
+        if isinstance(result, list):
+            return result
         return []
-    return result
+    return []
 
 
 # ---------------------------------------------------------------------------
