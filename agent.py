@@ -126,14 +126,20 @@ def diagnostics_inject_summary(session: Session) -> None:
 
 
 def flashback_maybe_seed(session: Session) -> None:
-    """Turn-zero memory recall injection seam (phase N).
+    """Turn-zero memory recall injection seam.
 
-    Reads long-term episodic memory and optionally seeds the session with
-    retrieved context before processing the user's request.
-
-    Currently a no-op extension point.
+    Delegates to the flashback module, which decides -- via the terse and
+    continuation gates -- whether to seed a compact recalled-memory bundle onto
+    the session for this turn. The bundle (if any) is stashed on
+    ``session._flashback_block`` and injected by the flashback context provider;
+    it is never persisted to the transcript. Never raises.
     """
-    pass
+    try:
+        import memory.flashback as flashback
+
+        flashback.maybe_seed(session)
+    except Exception:
+        pass
 
 
 def episodic_maybe_extract(session: Session, client: LLMClient) -> None:

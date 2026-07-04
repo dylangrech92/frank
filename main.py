@@ -24,11 +24,14 @@ sys.modules.setdefault("main", sys.modules[__name__])
 # =============================================================================
 
 
-def session_start_jobs(session: Session) -> None:
+def session_start_jobs(session: Session, client: LLMClient) -> None:
     """Run once after the session is created.
 
-    Registers the active-rules context provider so every assembled context
-    carries the project's enforced rules.
+    Registers the always-on rules provider and the gated flashback provider, then
+    runs long-term-memory maintenance: evict stale episodes, purge expired TTL
+    facts, and mine any not-yet-extracted episode gists into durable facts (a
+    catch-up sweep for episodes left unmined by a prior session). Every step is
+    isolated so one failure never blocks session startup.
     """
     try:
         from memory.graph import register_graph_provider
@@ -37,10 +40,45 @@ def session_start_jobs(session: Session) -> None:
     except Exception:
         pass
 
+    try:
+        from memory.flashback import register_flashback_provider
 
-def session_end_jobs(session: Session) -> None:
-    """Run once when the REPL exits: block until the episodic write queue has
-    drained so an in-flight extraction from the final turn is not lost."""
+        register_flashback_provider()
+    except Exception:
+        pass
+
+    try:
+        from memory.recall import get_memory
+        import memory.episodic as episodic
+        import memory.atomic as atomic
+
+        ctx = get_memory(session.project_root)
+        try:
+            evicted = episodic.evict_episodes(ctx.store)
+            if evicted:
+                print(f"episodic: evicted {evicted} stale episode(s)", file=sys.stderr)
+        except Exception as exc:
+            print(f"session-start-evict-error: {exc}", file=sys.stderr)
+        try:
+            purged = atomic.purge_expired(ctx)
+            if purged:
+                print(f"facts: purged {purged} expired atom(s)", file=sys.stderr)
+        except Exception as exc:
+            print(f"session-start-purge-error: {exc}", file=sys.stderr)
+        try:
+            stats = atomic.extract_facts(ctx, client)
+            if stats.get("processed"):
+                print(f"facts: start-of-session extractor {stats}", file=sys.stderr)
+        except Exception as exc:
+            print(f"session-start-extract-error: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"session-start-memory-error: {exc}", file=sys.stderr)
+
+
+def session_end_jobs(session: Session, client: LLMClient) -> None:
+    """Run once when the REPL exits: drain the episodic write queue so an in-flight
+    extraction from the final turn is not lost, then mine the freshly-written
+    episodes into durable facts before shutdown."""
     try:
         import memory.episodic as episodic
         episodic.drain_and_join()
@@ -54,6 +92,17 @@ def session_end_jobs(session: Session) -> None:
             )
     except Exception as exc:
         print(f"session-end-episodic-error: {exc}", file=sys.stderr)
+
+    try:
+        from memory.recall import get_memory
+        import memory.atomic as atomic
+
+        ctx = get_memory(session.project_root)
+        stats = atomic.extract_facts(ctx, client)
+        if stats.get("processed"):
+            print(f"facts: end-of-session extractor {stats}", file=sys.stderr)
+    except Exception as exc:
+        print(f"session-end-extract-error: {exc}", file=sys.stderr)
 
 
 # =============================================================================
@@ -104,7 +153,7 @@ def main() -> None:
     discover()
     client = LLMClient(cfg.llm)
     session = Session(project_root, cfg.llm.model, SYSTEM_PROMPT)
-    session_start_jobs(session)
+    session_start_jobs(session, client)
 
     global MANAGER
     MANAGER = LSPManager(cfg.language_servers, project_root)
@@ -157,7 +206,7 @@ def main() -> None:
     if DEBUG_MANAGER is not None and DEBUG_MANAGER.active:
         DEBUG_MANAGER.stop()
 
-    session_end_jobs(session)
+    session_end_jobs(session, client)
 
 
 if __name__ == "__main__":
