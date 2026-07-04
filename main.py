@@ -27,9 +27,15 @@ sys.modules.setdefault("main", sys.modules[__name__])
 def session_start_jobs(session: Session) -> None:
     """Run once after the session is created.
 
-    Currently a no-op extension point.
+    Registers the active-rules context provider so every assembled context
+    carries the project's enforced rules.
     """
-    pass
+    try:
+        from memory.graph import register_graph_provider
+
+        register_graph_provider()
+    except Exception:
+        pass
 
 
 def session_end_jobs(session: Session) -> None:

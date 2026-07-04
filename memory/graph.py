@@ -381,3 +381,63 @@ def register_graph_layer() -> None:
     except Exception:
         return
     _graph_registered = True
+
+
+# ---------------------------------------------------------------------------
+# Active-rules context provider (seam #3): rules are injected into every
+# assembled context, never similarity-recalled.
+# ---------------------------------------------------------------------------
+
+
+def render_active_rules(ctx) -> str:
+    """Render all active ``rule`` nodes as an always-on context block.
+
+    Returns an empty string when there are no active rules. Exposed as a
+    standalone function so later phases (e.g. the flashback renderer) can compose
+    it directly without going through the provider.
+    """
+    rows = ctx.store.conn.execute(
+        "SELECT title, body FROM graph_nodes WHERE type='rule' AND active=1 "
+        "ORDER BY created_at"
+    ).fetchall()
+    if not rows:
+        return ""
+    lines = ["## Project rules (always enforced)"]
+    for r in rows:
+        title = (r["title"] or "").strip()
+        body = (r["body"] or "").strip()
+        if body:
+            lines.append(f"- {title}: {body}")
+        else:
+            lines.append(f"- {title}")
+    return "\n".join(lines)
+
+
+def _rules_context_provider(session) -> str:
+    """CONTEXT_PROVIDERS entry: inject active project rules into every context."""
+    try:
+        from memory.recall import get_memory
+
+        root = getattr(session, "project_root", None)
+        ctx = get_memory(str(root) if root is not None else None)
+        return render_active_rules(ctx)
+    except Exception:
+        return ""
+
+
+_provider_registered = False
+
+
+def register_graph_provider() -> None:
+    """Append the active-rules provider to session.CONTEXT_PROVIDERS (idempotent)."""
+    global _provider_registered
+    if _provider_registered:
+        return
+    try:
+        import session as _session_mod
+
+        if _rules_context_provider not in _session_mod.CONTEXT_PROVIDERS:
+            _session_mod.CONTEXT_PROVIDERS.append(_rules_context_provider)
+    except Exception:
+        return
+    _provider_registered = True
