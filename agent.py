@@ -22,7 +22,7 @@ from tools.result import ToolResult
 # =============================================================================
 
 # Module-level list tracking every mutation event since last ``diagnostics_inject_summary`` call.
-_TURN_MUTATIONS: list[dict] = []
+_TURN_MUTATIONS: list[dict] = {}
 
 
 def _mutate_tracker(event: dict) -> None:
@@ -42,6 +42,10 @@ def _mutate_tracker(event: dict) -> None:
     except Exception:
         pass
     _TURN_MUTATIONS.append(record)
+
+
+# Per-session episodic-extraction watermark (row count already handed to the encoder).
+_EPISODIC_WATERMARKS: dict[int, int] = {}
 
 
 from tools import _sandbox
@@ -132,15 +136,53 @@ def flashback_maybe_seed(session: Session) -> None:
     pass
 
 
-def episodic_maybe_extract(session: Session) -> None:
-    """End-of-turn episodic memory extraction seam (phase N).
+def episodic_maybe_extract(session: Session, client: LLMClient) -> None:
+    """End-of-turn episodic extraction: enqueue a transcript window for off-thread
+    encoding once enough new rows have accumulated past this session's watermark.
 
-    Analyzes the completed turn for patterns worth persisting to long-term
-    episodic memory and stores anything useful.
-
-    Currently a no-op extension point.
+    Non-blocking: it only measures the row count and hands a window to the episodic
+    write queue, then returns immediately so the REPL prompt never stalls.
     """
-    pass
+    try:
+        import memory.episodic as episodic
+    except Exception:
+        return
+
+    messages = session._messages
+    total = len(messages)
+    prev = _EPISODIC_WATERMARKS.get(id(session), 0)
+    new_rows = total - prev
+
+    # Emit the outcome of any PRIOR extraction that has since completed.
+    last = episodic.pop_last_run()
+    if last is not None:
+        print(
+            f"episodic: last extraction ran={last.get('ran')} "
+            f"stored={last.get('stored')} updated={last.get('updated')} "
+            f"deleted={last.get('deleted')} reason={last.get('reason')}",
+            file=sys.stderr,
+        )
+
+    if new_rows < episodic.GATE_N:
+        print(
+            f"episodic: gate skipped ({new_rows}/{episodic.GATE_N} new rows past watermark)",
+            file=sys.stderr,
+        )
+        return
+
+    # Advance the watermark and hand off the most-recent window for encoding.
+    _EPISODIC_WATERMARKS[id(session)] = total
+    start = max(0, total - episodic.EXTRACTION_WINDOW)
+    window = [(i, messages[i]) for i in range(start, total)]
+    try:
+        episodic.enqueue(str(session.project_root), window, client)
+        print(
+            f"episodic: enqueued window rows {start}..{total - 1} "
+            f"({new_rows} new past watermark)",
+            file=sys.stderr,
+        )
+    except Exception as exc:
+        print(f"episodic-enqueue-error: {exc}", file=sys.stderr)
 
 
 # The fourth hook — over-cap handling — lives directly in the ``handle_user_message``
@@ -308,7 +350,7 @@ def handle_user_message(
         session.append_assistant(response.text or "", tool_calls=tool_calls)
 
         if not response.tool_calls:
-            episodic_maybe_extract(session)
+            episodic_maybe_extract(session, client)
             return response.text
 
         for call in response.tool_calls:

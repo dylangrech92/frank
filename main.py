@@ -33,11 +33,21 @@ def session_start_jobs(session: Session) -> None:
 
 
 def session_end_jobs(session: Session) -> None:
-    """Run once when the REPL exits.
-
-    Currently a no-op extension point.
-    """
-    pass
+    """Run once when the REPL exits: block until the episodic write queue has
+    drained so an in-flight extraction from the final turn is not lost."""
+    try:
+        import memory.episodic as episodic
+        episodic.drain_and_join()
+        last = episodic.pop_last_run()
+        if last is not None:
+            print(
+                f"episodic: final extraction ran={last.get('ran')} "
+                f"stored={last.get('stored')} updated={last.get('updated')} "
+                f"deleted={last.get('deleted')} reason={last.get('reason')}",
+                file=sys.stderr,
+            )
+    except Exception as exc:
+        print(f"session-end-episodic-error: {exc}", file=sys.stderr)
 
 
 # =============================================================================
