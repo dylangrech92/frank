@@ -173,3 +173,211 @@ def record_pivot(ctx, title: str, why: str, supersedes: list[int]) -> int:
     except Exception:
         store.conn.rollback()
         raise
+
+
+# ---------------------------------------------------------------------------
+# Read path: similarity recall of decision/pivot/spec nodes + 1-hop expansion
+# ---------------------------------------------------------------------------
+
+_RECALL_TYPES = ("decision", "pivot", "spec")  # rules are always-injected, never similarity-recalled
+_EXPANSION_SCORE_FACTOR = 0.5
+_REL_FLOOR = 0.15
+
+_graph_registered = False
+
+
+def _fts_or_query(query: str) -> str:
+    """Build an FTS5 MATCH expression that ORs each quoted token (broad recall)."""
+    tokens = [t for t in query.replace('"', " ").split() if t]
+    if not tokens:
+        return '""'
+    return " OR ".join('"' + t + '"' for t in tokens)
+
+
+def _node_result(row, score: float, via: str) -> dict:
+    """Shape a graph_nodes row into the standard recall result dict."""
+    ntype = row["type"]
+    title = row["title"]
+    body = row["body"] or ""
+    active = row["active"]
+    superseded = row["superseded_at"] is not None
+    tag = " [superseded]" if superseded else ""
+    text = f"[{ntype}]{tag} {title}: {body}".rstrip()
+    return {
+        "layer": "graph",
+        "id": row["id"],
+        "kind": ntype,
+        "key": str(row["id"]),
+        "value": title,
+        "text": text,
+        "active": active,
+        "superseded": superseded,
+        "via": via,
+        "score": round(score, 6),
+    }
+
+
+def recall_graph(ctx, query: str, limit: int) -> list[dict]:
+    """Recall active decision/pivot/spec nodes matching *query*, then 1-hop expand.
+
+    Hybrid FTS(bm25) + vector(distance) scoring over active recall-type nodes; a
+    relative floor prunes weak hits. Each surviving hit is then expanded one hop
+    along graph_edges (either direction): the connected nodes -- INCLUDING
+    superseded ones -- are returned as history context at a reduced score. Rules
+    are never similarity-recalled (they are always injected via the context
+    provider). Returns primary hits followed by their 1-hop neighbours.
+    """
+    conn = ctx.store.conn
+
+    s_fts_map: dict[int, float] = {}
+    s_vec_map: dict[int, float] = {}
+
+    # --- FTS leg ---------------------------------------------------------
+    try:
+        fts_results = conn.execute(
+            "SELECT rowid, bm25(graph_nodes_fts) AS b FROM graph_nodes_fts "
+            "WHERE graph_nodes_fts MATCH ?",
+            (_fts_or_query(query),),
+        ).fetchall()
+        bm25_values = [r["b"] for r in fts_results]
+        if bm25_values:
+            b_min = min(bm25_values)
+            b_max = max(bm25_values)
+            for r in fts_results:
+                raw = r["b"]
+                s_fts = 1.0 if b_max == b_min else (b_max - raw) / (b_max - b_min)
+                s_fts_map[r["rowid"]] = max(0.0, min(1.0, float(s_fts)))
+    except Exception:
+        pass
+
+    # --- Vector leg ------------------------------------------------------
+    if ctx.store.vec_enabled and ctx.embedder.available:
+        qv = ctx.embedder.embed(query)
+        if qv is not None:
+            try:
+                import sqlite_vec
+
+                vec_bytes = sqlite_vec.serialize_float32(qv)
+                vec_results = conn.execute(
+                    "SELECT rowid, distance FROM graph_nodes_vec "
+                    "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+                    (vec_bytes, limit * 4),
+                ).fetchall()
+                dist_values = [r["distance"] for r in vec_results]
+                if dist_values:
+                    d_min = min(dist_values)
+                    d_max = max(dist_values)
+                    for r in vec_results:
+                        dist = r["distance"]
+                        if d_min == d_max:
+                            s_vec = 1.0 / (1.0 + abs(dist))
+                        else:
+                            normalised = (dist - d_min) / (d_max - d_min)
+                            s_vec = 1.0 - float(normalised) * 0.999
+                        s_vec_map[r["rowid"]] = max(0.0, min(1.0, s_vec))
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+    if not s_fts_map and not s_vec_map:
+        return []
+
+    all_ids = set(s_fts_map) | set(s_vec_map)
+    placeholders = ",".join(str(i) for i in all_ids)
+    active_types = ",".join("'" + t + "'" for t in _RECALL_TYPES)
+    node_map = {
+        r["id"]: r
+        for r in conn.execute(
+            f"SELECT id, type, title, body, extra, active, superseded_at "
+            f"FROM graph_nodes WHERE id IN ({placeholders}) "
+            f"AND active = 1 AND type IN ({active_types})"
+        ).fetchall()
+    }
+
+    relevance: dict[int, float] = {}
+    for nid in node_map:
+        s_val = max(s_fts_map.get(nid, 0.0), s_vec_map.get(nid, 0.0))
+        if s_val > 0:
+            relevance[nid] = s_val
+    if not relevance:
+        return []
+
+    max_rel = max(relevance.values())
+    threshold = _REL_FLOOR * max_rel if max_rel > 0 else 0.0
+    relevance = {nid: s for nid, s in relevance.items() if s >= threshold}
+
+    primary = sorted(relevance.items(), key=lambda x: x[1], reverse=True)[:limit]
+    primary_ids = {nid for nid, _ in primary}
+
+    results: list[dict] = [_node_result(node_map[nid], score, "direct") for nid, score in primary]
+
+    # --- 1-hop expansion (includes superseded nodes as history) ----------
+    expansion: dict[int, float] = {}
+    for nid, score in primary:
+        neighbours = conn.execute(
+            "SELECT CASE WHEN from_id=? THEN to_id ELSE from_id END AS other "
+            "FROM graph_edges WHERE from_id=? OR to_id=?",
+            (nid, nid, nid),
+        ).fetchall()
+        for nb in neighbours:
+            other = nb["other"]
+            if other in primary_ids:
+                continue
+            exp_score = score * _EXPANSION_SCORE_FACTOR
+            if exp_score > expansion.get(other, 0.0):
+                expansion[other] = exp_score
+
+    if expansion:
+        exp_ph = ",".join(str(i) for i in expansion)
+        exp_rows = {
+            r["id"]: r
+            for r in conn.execute(
+                f"SELECT id, type, title, body, extra, active, superseded_at "
+                f"FROM graph_nodes WHERE id IN ({exp_ph})"
+            ).fetchall()
+        }
+        for oid, exp_score in sorted(expansion.items(), key=lambda x: x[1], reverse=True):
+            row = exp_rows.get(oid)
+            if row is not None:
+                results.append(_node_result(row, exp_score, "1-hop"))
+
+    return results
+
+
+def forget_graph(ctx, key, kind: str | None = None) -> int:
+    """Deactivate (forget) a graph node by id. Returns the count invalidated.
+
+    *key* is the node id (int or its string form). When *kind* is supplied and the
+    node's type does not match it, nothing is invalidated (returns 0) so a forget
+    aimed at another layer's key is a no-op here.
+    """
+    try:
+        node_id = int(key)
+    except (TypeError, ValueError):
+        return 0
+
+    conn = ctx.store.conn
+    row = conn.execute(
+        "SELECT id, type, active FROM graph_nodes WHERE id=?", (node_id,)
+    ).fetchone()
+    if row is None or row["active"] == 0:
+        return 0
+    if kind is not None and row["type"] != kind:
+        return 0
+
+    conn.execute("UPDATE graph_nodes SET active=0 WHERE id=?", (node_id,))
+    conn.commit()
+    return 1
+
+
+def register_graph_layer() -> None:
+    """Register the graph recall/forget layer once (idempotent)."""
+    global _graph_registered
+    if _graph_registered:
+        return
+    try:
+        from memory.recall import register_layer  # type: ignore[attr-defined]
+
+        register_layer("graph", recall_graph, forget_graph)
+    except Exception:
+        return
+    _graph_registered = True

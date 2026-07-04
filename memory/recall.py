@@ -68,6 +68,12 @@ def _ensure_layers_registered() -> None:
     except Exception:
         pass
 
+    try:
+        from memory.graph import register_graph_layer
+        register_graph_layer()
+    except Exception:
+        pass
+
 
 def recall(query: str, project_root: str | None = None, limit: int = 10) -> list[dict]:
     """Hybrid recall across all registered layers; top `limit` by score desc."""
