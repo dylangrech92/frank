@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -506,3 +507,354 @@ def pop_last_run() -> dict | None:
         result = _last_run
         _last_run = None
         return result
+
+# ---------------------------------------------------------------------------
+# Erosion / eviction constants
+# ---------------------------------------------------------------------------
+
+TAU_LEAF_HOURS = 14 * 24        # erosion time-constant: 14 days in hours
+EVICT_WEIGHT_MAX = 0.05          # eviction threshold on eroded weight
+EVICT_SALIENCE_MAX = 3           # eviction threshold on salience
+EVICT_AGE_DAYS_MIN = 90          # eviction minimum age in days
+
+# ---------------------------------------------------------------------------
+# Time helpers (mirror atomic.py _parse_iso / _age_days)
+# ---------------------------------------------------------------------------
+
+
+def _parse_iso(s: str) -> datetime:
+    """Parse an ISO-8601 UTC timestamp string to a ``datetime``."""
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def _hours_between(earlier: str, now: str) -> float:
+    """Return the floating-point hours between *earlier* and *now*. Clamps negative deltas to 0.0."""
+    delta = _parse_iso(now) - _parse_iso(earlier)
+    total = delta.total_seconds() / 3600
+    return max(0.0, total)
+
+
+def erosion_weight(salience: int, last_relevant_at: str, now: str | None = None) -> float:
+    """weight = (salience/10) * exp(-delta_hours / TAU_LEAF_HOURS), anchored on last_relevant_at."""
+    import math
+
+    if now is None:
+        now = _now_iso()
+    dt_hours = _hours_between(last_relevant_at, now)
+    return (salience / 10.0) * math.exp(-dt_hours / TAU_LEAF_HOURS)
+
+
+def evict_episodes(store, now: str | None = None) -> int:
+    """Hard-delete episodes with erosion_weight < EVICT_WEIGHT_MAX AND salience <= EVICT_SALIENCE_MAX
+    AND age (created_at) > EVICT_AGE_DAYS_MIN days. Cleans FTS + vec rows too. Returns count evicted.
+
+    Only considers non-deleted episodes for the weight/salience test, but should also be able to purge
+    already-soft-deleted ancient rows — KEEP IT SIMPLE: operate on all rows where deleted_at IS NULL,
+    matching the three thresholds.
+    """
+    if now is None:
+        now = _now_iso()
+
+    conn = store.conn
+
+    evicted = 0
+    while True:
+        # Fetch candidates where deleted_at IS NULL (simplest: batch).
+        rows = conn.execute(
+            "SELECT rowid, id, salience, last_relevant_at, created_at, gist FROM episodes WHERE deleted_at IS NULL",
+        ).fetchall()
+
+        if not rows:
+            break
+
+        to_delete_rowids: list[int] = []
+
+        for r in rows:
+            rid = r["rowid"]
+            salience = r["salience"] or 0
+            anchor = r["last_relevant_at"] or r["created_at"]
+            weight = erosion_weight(salience, anchor, now)
+
+            created = r["created_at"]
+            age_days = _hours_between(created, now) / 24.0 if created else 0.0
+
+            if weight < EVICT_WEIGHT_MAX and salience <= EVICT_SALIENCE_MAX and age_days > EVICT_AGE_DAYS_MIN:
+                to_delete_rowids.append(rid)
+
+        if not to_delete_rowids:
+            break
+
+        rowid_placeholders = ",".join(str(r) for r in to_delete_rowids)
+
+        # Need gists for FTS delete markers.
+        details = conn.execute(
+            f"SELECT rowid, id, gist FROM episodes WHERE rowid IN ({rowid_placeholders})",
+        ).fetchall()
+
+        gist_map: dict[int, str] = {}
+        for dr in details:
+            gist_map[dr["rowid"]] = dr["gist"]
+
+        # Hard-delete from episodes.
+        conn.execute(f"DELETE FROM episodes WHERE rowid IN ({rowid_placeholders})")
+
+        # Remove from FTS.
+        for rid, gist in gist_map.items():
+            conn.execute(
+                "INSERT INTO episodes_fts(episodes_fts, rowid, gist) VALUES('delete', ?, ?)",
+                (rid, gist),
+            )
+
+        # Remove from vec when available.
+        if store.vec_enabled:
+            conn.execute(f"DELETE FROM episodes_vec WHERE rowid IN ({rowid_placeholders})")
+
+        evicted += len(to_delete_rowids)
+        conn.commit()
+
+    return evicted
+
+
+# ---------------------------------------------------------------------------
+# Recall / forget layer functions
+# ---------------------------------------------------------------------------
+
+
+def _escape_fts_query(query: str) -> str:
+    """Escape *query* for use in an FTS5 ``MATCH`` expression.
+
+    Wraps the entire query in double-quotes so terms are matched literally,
+    and any embedded double-quotes inside the query are escaped as ``""``.
+    Falls back to raw term OR-matching if quoting fails.
+    """
+    try:
+        escaped = query.replace('"', '""')
+        return f'"{escaped}"'
+    except Exception:
+        terms = [t.strip() for t in query.split() if t.strip()]
+        return " ".join(f'"{t}"' for t in terms)
+
+
+def recall_episodes(ctx, query: str, limit: int) -> list[dict]:
+    """Return up to *limit* non-deleted episodes most relevant to *query*, hybrid FTS + vector,
+    with an erosion nudge on ordering (fresher/higher-salience ranks higher).
+
+    Mirrors atomic.recall_facts structure:
+      - FTS leg: SELECT rowid, bm25(episodes_fts) AS b FROM episodes_fts WHERE episodes_fts MATCH ?
+        (escape the query like atomic._escape_fts_query).
+        Normalize bm25 best(most negative)->1.0, worst->0.0.
+      - Vector leg (if store.vec_enabled and embedder.available): embed(query); MATCH episodes_vec ORDER BY
+        distance LIMIT limit*4; normalize distance to [0,1] like recall_facts.
+      - Merge: relevance[rowid] = max(s_fts, s_vec). Build a map of non-deleted episodes for the union of
+        rowids: SELECT rowid, id, gist, salience, created_at, last_relevant_at FROM episodes
+        WHERE rowid IN (...) AND deleted_at IS NULL. Apply relative floor (0.15 * max) like recall_facts.
+      - Final score: final = relevance + 0.25 * erosion_weight(salience, last_relevant_at or created_at, now).
+        This makes decay affect ordering.
+      - Sort desc, take top ``limit``. Best-effort UPDATE episodes SET last_accessed_at = now WHERE rowid IN (...).
+    Each result dict (uniform with facts layer):
+        {"layer": "episodic", "id": <episode.id TEXT>, "kind": "episode", "key": <episode.id>,
+         "value": gist, "valid_from": created_at, "score": round(final,6),
+         "text": f"[episode] {gist}  (recorded {created_at[:10]})"}
+    Return [] when nothing matches. Swallow FTS/vec leg errors like recall_facts does.
+    """
+    now = _now_iso()
+    conn = ctx.store.conn
+
+    s_fts_rows: list[tuple[int, float]] = []
+    s_vec_rows: dict[int, float] = {}
+
+    # --- FTS leg --------------------------------------------------------
+    fts_query = _escape_fts_query(query)
+    try:
+        fts_results = conn.execute(
+            "SELECT rowid, bm25(episodes_fts) AS b FROM episodes_fts WHERE episodes_fts MATCH ?",
+            (fts_query,),
+        ).fetchall()
+
+        bm25_values = [r["b"] for r in fts_results]
+        if bm25_values:
+            b_min = min(bm25_values)
+            b_max = max(bm25_values)
+            for r in fts_results:
+                raw = r["b"]
+                if b_max == b_min:
+                    s_fts_val = 1.0
+                else:
+                    s_fts_val = (b_max - raw) / (b_max - b_min)
+                s_fts_val = max(0.0, min(1.0, float(s_fts_val)))
+                s_fts_rows.append((r["rowid"], s_fts_val))
+    except Exception:
+        pass
+
+    # --- Vector leg -----------------------------------------------------
+    if ctx.store.vec_enabled and ctx.embedder.available:
+        qv = ctx.embedder.embed(query)
+        if qv is not None:
+            try:
+                import sqlite_vec
+
+                vec_bytes = sqlite_vec.serialize_float32(qv)
+
+                vec_results = conn.execute(
+                    """
+                    SELECT rowid, distance FROM episodes_vec
+                    WHERE embedding MATCH ? ORDER BY distance LIMIT ?
+                    """,
+                    (vec_bytes, limit * 4),
+                ).fetchall()
+
+                dist_values = [r["distance"] for r in vec_results]
+                if dist_values:
+                    d_min = min(dist_values)
+                    d_max = max(dist_values)
+                    for r in vec_results:
+                        dist = r["distance"]
+                        if d_min == d_max:
+                            s_vec_val = 1.0 / (1.0 + abs(dist))
+                        else:
+                            normalised = (dist - d_min) / (d_max - d_min)
+                            s_vec_val = 1.0 - float(normalised) * 0.999
+                        s_vec_val = max(0.0, min(1.0, s_vec_val))
+                        s_vec_rows[r["rowid"]] = round(s_vec_val, 6)
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+    # --- Merge & score --------------------------------------------------
+    if not s_fts_rows and not s_vec_rows:
+        return []
+
+    all_rowids = set()
+    if s_fts_rows:
+        all_rowids.update(rowid for rowid, _ in s_fts_rows)
+    all_rowids.update(s_vec_rows.keys())
+
+    placeholders = ",".join(str(i) for i in all_rowids)
+    episode_rows = conn.execute(
+        f"""
+        SELECT rowid, id, gist, salience, created_at, last_relevant_at
+        FROM episodes
+        WHERE rowid IN ({placeholders})
+          AND deleted_at IS NULL
+        """,
+    ).fetchall()
+
+    ep_map: dict[int, sqlite3.Row] = {r["rowid"]: r for r in episode_rows}
+
+    s_fts_map = dict(s_fts_rows)
+    relevance: dict[int, float] = {}
+    for rowid in ep_map:
+        s_val = max(
+            s_fts_map.get(rowid, 0.0),
+            s_vec_rows.get(rowid, 0.0),
+        )
+        if s_val > 0:
+            relevance[rowid] = s_val
+
+    if not relevance:
+        return []
+
+    # Relative floor.
+    max_rel = max(relevance.values())
+    if max_rel > 0:
+        rel_threshold = 0.15 * max_rel
+    else:
+        rel_threshold = 0.0
+    relevance = {rid: s for rid, s in relevance.items() if s >= rel_threshold}
+
+    # Final score with erosion nudge.
+    scored: list[tuple[int, int, float, str, str | None]] = []
+    for rowid, rel in relevance.items():
+        row = ep_map[rowid]
+        rid = row["rowid"]
+        eid = row["id"]
+        gist_val = row["gist"] or ""
+        salience = row["salience"] or 0
+        created_at = row["created_at"] or now
+        anchor = row["last_relevant_at"] or created_at
+        erosion = erosion_weight(salience, anchor, now)
+        final = rel + 0.25 * erosion
+        scored.append((rid, eid, final, gist_val, created_at))
+
+    scored.sort(key=lambda x: x[2], reverse=True)
+    scored = scored[:limit]
+
+    # Build result dicts.
+    results: list[dict] = []
+    ret_ids: list[str] = []
+    for rid, eid, final_score, gist_val, created_at in scored:
+        text = f"[episode] {gist_val}  (recorded {created_at[:10]})"
+        results.append({
+            "layer": "episodic",
+            "id": eid,
+            "kind": "episode",
+            "key": eid,
+            "value": gist_val,
+            "valid_from": created_at,
+            "score": round(final_score, 6),
+            "text": text,
+        })
+        ret_ids.append(eid)
+
+    # Best-effort last_accessed_at update.
+    if ret_ids:
+        ep_placeholders = ",".join("?" for _ in ret_ids)
+        try:
+            conn.execute(
+                f"UPDATE episodes SET last_accessed_at = ? WHERE id IN ({ep_placeholders})",
+                [now] + ret_ids,
+            )
+            conn.commit()
+        except Exception:
+            pass
+
+    return results
+
+
+def forget_episodes(ctx, key: str, kind: str | None) -> int:
+    """Soft-delete episode(s) by id. The registry's forget passes the user's `key` as the episode id
+    (episodes have no separate key). If `kind` is provided and is not "episode", return 0 (this layer
+    only owns kind 'episode'; a None kind means 'any layer' and DOES apply here).
+    Look up a non-deleted episode WHERE id = key; if found, call the existing _soft_delete(store, key)
+    and return 1; else return 0. (Reuse the module's _soft_delete.)"""
+    if kind is not None and kind != "episode":
+        return 0
+    conn = ctx.store.conn
+    row = conn.execute(
+        "SELECT id FROM episodes WHERE id = ? AND deleted_at IS NULL",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return 0
+    _soft_delete(ctx.store, key)
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# Lazy idempotent registration
+# ---------------------------------------------------------------------------
+
+_registered = False
+
+
+def register_episodic_layer() -> None:
+    """Register the episodic recall/forget layer with memory.recall (if available)."""
+    global _registered
+
+    if _registered:
+        return
+
+    try:
+        from memory.recall import register_layer  # type: ignore[attr-defined]
+
+        register_layer("episodic", recall_episodes, forget_episodes)
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        pass
+
+    _registered = True
+
+
+# Also attempt registration at import time (best-effort).
+try:
+    register_episodic_layer()
+except Exception:
+    pass
