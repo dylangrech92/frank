@@ -22,7 +22,7 @@ from tools.result import ToolResult
 # =============================================================================
 
 # Module-level list tracking every mutation event since last ``diagnostics_inject_summary`` call.
-_TURN_MUTATIONS: list[dict] = {}
+_TURN_MUTATIONS: list[dict] = []
 
 
 def _mutate_tracker(event: dict) -> None:
