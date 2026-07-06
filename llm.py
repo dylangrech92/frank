@@ -8,11 +8,17 @@ from __future__ import annotations
 
 import json
 import re
-import urllib.error
-import urllib.request
+import time
+import requests
 from config import LLMConfig
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
+
+# One retry, ~1s backoff, on 5xx and connection-level errors (F5). Never
+# retried: 4xx responses, and anything past the point a 2xx response has
+# started streaming deltas to on_delta (see LLMClient._request_with_retry).
+_MAX_ATTEMPTS = 2
+_RETRY_BACKOFF_SECONDS = 1.0
 
 
 class OverCapError(Exception):
@@ -46,10 +52,16 @@ class ChatResponse:
             when the assistant returned no textual content (e.g. pure tool use).
         tool_calls: List of parsed ``ToolCall`` entries from
             ``choices[0].message.tool_calls``; empty list when none was returned.
+        prompt_tokens: ``usage.prompt_tokens`` from the response when the
+            provider reports it; ``None`` when absent (estimate-only fallback).
+        completion_tokens: ``usage.completion_tokens`` from the response when
+            the provider reports it; ``None`` when absent.
     """
 
     text: str = ""
     tool_calls: List[ToolCall] = field(default_factory=list)
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
 
 
 def _strip_outer_braces(args_str: str) -> str:
@@ -183,18 +195,30 @@ def _read_sse_response(resp: Any, on_delta: Callable[[str], None]) -> ChatRespon
     concatenate). Callback exceptions are swallowed — display must never kill
     the request. Unparseable data lines are skipped.
 
+    A ``usage`` key is checked on every parsed chunk (not just ones carrying
+    choices) since providers commonly send the final usage-bearing chunk with
+    an empty ``choices`` list — checking it before the empty-choices bail-out
+    is what actually captures it (F6).
+
     Args:
-        resp: The open ``urlopen`` response object (file-like, yields bytes lines).
+        resp: An iterable yielding raw bytes (or str) lines, one SSE line each
+            (the open ``urlopen`` response object, or ``Response.iter_lines()``
+            from ``requests``).
         on_delta: Called with each non-empty ``delta.content`` fragment.
 
     Returns:
-        A ``ChatResponse`` identical in shape to the non-streaming parse.
+        A ``ChatResponse`` identical in shape to the non-streaming parse, with
+        ``prompt_tokens``/``completion_tokens`` populated when the stream
+        carried a ``usage`` chunk.
     """
     text_parts: list[str] = []
     calls_by_index: dict[int, dict[str, Any]] = {}
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
 
     for raw_line in resp:
-        line = raw_line.decode("utf-8", errors="replace").strip()
+        raw_text = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
+        line = raw_text.strip()
         if not line.startswith("data:"):
             continue
         data_str = line[len("data:"):].strip()
@@ -204,6 +228,11 @@ def _read_sse_response(resp: Any, on_delta: Callable[[str], None]) -> ChatRespon
             chunk = json.loads(data_str)
         except json.JSONDecodeError:
             continue
+
+        usage = chunk.get("usage")
+        if usage:
+            prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+            completion_tokens = usage.get("completion_tokens", completion_tokens)
 
         choices = chunk.get("choices") or []
         if not choices:
@@ -238,11 +267,22 @@ def _read_sse_response(resp: Any, on_delta: Callable[[str], None]) -> ChatRespon
             slot["id"] = f"call_{idx}"  # some providers omit ids on streamed calls
         tool_calls.append(_tool_call_from_dict(slot))
 
-    return ChatResponse(text="".join(text_parts), tool_calls=tool_calls)
+    return ChatResponse(
+        text="".join(text_parts),
+        tool_calls=tool_calls,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
 
 
 class LLMClient:
     """Thin HTTP client for OpenAI-compatible chat-completions endpoints.
+
+    Uses a ``requests.Session`` (rather than a bare ``urllib.request.urlopen``
+    per call) so the underlying TCP/TLS connection is kept alive and reused
+    across the several chat calls a single turn makes (F1). ``requests`` is
+    already a project dependency (see ``tools/web_read.py``), so this avoids
+    hand-rolling keep-alive management on top of ``http.client``.
 
     Args:
         config: A frozen ``LLMConfig`` dataclass holding base_url, api_key, model,
@@ -257,6 +297,64 @@ class LLMClient:
 
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
+        self._session = requests.Session()
+
+    def _request_with_retry(
+        self,
+        url: str,
+        body: Dict[str, Any],
+        headers: Dict[str, str],
+        stream: bool,
+    ) -> requests.Response:
+        """POST *body* to *url*, retrying once on 5xx / connection-level errors.
+
+        Only the connect-and-status-check phase is ever retried: a 2xx
+        response is returned immediately, before its body (or SSE stream) is
+        consumed, so a retry here never re-sends a request whose deltas were
+        already forwarded to ``on_delta`` (that consumption happens later, in
+        ``chat()``/``_read_sse_response``, outside this method). 4xx
+        responses are never retried — only 5xx and connection-level failures
+        (``requests.exceptions.ConnectionError``/``Timeout``) are (F5).
+
+        Args:
+            url: Full chat-completions endpoint URL.
+            body: JSON-serializable request body.
+            headers: Request headers (Content-Type, Authorization).
+            stream: Passed through to ``requests`` so a streaming response's
+                body is not eagerly buffered.
+
+        Returns:
+            The ``requests.Response`` for a status code below 500 (the caller
+            still checks for 4xx and raises the appropriate error contract).
+
+        Raises:
+            RuntimeError: On a 5xx or connection-level failure that persists
+                through the retry.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_ATTEMPTS):
+            is_last_attempt = attempt == _MAX_ATTEMPTS - 1
+            try:
+                resp = self._session.post(url, json=body, headers=headers, stream=stream)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                last_exc = exc
+                if not is_last_attempt:
+                    time.sleep(_RETRY_BACKOFF_SECONDS)
+                    continue
+                raise RuntimeError(f"connection error: {exc}") from exc
+
+            if resp.status_code >= 500:
+                if not is_last_attempt:
+                    resp.close()
+                    time.sleep(_RETRY_BACKOFF_SECONDS)
+                    continue
+                body_text = resp.text
+                raise RuntimeError(f"HTTP {resp.status_code}: {body_text}")
+
+            return resp
+
+        # Unreachable: the loop above always either returns or raises.
+        raise RuntimeError(f"request failed after retry: {last_exc}")
 
     def chat(
         self,
@@ -279,7 +377,8 @@ class LLMClient:
 
     Returns:
         A ``ChatResponse`` with ``text`` and ``tool_calls`` populated from
-        ``choices[0].message``.
+        ``choices[0].message``, plus ``prompt_tokens``/``completion_tokens``
+        when the provider's response carried a ``usage`` field.
 
     Raises:
         OverCapError: When the provider returns HTTP 400 with a body mentioning
@@ -296,6 +395,15 @@ class LLMClient:
 
         if want_stream:
             body["stream"] = True
+            # Most OpenAI-compatible servers (this project's default Ollama
+            # endpoint included) only emit the final usage-bearing chunk when
+            # explicitly asked via stream_options — otherwise SSE responses
+            # never carry usage at all, silently defeating F6 for the
+            # streaming path (verified live: identical request without this
+            # flag omits `usage` entirely; with it, a final chunk with empty
+            # `choices` and populated `usage` is sent, as already handled by
+            # ``_read_sse_response``).
+            body["stream_options"] = {"include_usage": True}
 
         if self.config.max_tokens is not None:
             body["max_tokens"] = self.config.max_tokens
@@ -303,40 +411,46 @@ class LLMClient:
         if tools:
             body["tools"] = tools
 
-        payload = json.dumps(body).encode("utf-8")
         url = f"{self.config.base_url.rstrip('/')}/chat/completions"
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.config.api_key}",
-            },
-            method="POST",
-        )
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.api_key}",
+        }
 
-        try:
-            resp = urllib.request.urlopen(req)
-            if on_delta is not None and want_stream and resp.headers.get_content_type() == "text/event-stream":
-                return _read_sse_response(resp, on_delta)
-            data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body_text = exc.read().decode("utf-8", errors="replace")
-            detail = f"HTTP {exc.code}: {body_text}"
-            if exc.code == 400 and (
+        resp = self._request_with_retry(url, body, headers, want_stream)
+
+        if resp.status_code >= 400:
+            body_text = resp.text
+            detail = f"HTTP {resp.status_code}: {body_text}"
+            if resp.status_code == 400 and (
                 "context_length_exceeded" in body_text.lower()
                 or "maximum context length" in body_text.lower()
             ):
-                raise OverCapError(f"context too long: {detail}") from exc
-            raise RuntimeError(detail) from exc
+                raise OverCapError(f"context too long: {detail}")
+            raise RuntimeError(detail)
+
+        content_type = resp.headers.get("Content-Type", "")
+        if on_delta is not None and want_stream and content_type.startswith("text/event-stream"):
+            return _read_sse_response(resp.iter_lines(), on_delta)
+
+        data = resp.json()
 
         choices = data.get("choices", [])
+        usage = data.get("usage") or {}
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+
         if not choices:
-            return ChatResponse()
+            return ChatResponse(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
 
         message = choices[0].get("message", {})
         text = message.get("content", "") or ""
         tool_calls_raw = message.get("tool_calls") or []
         tool_calls = [_tool_call_from_dict(tc) for tc in tool_calls_raw]
 
-        return ChatResponse(text=text, tool_calls=tool_calls)
+        return ChatResponse(
+            text=text,
+            tool_calls=tool_calls,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )

@@ -533,6 +533,15 @@ def handle_user_message(
             compactions += 1
             continue
 
+        if response.prompt_tokens is not None:
+            print(
+                ui.telemetry(
+                    f"usage: actual prompt_tokens={response.prompt_tokens} "
+                    f"vs estimated ~{est} tokens (delta {response.prompt_tokens - est:+d})"
+                ),
+                file=sys.stderr,
+            )
+
         tool_calls: list[ToolCall] | None = (
             response.tool_calls if response.tool_calls else None
         )
