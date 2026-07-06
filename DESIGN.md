@@ -177,6 +177,9 @@ The transcript on disk and the context sent to the model are **different**. `ses
 - `record_rule(title, constraint)` · `record_decision(title, rationale, alternatives?, implements?)` · `record_pivot(title, why, supersedes)` · `record_spec(title, body, acceptance?, status?)`
 - `link_nodes(from_id, to_id, edge_type)` — optional post-hoc relation
 
+**Subagents**
+- `spawn_agents(specs)` — fans out `{prompt, cwd?}` entries to concurrent, memory-less one-shot children of this same harness (`main.py --no-memory -p -`, one process per spec), up to `subagents.max_concurrent` (config, default 4) at a time, each bounded by `subagents.timeout_s` (default 600). Each child sees only its own `prompt` — no shared context, transcript, or memory — so callers must write fully self-contained prompts. Returns per-child answer, exit code, and a stderr tail on failure/timeout. A depth guard (`CODING_AGENT_DEPTH` env var, incremented per generation) refuses to spawn once already two levels deep, so fan-out cannot recurse without bound. Not `parallel_safe` — children may mutate files.
+
 ### 5.1 Tool encapsulation convention
 Every tool is one file/class:
 
@@ -295,6 +298,13 @@ def handle_user_message(text):
 
 **Parallel tool dispatch.** Tools carry a `parallel_safe` class attribute (default `False`), true only for tools that neither mutate state nor touch a main-thread-only resource (LSP document sync, the cached SQLite connection, process handles) — currently `read_file`, `list_files`, `find`, `get_diagnostics`, `web_search`, `web_read`. When an assistant batch has 2+ calls and every one is `parallel_safe`, the loop dispatches them on a `ThreadPoolExecutor` (≤8 workers) and appends results in original call order; any unsafe or unknown tool in the batch forces the fully sequential path, preserving effect ordering.
 
+**Reactive steers and nudges.** A handful of per-turn watchdogs live inline in `handle_user_message`, each firing only on its trigger condition (zero cost on the happy path) and each capped so it can't loop forever:
+
+- **Loop guard** — a repeated, byte-identical error envelope from the same tool gets a `[loop-guard]` suffix nudging the model to change approach instead of retrying the same call.
+- **Web-search focus nudge** — 3+ consecutive successful `web_search` calls with no intervening `web_read` get a `[focus]` suffix telling the model to read a result instead of searching again.
+- **Graph-memory usage nudge (H5)** — a turn whose mutations touch 3+ distinct files with no `record_decision`/`record_spec` call gets a one-line reminder appended to the last tool result, at most once per session.
+- **Hard verify gate (H1 bounce, hardened by S3)** — when a final answer (no tool calls) ends a turn that mutated files with no successful `run_tests`/`run_command` call since, the harness bounces once: it injects a synthetic user-role steer telling the model to verify now or state explicitly that the change is unverified, then loops again instead of returning. If the *second* final answer still has neither a verification call nor an "unverified" declaration (case-insensitive match), the harness accepts it but prefixes the **returned** text (never the transcript) with `[UNVERIFIED CHANGES] `. At most one bounce per turn. The one `client.chat` call immediately after the bounce is delivered through `on_delta` whole rather than streamed fragment-by-fragment, since whether the marker applies can only be decided once the full response is in hand — this keeps the "final text exactly once, plus one trailing `\n`" streaming contract intact even when the gate rewrites the answer.
+
 ## 10. config.json
 
 Config is per-agent-install, not per-project: it defaults to `config.json` next to `main.py` in the agent's own directory, and `--config <path>` overrides that for testing or alternate setups.
@@ -314,7 +324,8 @@ Config is per-agent-install, not per-project: it defaults to `config.json` next 
   "debug_adapters": { "python": "debugpy", "php": "php-debug", "javascript": "js-debug" },
   "test_runners": { "python": "pytest", "php": "phpunit", "javascript": "jest" },
   "compaction": { "reserve_ratio": 0.10, "reserve_min_tokens": 8000 },
-  "git": { "allow_destructive": false }
+  "git": { "allow_destructive": false },
+  "subagents": { "max_concurrent": 4, "timeout_s": 600 }
 }
 ```
 

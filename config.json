@@ -11,6 +11,13 @@
   },
   "test_runners": {},
   "compaction": {"reserve_ratio": 0.10, "reserve_min_tokens": 8000},
+  "subagents": {"max_concurrent": 4, "timeout_s": 600},
+  "linters": {
+    "python":     {"command": ["ruff", "check", "--output-format", "json"]},
+    "javascript": {"command": ["eslint", "--format", "json"]},
+    "typescript": {"command": ["eslint", "--format", "json"]},
+    "php":        {"command": ["phpstan", "analyse", "--error-format", "json", "--no-progress", "--level", "0"]}
+  },
   "language_servers": {
     "python":     {"command": ["pyright-langserver", "--stdio"]},
     "javascript": {"command": ["typescript-language-server", "--stdio"]},
