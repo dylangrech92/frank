@@ -16,8 +16,17 @@ class Tool(ABC):
     """
 
     name: str  # unique tool name, set by subclass
-    description: str  # LLM-facing description
+    summary: str  # one-line description shown in the catalog (before a tool is loaded)
+    description: str  # full LLM-facing description (shown once the tool is loaded)
     parameters: dict  # JSON Schema describing arguments
+
+    # Optional attributes used to render an oversize-result error (see
+    # registry.dispatch's result-too-large guard) and the repeated-identical-
+    # failure loop-guard.  Subclasses may override; sensible defaults apply
+    # otherwise.
+    action: str = "complete the operation"  # short verb phrase, e.g. "read the file"
+    oversize_hint: str = "narrow the request or use a more specific tool"
+    alternative: str = "a different tool or approach"  # suggested when this tool keeps failing
 
     @abstractmethod
     def run(self, **kwargs: object) -> ToolResult:

@@ -13,6 +13,7 @@ class DebugInspect(Tool):
     """Inspect the paused debug session: evaluate an expression, list variables in scope, or read the call stack at the current stop."""
 
     name = "debug_inspect"
+    summary = 'Inspect a paused session (eval, variables, stack).'
     description = (
         'Inspect the paused debug session: evaluate an expression, list variables in scope, '
         'or read the call stack at the current stop.'

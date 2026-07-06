@@ -1,10 +1,9 @@
 {
   "llm": {
-    "base_url": "https://api.provider.com/v1",
-    "api_key": "YOUR_API_KEY",
-    "model": "provider-model-name",
+    "base_url": "http://grck.lan:30068/v1",
+    "api_key": "ollama",
+    "model": "qwen3.6:27b-128k",
     "temperature": 0.2,
-    "max_tokens": 4096,
     "context_limit": 128000
   },
   "git": {

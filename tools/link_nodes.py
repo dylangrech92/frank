@@ -14,6 +14,7 @@ class LinkNodes(Tool):
     """Create a typed edge between two existing graph nodes."""
 
     name = 'link_nodes'
+    summary = 'Create a typed edge between two data-graph nodes.'
     description = (
         'Create a typed edge between two existing data-graph nodes. edge_type is one '
         'of: supersedes, implements, constrains, refines, relates_to.'

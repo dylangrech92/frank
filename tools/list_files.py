@@ -1,12 +1,11 @@
 """List files tool: walks the project tree and renders an indented overview."""
 
 import fnmatch
-import os
 from pathlib import Path
 from typing import Any
 
 from tools.base import Tool
-from tools.result import ToolResult, truncate
+from tools.result import ToolResult
 from tools._sandbox import resolve_in_root
 
 
@@ -77,13 +76,15 @@ class ListFiles(Tool):
 
     Walks the target directory recursively, rendering each entry indented by
     its depth, grouped with directories first then files within each level.
-    Truncates output at 20000 characters when exceeded.
     """
 
     name = 'list_files'
+    summary = 'List the project file tree (gitignore-aware).'
     description = (
         'Lists the project file tree while respecting gitignore rules.'
     )
+    action = 'list files'
+    oversize_hint = 'pass a subdirectory path'
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {
@@ -139,8 +140,4 @@ class ListFiles(Tool):
 
         _recurse(target, 0)
 
-        body_list, truncated = truncate('\n'.join(lines), 20_000)
-        if truncated:
-            body_list += '\noutput truncated'
-
-        return ToolResult.ok(body_list, entries=entries)
+        return ToolResult.ok('\n'.join(lines), entries=entries)

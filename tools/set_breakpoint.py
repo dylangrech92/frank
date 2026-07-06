@@ -16,6 +16,7 @@ class SetBreakpoint(Tool):
     """
 
     name = 'set_breakpoint'
+    summary = 'Set a (optionally conditional) breakpoint at a file and line.'
     description = (
         'Set a breakpoint at a file and line, optionally conditional. '
         'Works before or during a debug session; mid-session breakpoints take effect immediately.'
@@ -23,7 +24,7 @@ class SetBreakpoint(Tool):
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {
-            'file': {
+            'path': {
                 'type': 'string',
                 'description': 'Path to the source file (absolute or relative to project root).',
             },
@@ -36,14 +37,14 @@ class SetBreakpoint(Tool):
                 'description': 'Optional Python expression; breakpoint only fires when it is true.',
             },
         },
-        'required': ['file', 'line'],
+        'required': ['path', 'line'],
     }
 
     def run(self, **kwargs: Any) -> ToolResult:
         """Execute the tool, registering a breakpoint.
 
         Args:
-            **kwargs: Parsed from LLM function-call payload. Expects ``file`` (str),
+            **kwargs: Parsed from LLM function-call payload. Expects ``path`` (str),
                 ``line`` (int), and optional ``condition`` (str).
 
         Returns:
@@ -58,7 +59,7 @@ class SetBreakpoint(Tool):
                 code='debug-unavailable',
             )
 
-        file = kwargs['file']
+        file = kwargs['path']
         line = kwargs['line']
         condition = kwargs.get('condition')
 

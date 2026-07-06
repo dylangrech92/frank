@@ -17,6 +17,7 @@ class FindSymbol(Tool):
     """
 
     name = 'find_symbol'
+    summary = 'Fuzzy-search symbols by name across the workspace.'
     description = (
         'Fuzzy-search symbols by name across the whole workspace (like an IDE\'s '
         'ctrl+T). Searches all open documents in all language servers.'

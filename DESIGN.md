@@ -73,37 +73,39 @@ Per-project runtime artifacts live under the **project root** (the launch CWD), 
 
 ```
 <project>/.coding_agent/
-  sessions/2026-07-01T20-45-03.json     # a NEW transcript is created every launch
+  sessions/2026-07-01T20-45-03-48213.json  # id is <timestamp>-<pid>; --session <id> resumes it
   memory.db                             # SQLite: episodes, facts, graph_nodes/edges (+ vec + fts)
 ```
 
 ## 4. Session, transcript & context assembly
 
 ### 4.1 Lifecycle
-On launch the harness: (1) loads `config.json`; (2) captures the launch **CWD as the project root** (all file operations are sandboxed to it); (3) creates a **new session transcript** (fresh file every launch — no resume); (4) pre-warms LSP servers for languages detected in the tree; (5) enters a REPL: read user message → run the agent loop → print the assistant's text → persist the turn.
+On launch the harness: (1) loads `config.json` from the agent's own install directory by default (`--config` overrides); (2) captures the launch **CWD as the project root** (all file operations are sandboxed to it); (3) creates a **new session transcript** with a `<timestamp>-<pid>` id (unique across concurrent launches), or resumes an existing one when `--session <id>` is passed (`--list-sessions` lists available ids); an advisory lock file guards against two processes appending to the same transcript at once; (4) pre-warms LSP servers for languages detected in the tree; (5) enters a REPL: read user message → run the agent loop → print the assistant's text → persist the turn.
 
 ### 4.2 Message format
 **Native OpenAI tool-role messages.** An `assistant` message carries `tool_calls`; each result is a `role:"tool"` message keyed by `tool_call_id`. This is the standard OpenAI-compatible contract and maps 1:1 onto "tool results attached to the assistant response." (This deliberately diverges from Chalie, which flattens history into a single text user-message; the native format is leaner and standard here.)
 
 ### 4.3 Transcript on disk (full fidelity)
-One file per session: YAML frontmatter (metadata) + a JSON body that is a **flat array of native-OpenAI messages**. Nothing is ever pruned from the record.
+One file per session: YAML frontmatter (metadata) + a JSON body holding the **flat array of native-OpenAI messages**, plus optional `summary`/`summary_covers` (persisted compaction state) and `episodic_watermark` (persisted extraction watermark) keys so `--session <id>` resumes with the compacted view and without re-mining already-mined history. Legacy transcripts predating these keys — a bare JSON array with no wrapping object — still load: they resume with no summary and an episodic watermark seeded to the full message count. Writes are atomic (temp file + `os.replace`), and an advisory `<transcript>.lock` file (containing the holding pid) prevents two processes from appending to the same transcript concurrently. Nothing is ever pruned from the record.
 
 ```
 ---
-session_id: 2026-07-01T20-45-03
+session_id: 2026-07-01T20-45-03-48213
 cwd: /Users/dylangrech/dev/myproject
 model: gpt-4o
 created_at: 2026-07-01T20:45:03Z
 ---
-[
-  {"role": "user", "content": "add a /health endpoint"},
-  {"role": "assistant", "content": "Adding it.",
-     "tool_calls": [{"id": "c1", "name": "create_file",
-                     "arguments": {"path": "health.py", "content": "..."}}]},
-  {"role": "tool", "tool_call_id": "c1", "name": "create_file",
-     "content": "[create_file(status=ok)]"},
-  {"role": "assistant", "content": "Done — /health returns 200."}
-]
+{
+  "messages": [
+    {"role": "user", "content": "add a /health endpoint"},
+    {"role": "assistant", "content": "Adding it.",
+       "tool_calls": [{"id": "c1", "name": "create_file",
+                       "arguments": {"path": "health.py", "content": "..."}}]},
+    {"role": "tool", "tool_call_id": "c1", "name": "create_file",
+       "content": "[create_file(status=ok)]"},
+    {"role": "assistant", "content": "Done — /health returns 200."}
+  ]
+}
 ```
 
 ### 4.4 Assembled context (the pruned view sent to the LLM)
@@ -289,10 +291,12 @@ def handle_user_message(text):
 
 ## 10. config.json
 
+Config is per-agent-install, not per-project: it defaults to `config.json` next to `main.py` in the agent's own directory, and `--config <path>` overrides that for testing or alternate setups.
+
 ```json
 {
-  "llm": { "base_url": "https://api.provider.com/v1", "api_key": "…", "model": "…",
-           "temperature": 0.2, "max_tokens": 4096, "context_limit": 128000 },
+   "llm": { "base_url": "https://api.provider.com/v1", "api_key": "…", "model": "…",
+            "temperature": 0.2, "context_limit": 128000 },
   "language_servers": {
     "python": "pyright-langserver --stdio",
     "php": "intelephense --stdio",
@@ -351,5 +355,4 @@ def handle_user_message(text):
 - Episodic super-episode roll-up (UMAP + HDBSCAN clustering).
 - Auto-mined / hybrid data-graph suggestion.
 - Cross-project (global) memory layer.
-- Session resume (each launch is intentionally a fresh transcript).
 - Multi-provider abstraction beyond OpenAI-compatible (Anthropic/Gemini native).

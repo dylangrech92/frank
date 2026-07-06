@@ -20,6 +20,7 @@ class CodeActions(Tool):
     """
 
     name = 'code_actions'
+    summary = 'List/apply code actions (quick fixes, refactorings).'
     description = (
         'List code actions (quick fixes, organize imports, refactorings) '
         'available for a file or line range, or apply one by passing its '
@@ -33,7 +34,7 @@ class CodeActions(Tool):
                 'type': 'string',
                 'description': 'Path relative to the project root.',
             },
-            'line': {
+            'start_line': {
                 'type': 'integer',
                 'description': '1-based start line (inclusive). Defaults to 1.',
             },
@@ -58,7 +59,7 @@ class CodeActions(Tool):
 
         Args:
             **kwargs: Parsed from LLM function-call payload. Requires ``path``
-                (str). Optionally ``line``, ``end_line``, ``only``, and ``apply``.
+                (str). Optionally ``start_line``, ``end_line``, ``only``, and ``apply``.
 
         Returns:
             A ``ToolResult`` listing available actions or confirming an action was applied,
@@ -83,8 +84,8 @@ class CodeActions(Tool):
             file_lines = len(f.readlines())
         num_file_lines = max(file_lines, 1)
 
-        # --- validate line / end_line (default to 1 and last line) -----------
-        line_raw = kwargs.get('line')
+        # --- validate start_line / end_line (default to 1 and last line) -----
+        line_raw = kwargs.get('start_line')
         end_line_raw = kwargs.get('end_line')
 
         if line_raw is None:
@@ -92,7 +93,7 @@ class CodeActions(Tool):
         if end_line_raw is None:
             end_line_raw = num_file_lines
 
-        for label, value in [('line', line_raw), ('end_line', end_line_raw)]:
+        for label, value in [('start_line', line_raw), ('end_line', end_line_raw)]:
             if (
                 not isinstance(value, int)
                 or isinstance(value, bool)
@@ -111,7 +112,7 @@ class CodeActions(Tool):
 
         if end_line < line:
             return ToolResult.err(
-                f'end_line ({end_line}) must be >= line ({line}).',
+                f'end_line ({end_line}) must be >= start_line ({line}).',
                 code='bad-arguments',
             )
 

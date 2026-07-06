@@ -10,10 +10,11 @@ import json
 import sys
 import time
 import compaction
+import ui
 
 from llm import ChatResponse, LLMClient, OverCapError, ToolCall
 from session import Session
-from tools.registry import dispatch, schemas
+from tools.registry import dispatch, get_tool, schemas
 from tools.result import ToolResult
 
 
@@ -156,7 +157,7 @@ def episodic_maybe_extract(session: Session, client: LLMClient) -> None:
 
     messages = session._messages
     total = len(messages)
-    prev = _EPISODIC_WATERMARKS.get(id(session), 0)
+    prev = _EPISODIC_WATERMARKS.get(id(session), session.episodic_watermark)
     new_rows = total - prev
 
     # Emit the outcome of any PRIOR extraction that has since completed.
@@ -178,6 +179,7 @@ def episodic_maybe_extract(session: Session, client: LLMClient) -> None:
 
     # Advance the watermark and hand off the most-recent window for encoding.
     _EPISODIC_WATERMARKS[id(session)] = total
+    session.set_episodic_watermark(total)
     start = max(0, total - episodic.EXTRACTION_WINDOW)
     window = [(i, messages[i]) for i in range(start, total)]
     try:
@@ -208,6 +210,7 @@ def render_tool_result(name: str, result: ToolResult) -> str:
         [name(STATUS code=CODE)]       # error status with code
         [name(STATUS)]                  # success status, no code
         <body>                          # only when body is non-empty
+        meta_key: value                 # one line per non-empty meta entry
         hint: <hint_text>               # only when a hint is present
 
     The bracket header always contains the tool name and status.  When status
@@ -238,11 +241,101 @@ def render_tool_result(name: str, result: ToolResult) -> str:
             body_str_val = str(result.body)
         lines.append(body_str_val)
 
+    for meta_key, meta_value in result.meta.items():
+        if meta_value is None or meta_value == "":
+            continue
+        lines.append(f"{meta_key}: {meta_value}")
+
     hint_text = result.hint
     if hint_text is not None and hint_text:
         lines.append(f"hint: {hint_text}")
 
     return "\n".join(lines)
+
+
+def _guard_oversize_result(
+    name: str,
+    result: ToolResult,
+    rendered: str,
+    cap: int,
+    est_context_before_result: int,
+) -> tuple[ToolResult, str]:
+    """Discard an oversized rendered tool result and substitute a clean error.
+
+    Dylan's explicit spec: never silently truncate a tool result — if it would
+    consume more than 75% of the remaining token budget, discard the body
+    entirely and return a ``result-too-large`` error instead, so the oversized
+    raw body never enters the session transcript.
+
+    Args:
+        name: Registered tool name.
+        result: The ``ToolResult`` returned by ``dispatch()``.
+        rendered: The already-rendered text for *result* (see ``render_tool_result``).
+        cap: The shared token cap for this turn's context (see ``compaction.compute_cap``).
+        est_context_before_result: Token estimate of the assembled context before
+            this result is appended.
+
+    Returns:
+        ``(result, rendered)`` unchanged when the result fits, or a substituted
+        ``(ToolResult.err(...), rendered_error_text)`` pair when it does not.
+    """
+    result_tokens = compaction.estimate_tokens([{"role": "tool", "content": rendered}])
+    budget = 0.75 * max(cap - est_context_before_result, 1)
+    if result_tokens <= budget:
+        return result, rendered
+
+    tool = get_tool(name)
+    action = getattr(tool, "action", "complete the operation") if tool else "complete the operation"
+    oversize_hint = (
+        getattr(tool, "oversize_hint", "narrow the request or use a more specific tool")
+        if tool
+        else "narrow the request or use a more specific tool"
+    )
+    substituted = ToolResult.err(
+        f"{name} failed to {action} — result is too large to fit in context — {oversize_hint}",
+        code="result-too-large",
+    )
+    return substituted, render_tool_result(name, substituted)
+
+
+def _loop_guard_check(
+    name: str,
+    rendered: str,
+    seen_errors: dict[tuple[str, str], int],
+) -> str:
+    """Append a steer suffix when the same (tool, error) has repeated within a turn.
+
+    Cheap prefix check on the rendered text (mirrors Chalie's ``dispatch_service``
+    pattern) so the success path pays nothing: only rendered error envelopes
+    (``"[name(error..."`` header) participate in the count.
+
+    Args:
+        name: Registered tool name.
+        rendered: The rendered result text for this call (post oversize-guard).
+        seen_errors: Per-turn counting dict, keyed by ``(name, rendered)``,
+            mutated in place.
+
+    Returns:
+        *rendered* unchanged, or *rendered* with a ``[loop-guard]`` suffix
+        appended when this exact (name, rendered) pair has now been seen twice.
+    """
+    if not rendered.startswith(f"[{name}(error"):
+        return rendered
+
+    key = (name, rendered)
+    seen_errors[key] = seen_errors.get(key, 0) + 1
+    if seen_errors[key] < 2:
+        return rendered
+
+    tool = get_tool(name)
+    alternative = getattr(tool, "alternative", "a different tool or approach") if tool else "a different tool or approach"
+    steer = (
+        f"\n\n[loop-guard] {name} called with these exact arguments has failed "
+        f"multiple times with the same error. Do not repeat this call. Fix the "
+        f"specific problem named above, try {alternative}, or stop and tell the "
+        f"user what error you are getting."
+    )
+    return rendered + steer
 
 
 # =============================================================================
@@ -293,10 +386,12 @@ def handle_user_message(
 
     window = client.config.context_limit
     comp_cfg = compaction_cfg or {}
-    tool_schemas = schemas()
     cap = compaction.compute_cap(window, comp_cfg)
     max_compactions = 5
     compactions = 0
+    # Per-turn (reset on every handle_user_message call) tracking of rendered
+    # error envelopes seen so far, for the repeated-identical-failure loop-guard.
+    seen_errors: dict[tuple[str, str], int] = {}
 
     def _over_cap_giveup() -> str:
         msg = (
@@ -307,12 +402,17 @@ def handle_user_message(
         return msg
 
     while True:
+        # Recomputed every iteration so a mid-turn load_tool call is reflected in
+        # the very next client.chat — a stale pre-loop snapshot would otherwise
+        # withhold the just-loaded tool's schema until the following user turn.
+        tool_schemas = schemas()
+
         # Pre-flight: keep the assembled request at or below the shared cap,
         # compacting older turns before the call is ever made.
         context = session.assemble_context()
         est = compaction.estimate_tokens(context, tool_schemas)
         print(
-            f"context: {len(context)} messages, ~{est} tokens (cap {cap})",
+            ui.telemetry(f"context: {len(context)} messages, ~{est} tokens (cap {cap})"),
             file=sys.stderr,
         )
         while est > cap:
@@ -324,8 +424,10 @@ def handle_user_message(
             context = session.assemble_context()
             est = compaction.estimate_tokens(context, tool_schemas)
             print(
-                f"context: {len(context)} messages, ~{est} tokens "
-                f"(cap {cap}) [post-compaction #{compactions}]",
+                ui.telemetry(
+                    f"context: {len(context)} messages, ~{est} tokens "
+                    f"(cap {cap}) [post-compaction #{compactions}]"
+                ),
                 file=sys.stderr,
             )
 
@@ -361,14 +463,16 @@ def handle_user_message(
 
         for call in response.tool_calls:
             print(
-                f"Tool call: {call.name}({json.dumps(call.arguments)})",
+                ui.tool_call(f"Tool call: {call.name}({json.dumps(call.arguments)})"),
                 file=sys.stderr,
             )
 
             result = dispatch(call.name, call.arguments)
             rendered = render_tool_result(call.name, result)
+            result, rendered = _guard_oversize_result(call.name, result, rendered, cap, est)
+            rendered = _loop_guard_check(call.name, rendered, seen_errors)
 
-            print(rendered, file=sys.stderr)
+            print(ui.tool_result(rendered), file=sys.stderr)
 
             session.append_tool_result(call.id, call.name, rendered)
 

@@ -15,13 +15,14 @@ class ClearBreakpoint(Tool):
     """
 
     name = 'clear_breakpoint'
+    summary = 'Remove a breakpoint (one line or all in a file).'
     description = (
         'Remove a breakpoint at a file (a specific line, or all lines in that file when line is omitted).'
     )
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {
-            'file': {
+            'path': {
                 'type': 'string',
                 'description': 'Path to the source file (absolute or relative to project root).',
             },
@@ -30,14 +31,14 @@ class ClearBreakpoint(Tool):
                 'description': 'Optional 1-based line number. When absent, clears all breakpoints in the file.',
             },
         },
-        'required': ['file'],
+        'required': ['path'],
     }
 
     def run(self, **kwargs: Any) -> ToolResult:
         """Execute the tool, clearing a breakpoint.
 
         Args:
-            **kwargs: Parsed from LLM function-call payload. Expects ``file`` (str)
+            **kwargs: Parsed from LLM function-call payload. Expects ``path`` (str)
                 and optional ``line`` (int).
 
         Returns:
@@ -52,7 +53,7 @@ class ClearBreakpoint(Tool):
                 code='debug-unavailable',
             )
 
-        file = kwargs['file']
+        file = kwargs['path']
         line = kwargs.get('line')
 
         try:

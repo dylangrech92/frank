@@ -25,6 +25,7 @@ class RenameSymbol(Tool):
     """
 
     name = 'rename_symbol'
+    summary = 'Rename a symbol across the workspace (IDE F2).'
     description = (
         'Rename the symbol at a position across the whole workspace '
         '(like an IDE\'s F2); applies the multi-file edit immediately. '

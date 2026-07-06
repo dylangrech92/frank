@@ -7,6 +7,7 @@ Ollama with the openai suffix, LMStudio) and returns parsed ``ChatResponse`` obj
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from config import LLMConfig
@@ -51,15 +52,125 @@ class ChatResponse:
     tool_calls: List[ToolCall] = field(default_factory=list)
 
 
+def _strip_outer_braces(args_str: str) -> str:
+    """Strip markdown code fences and any junk outside the outermost ``{...}``.
+
+    Returns the substring from the first ``{`` to the last ``}`` inclusive, or
+    the input unchanged when no ``{`` / ``}`` pair is found.
+    """
+    start = args_str.find("{")
+    end = args_str.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return args_str
+    return args_str[start:end + 1]
+
+
+def _escape_raw_control_chars_in_strings(args_str: str) -> str:
+    """Escape literal newlines/tabs that appear inside double-quoted string values.
+
+    A small state-machine scan: outside of a string, characters pass through
+    unchanged; inside a double-quoted string (tracking ``\\"`` escapes so a
+    quote does not falsely end the string), a raw ``\\n`` becomes ``\\\\n`` and
+    a raw ``\\t`` becomes ``\\\\t``.
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in args_str:
+        if in_string:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == '"':
+                in_string = False
+                out.append(ch)
+                continue
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+            out.append(ch)
+        else:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+    return "".join(out)
+
+
+def _remove_trailing_commas(args_str: str) -> str:
+    """Remove commas that appear immediately before a closing ``}`` or ``]``.
+
+    Whitespace between the comma and the closing bracket is tolerated.
+    """
+    return re.sub(r",(\s*[}\]])", r"\1", args_str)
+
+
+def _repair_json(args_str: str) -> str | None:
+    """Attempt cheap, ordered repairs on a malformed tool-call arguments string.
+
+    Each repair is applied in turn and ``json.loads`` is retried after every
+    step; the first repair that yields valid JSON wins. Repairs are cumulative
+    (each builds on the previous step's output) since malformed payloads often
+    combine more than one issue (e.g. fenced *and* trailing-comma).
+
+    Args:
+        args_str: The raw, non-parsing arguments string.
+
+    Returns:
+        The repaired string (already verified to parse) on success, or
+        ``None`` when no repair combination produces valid JSON.
+    """
+    candidate = args_str
+    repairs = (
+        _strip_outer_braces,
+        _escape_raw_control_chars_in_strings,
+        _remove_trailing_commas,
+    )
+    for repair in repairs:
+        candidate = repair(candidate)
+        try:
+            json.loads(candidate)
+            return candidate
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return None
+
+
 def _tool_call_from_dict(raw: Dict[str, Any]) -> ToolCall:
-    """Convert a raw OpenAI-style tool-call dict into a ``ToolCall``."""
+    """Convert a raw OpenAI-style tool-call dict into a ``ToolCall``.
+
+    On a JSON parse failure, cheap repairs are attempted in order (see
+    ``_repair_json``) and ``json.loads`` retried after each. If every repair
+    fails, ``arguments`` is set to a small error-marker dict — never a silent
+    ``{}`` — so ``dispatch()`` can report the malformed payload back to the
+    model instead of it looking like a missing-parameter error.
+    """
     func = raw.get("function", {})
     name = func.get("name", "")
     args_str = func.get("arguments", "null")
+
+    if not isinstance(args_str, str):
+        return ToolCall(id=raw["id"], name=name, arguments={"raw": args_str})
+
     try:
-        arguments = json.loads(args_str) if isinstance(args_str, str) else {"raw": args_str}
-    except (json.JSONDecodeError, TypeError):
-        arguments = {}
+        arguments = json.loads(args_str)
+    except json.JSONDecodeError as exc:
+        repaired = _repair_json(args_str)
+        if repaired is not None:
+            arguments = json.loads(repaired)
+        else:
+            arguments = {
+                "__json_error__": str(exc),
+                "__raw__": args_str[:200],
+            }
+
     return ToolCall(id=raw["id"], name=name, arguments=arguments)
 
 
@@ -68,7 +179,8 @@ class LLMClient:
 
     Args:
         config: A frozen ``LLMConfig`` dataclass holding base_url, api_key, model,
-            temperature, max_tokens, and context_limit.
+            temperature, context_limit, and an optional max_tokens (None = do not
+            cap output; the reactive compaction loop governs the context budget).
 
     Example:
         >>> from config import LLMConfig  # doctest: +SKIP
@@ -98,7 +210,7 @@ class LLMClient:
 
     Raises:
         OverCapError: When the provider returns HTTP 400 with a body mentioning
-            *context\_length\_exceeded* or *maximum context length*.
+            *context_length_exceeded* or *maximum context length*.
         RuntimeError: For all other non-2xx responses, including the HTTP status
             and response body text.
     """
@@ -106,8 +218,10 @@ class LLMClient:
             "model": self.config.model,
             "messages": messages,
             "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
         }
+
+        if self.config.max_tokens is not None:
+            body["max_tokens"] = self.config.max_tokens
 
         if tools:
             body["tools"] = tools

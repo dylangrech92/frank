@@ -67,6 +67,7 @@ class WebSearch(Tool):
     """
 
     name = "web_search"
+    summary = 'Search the web (DuckDuckGo) for top results.'
     description = (
         "Search the web (DuckDuckGo) and return the top results as titles, URLs, and snippets."
     )

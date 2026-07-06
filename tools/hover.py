@@ -23,6 +23,7 @@ class Hover(Tool):
     """
 
     name = 'hover'
+    summary = 'Get type/signature info for the symbol at a position.'
     description = (
         'Get type/signature information for the symbol at a position in a file. '
         'Requires path, line (1-based), and column (1-based).'

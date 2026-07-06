@@ -42,6 +42,7 @@ class RecordPivot(Tool):
     """Record a pivot node that supersedes one or more existing nodes (transactional)."""
 
     name = 'record_pivot'
+    summary = 'Record a pivot that supersedes prior decision/spec nodes.'
     description = (
         'Record a pivot: a change of direction that supersedes one or more existing '
         'decision/spec/pivot nodes. Provide a title, why the pivot happened, and the '

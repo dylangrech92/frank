@@ -19,6 +19,7 @@ class CreateFile(Tool):
     """
 
     name = 'create_file'
+    summary = 'Create a new file with given content.'
     description = (
         'Creates a new file with the given content inside the project. '
         'The path must be relative to the project root.'

@@ -18,6 +18,7 @@ class UpdateFile(Tool):
     """
 
     name = 'update_file'
+    summary = 'Overwrite an existing file with new content (full overwrite).'
     description = (
         'Overwrites an existing file with entirely new content (full overwrite, not a patch). '
         'The path must be relative to the project root.'

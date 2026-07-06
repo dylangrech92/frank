@@ -12,6 +12,7 @@ class RecordSpec(Tool):
     """Record a specification: a title, its body, and optional acceptance/status."""
 
     name = 'record_spec'
+    summary = 'Record a specification for a feature/component.'
     description = (
         'Record a specification for a feature or component: a short title, the spec '
         'body, and optionally acceptance criteria and a status (e.g. draft, '

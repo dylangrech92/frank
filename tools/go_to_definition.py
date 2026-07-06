@@ -23,10 +23,12 @@ class GoToDefinition(Tool):
     """
 
     name = 'go_to_definition'
+    summary = 'Jump to the definition of the symbol at a position.'
     description = (
         'Navigate to the definition of the symbol at a position in a file. '
         'Requires path, line (1-based), and column (1-based).'
     )
+    alternative = 'find_symbol'
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {

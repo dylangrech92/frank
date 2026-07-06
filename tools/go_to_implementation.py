@@ -23,6 +23,7 @@ class GoToImplementation(Tool):
     """
 
     name = 'go_to_implementation'
+    summary = 'Jump to the implementation of the symbol at a position.'
     description = (
         'Navigate to the implementation of the symbol at a position in a file. '
         'Requires path, line (1-based), and column (1-based).'

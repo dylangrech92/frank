@@ -31,6 +31,7 @@ class FormatFile(Tool):
     """
 
     name = 'format'
+    summary = 'Format a source file in place (LSP or CLI formatter).'
     description = (
         'Format a source file in place using the language server\'s formatter, '
         'or a configured CLI formatter for languages whose server cannot format '
@@ -213,7 +214,7 @@ class FormatFile(Tool):
         if proc.returncode != 0:
             stderr = proc.stderr.strip() or proc.stdout.strip()
             return ToolResult.err(
-                f'{command[0]} failed: {stderr[:500]}',
+                f'{command[0]} failed: {stderr}',
                 code='edit-failed',
             )
 

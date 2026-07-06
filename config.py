@@ -13,7 +13,7 @@ class LLMConfig:
     api_key: str
     model: str
     temperature: float = 0.2
-    max_tokens: int = 4096
+    max_tokens: int | None = None
     context_limit: int = 128000
 
 

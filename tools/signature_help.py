@@ -23,6 +23,7 @@ class SignatureHelp(Tool):
     """
 
     name = 'signature_help'
+    summary = 'Get parameter hints for a function call at a position.'
     description = (
         'Get parameter hints for a function call at a position '
         '(line/column 1-based, typically placed inside the call parentheses).'

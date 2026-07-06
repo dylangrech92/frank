@@ -12,6 +12,7 @@ class DebugStop(Tool):
     """Stop the current debug session and tear down the adapter cleanly."""
 
     name = "debug_stop"
+    summary = 'Stop the current debug session and tear down the adapter.'
     description = (
         "Stop the current debug session and tear down the adapter cleanly."
     )

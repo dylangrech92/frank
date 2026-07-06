@@ -12,6 +12,7 @@ class RecordDecision(Tool):
     """Record a design decision, its rationale, and the alternatives considered."""
 
     name = 'record_decision'
+    summary = 'Record a design/architecture decision.'
     description = (
         'Record a design/architecture decision: a short title, the rationale, and '
         'optionally the alternatives considered and the id of a node this decision '

@@ -12,6 +12,7 @@ class RecordRule(Tool):
     """Record a project rule that is injected into every assembled context."""
 
     name = 'record_rule'
+    summary = 'Record an always-enforced project rule.'
     description = (
         'Record an always-enforced project rule (e.g. a naming convention or '
         'invariant). Active rules are injected into every context so the agent '

@@ -4,12 +4,13 @@ import argparse
 import os
 import sys
 
+import ui
 from agent import handle_user_message
 from config import Config, load as config_load
 from dap.manager import DAPManager, DebugUnavailableError
 from lsp.manager import LSPManager, LSPUnavailableError
 from llm import LLMClient
-from session import Session
+from session import Session, list_sessions
 from runtime.process import reap_all
 from tools.registry import discover
 from diagnostics import STORE
@@ -44,6 +45,14 @@ def session_start_jobs(session: Session, client: LLMClient) -> None:
         from memory.flashback import register_flashback_provider
 
         register_flashback_provider()
+    except Exception:
+        pass
+
+    try:
+        from session import CONTEXT_PROVIDERS
+        from tools.registry import render_catalog_block
+
+        CONTEXT_PROVIDERS.append(lambda _session: render_catalog_block())
     except Exception:
         pass
 
@@ -110,9 +119,26 @@ def session_end_jobs(session: Session, client: LLMClient) -> None:
 # =============================================================================
 
 SYSTEM_PROMPT = (
-    "You are a coding agent operating on the user's project through tools. "
-    "Call tools when you need real information about the project. "
-    "Answer conversationally otherwise."
+    "You are a coding agent operating on the user's project through tools. Only "
+    "`load_tool` is loaded by default; the system message lists every other tool "
+    "as name(params): summary — call load_tool(name) and that tool becomes "
+    "callable immediately.\n"
+    "\n"
+    "Working rules:\n"
+    "- Ground claims in tool results; if you have not looked, look before answering.\n"
+    "- Read code before editing it; after editing, check diagnostics before moving on.\n"
+    "- Fix causes, not symptoms, and prefer the smallest change that achieves the goal.\n"
+    "- Never suppress or work around an error you do not understand — investigate it.\n"
+    "- When a tool call errors, fix the specific problem named in the error before "
+    "retrying; never resend identical arguments. If the same call fails twice, "
+    "change approach or tell the user.\n"
+    "- Tool outputs from earlier turns are pruned from your context; restate "
+    "load-bearing paths, values, and excerpts in your replies so they survive.\n"
+    "- Once you have what you need, stop calling tools and answer. When you change "
+    "code, verify by running the relevant code or tests.\n"
+    "- Touch only what the task requires.\n"
+    "\n"
+    "Answer conversationally when no tool is needed."
 )
 
 # Module-level handle to the LSP manager so tools can reach it later.
@@ -135,78 +161,126 @@ def main() -> None:
         action="store_true",
         help="Dump the exact assembled context per LLM call and echo tool activity",
     )
+    default_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
     parser.add_argument(
         "--config",
-        default="config.json",
-        help="Path to the config file (default: config.json)",
+        default=default_config,
+        help=f"Path to the config file (default: {default_config})",
+    )
+    parser.add_argument(
+        "--session",
+        default=None,
+        metavar="ID",
+        help="Resume an existing session by id instead of starting a fresh one",
+    )
+    parser.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help="List available session ids for the current project directory and exit",
+    )
+    parser.add_argument(
+        "--pretty",
+        action="store_true",
+        help="Colorize interactive output (tool calls, results, telemetry, errors)",
     )
     args = parser.parse_args()
+    ui.enable(args.pretty)
+
+    project_root: str = os.getcwd()
+
+    if args.list_sessions:
+        sessions = list_sessions(project_root)
+        if not sessions:
+            print("No sessions found for this project.")
+        else:
+            for session_id, count in sessions:
+                count_str = f"{count} message(s)" if count is not None else "unknown message count"
+                print(f"{session_id}  ({count_str})")
+        return
+
     os.environ["CODING_AGENT_CONFIG"] = os.path.abspath(args.config)
 
     try:
         cfg: Config = config_load(args.config)
     except FileNotFoundError as exc:
-        print(str(exc), file=sys.stderr)
+        print(ui.error(str(exc)), file=sys.stderr)
         sys.exit(1)
 
-    project_root: str = os.getcwd()
+    print(ui.telemetry(f"config: {os.path.abspath(args.config)}"), file=sys.stderr)
+
     discover()
     client = LLMClient(cfg.llm)
-    session = Session(project_root, cfg.llm.model, SYSTEM_PROMPT)
-    session_start_jobs(session, client)
+    try:
+        if args.session:
+            session = Session.resume(project_root, cfg.llm.model, SYSTEM_PROMPT, args.session)
+        else:
+            session = Session(project_root, cfg.llm.model, SYSTEM_PROMPT)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(ui.error(str(exc)), file=sys.stderr)
+        sys.exit(1)
 
-    global MANAGER
-    MANAGER = LSPManager(cfg.language_servers, project_root)
-    MANAGER.on_client_start = lambda client: client.on_notification(
-        "textDocument/publishDiagnostics", STORE.handle_publish
-    )
-    MANAGER.on_purge(STORE.purge)
-    for line in MANAGER.prewarm():
-        print(line, file=sys.stderr)
+    try:
+        session_start_jobs(session, client)
 
-    print(
-        f"Starting coding-agent on model '{session.model}' "
-        f"with transcript at {session.transcript_path}",
-        file=sys.stderr,
-    )
+        global MANAGER
+        MANAGER = LSPManager(cfg.language_servers, project_root)
+        MANAGER.on_client_start = lambda client: client.on_notification(
+            "textDocument/publishDiagnostics", STORE.handle_publish
+        )
+        MANAGER.on_purge(STORE.purge)
+        for line in MANAGER.prewarm():
+            print(line, file=sys.stderr)
 
-    global DEBUG_MANAGER
-    DEBUG_MANAGER = DAPManager(cfg.debug_adapters, project_root)
-
-    while True:
-        try:
-            text: str = input("> ")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-
-        stripped = text.strip()
-        if not stripped:
-            continue
-        if stripped in ("exit", "quit"):
-            break
-
-        try:
-            assistant_text: str = handle_user_message(stripped, session, client, args.verbose, cfg.compaction)
-            print(assistant_text)
-        except Exception as exc:
-            print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)
-            continue
-
-    reaped = reap_all()
-    if reaped:
         print(
-            f'Reaped {len(reaped)} background process(es).',
+            ui.telemetry(
+                f"Starting coding-agent on model '{session.model}' "
+                f"| session id: {session.session_id} "
+                f"| transcript at {session.transcript_path}"
+            ),
             file=sys.stderr,
         )
 
-    if MANAGER is not None:
-        MANAGER.shutdown_all()
+        global DEBUG_MANAGER
+        DEBUG_MANAGER = DAPManager(cfg.debug_adapters, project_root)
 
-    if DEBUG_MANAGER is not None and DEBUG_MANAGER.active:
-        DEBUG_MANAGER.stop()
+        while True:
+            try:
+                text: str = input(ui.prompt_marker("> "))
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
 
-    session_end_jobs(session, client)
+            stripped = text.strip()
+            if not stripped:
+                continue
+            if stripped in ("exit", "quit"):
+                break
+
+            try:
+                assistant_text: str = handle_user_message(
+                    stripped, session, client, args.verbose, cfg.compaction
+                )
+                print(ui.assistant(assistant_text))
+            except Exception as exc:
+                print(ui.error(f"Error: {type(exc).__name__}: {exc}"), file=sys.stderr)
+                continue
+
+        reaped = reap_all()
+        if reaped:
+            print(
+                f'Reaped {len(reaped)} background process(es).',
+                file=sys.stderr,
+            )
+
+        if MANAGER is not None:
+            MANAGER.shutdown_all()
+
+        if DEBUG_MANAGER is not None and DEBUG_MANAGER.active:
+            DEBUG_MANAGER.stop()
+
+        session_end_jobs(session, client)
+    finally:
+        session.close()
 
 
 if __name__ == "__main__":

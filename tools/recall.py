@@ -16,6 +16,7 @@ class Recall(Tool):
     """
 
     name = 'recall'
+    summary = 'Search project memory for facts relevant to a query.'
     description = (
         'Search the project persistent memory for facts relevant to a '
         'natural-language query. Returns the most relevant remembered atoms '

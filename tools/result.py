@@ -67,20 +67,3 @@ class ToolResult:
             **meta: Metadata key-value pairs (values must be str/int/float/bool).
         """
         return cls(status="error", body=message, code=code, hint=hint, meta={**meta})
-
-
-def truncate(text: str, limit: int) -> tuple[str, bool]:
-    """Return ``(text, False)`` when ``len(text) <= limit``, else ``(text[:limit], True)``.
-
-    Args:
-        text: The text to possibly truncate.
-        limit: Maximum allowed length (must be >= 0).
-
-    Raises:
-        ValueError: If *limit* is negative.
-    """
-    if limit < 0:
-        raise ValueError(f"limit must be >= 0, got {limit}")
-    if len(text) <= limit:
-        return text, False
-    return text[:limit], True

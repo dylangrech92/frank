@@ -21,10 +21,13 @@ class WebRead(Tool):
     """
 
     name = "web_read"
+    summary = 'Fetch a public URL and return its readable text.'
     description = (
         "Fetch a public http(s) URL and return its readable text content "
         "(HTML is cleaned and extracted). Private and internal addresses are blocked."
     )
+    action = 'fetch the page'
+    oversize_hint = 'request a more specific URL or section'
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -34,7 +37,11 @@ class WebRead(Tool):
             },
             "max_chars": {
                 "type": "integer",
-                "description": "Truncate the extracted text to this many characters. Default 20000.",
+                "description": (
+                    "Optionally cap the extracted text to this many characters "
+                    "(absolute cap 200000). When omitted, the full extracted text is "
+                    "returned."
+                ),
             },
         },
         "required": ["source"],
@@ -45,7 +52,8 @@ class WebRead(Tool):
 
         Args:
             source: The http(s) URL to fetch and extract text from.
-            max_chars: Optional character cap (default 20000, absolute cap 200000).
+            max_chars: Optional character cap (absolute cap 200000). When omitted,
+                the full extracted text is returned.
 
         Returns:
             A ``ToolResult`` with the extracted text or an error description.
@@ -69,13 +77,12 @@ class WebRead(Tool):
             )
 
         # -------------------------------------------------------------------
-        # 2. max_chars
+        # 2. max_chars — only caps when the caller explicitly asks for it
         # -------------------------------------------------------------------
         max_chars_raw = kwargs.get("max_chars")
+        max_chars: int | None = None
         if isinstance(max_chars_raw, int) and max_chars_raw > 0:
             max_chars = min(max_chars_raw, 200000)
-        else:
-            max_chars = 20000
 
         # -------------------------------------------------------------------
         # 3. Fetch
@@ -139,10 +146,10 @@ class WebRead(Tool):
             )
 
         # -------------------------------------------------------------------
-        # 7. Truncate
+        # 7. Cap only when the caller explicitly requested max_chars
         # -------------------------------------------------------------------
         truncation_marker = ""
-        if len(text) > max_chars:
+        if max_chars is not None and len(text) > max_chars:
             text, actually_truncated = truncate_text_at(text, max_chars)
             if actually_truncated:
                 truncation_marker = f"\n[truncated at {max_chars} characters]"

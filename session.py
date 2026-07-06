@@ -8,6 +8,7 @@ persisted without loss.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List
@@ -25,6 +26,142 @@ CONTEXT_PROVIDERS: List[Callable[[Any], str]] = []
 def _format_json(obj: Any) -> str:
     """Pretty-print *obj* as JSON with two-space indentation and trailing newline."""
     return json.dumps(obj, indent=2) + "\n"
+
+
+def _parse_frontmatter(text: str) -> tuple[Dict[str, str], str]:
+    """Split a persisted transcript file into its frontmatter dict and JSON body text.
+
+    The file is expected to open with a ``---`` delimited block of ``key: value``
+    lines followed by a second ``---`` line and then the JSON body. Files that do
+    not start with the delimiter are treated as having no frontmatter at all.
+
+    Args:
+        text: Full contents of a transcript file.
+
+    Returns:
+        A tuple of (frontmatter dict, remaining body text).
+    """
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+
+    if end is None:
+        return {}, text
+
+    frontmatter: Dict[str, str] = {}
+    for line in lines[1:end]:
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        frontmatter[key.strip()] = value.strip()
+
+    body_text = "\n".join(lines[end + 1:])
+    return frontmatter, body_text
+
+
+def _load_transcript(
+    path: Path,
+) -> tuple[List[Dict[str, Any]], str | None, int, datetime, int | None]:
+    """Load a persisted transcript file for resuming a session.
+
+    Supports both the original body schema (a bare JSON array of messages) and
+    the additive schema (a JSON object with ``messages``, ``summary``,
+    ``summary_covers`` and ``episodic_watermark`` keys), so old transcripts
+    written before compaction state was persisted still load correctly.
+
+    Args:
+        path: Path to the ``<session_id>.json`` transcript file.
+
+    Returns:
+        A tuple of (messages, summary or None, summary_covers,
+        created_at, episodic_watermark or None). ``episodic_watermark`` is
+        ``None`` for legacy bare-array transcripts, signalling the caller
+        should seed it to ``len(messages)`` rather than 0.
+
+    Raises:
+        ValueError: If the file's JSON body is malformed or is not shaped like
+            a transcript (neither a bare list nor a dict).
+    """
+    text = path.read_text(encoding="utf-8")
+    frontmatter, body_text = _parse_frontmatter(text)
+
+    try:
+        body = json.loads(body_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"transcript corrupt: {path}: invalid JSON ({exc})") from exc
+
+    episodic_watermark: int | None
+    if isinstance(body, list):
+        messages: List[Dict[str, Any]] = body
+        summary: str | None = None
+        summary_covers = 0
+        episodic_watermark = None
+    elif isinstance(body, dict) and isinstance(body.get("messages"), list):
+        messages = body["messages"]
+        summary = body.get("summary")
+        summary_covers = body.get("summary_covers", 0)
+        episodic_watermark = body.get("episodic_watermark", 0)
+    else:
+        raise ValueError(
+            f"transcript corrupt: {path}: body is neither a message list nor a "
+            f"dict with a 'messages' list"
+        )
+
+    created_at_raw = frontmatter.get("created_at")
+    if created_at_raw:
+        try:
+            created_at = datetime.strptime(created_at_raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            created_at = datetime.now(timezone.utc)
+    else:
+        created_at = datetime.now(timezone.utc)
+
+    return messages, summary, summary_covers, created_at, episodic_watermark
+
+
+def list_sessions(project_root: str | Path) -> List[tuple[str, int | None]]:
+    """List available session ids for *project_root*, newest first (by file mtime).
+
+    Files whose body is neither a bare message list nor a dict with a
+    ``messages`` list are skipped entirely — they are not valid transcripts.
+
+    Args:
+        project_root: Root directory of the project (str or Path).
+
+    Returns:
+        A list of (session_id, message_count) tuples. ``message_count`` is
+        ``None`` when the transcript could not be parsed cheaply.
+    """
+    root = Path(project_root).resolve()
+    session_dir = root / ".coding_agent" / "sessions"
+    if not session_dir.is_dir():
+        return []
+
+    entries: List[tuple[str, float, int | None]] = []
+    for p in session_dir.glob("*.json"):
+        try:
+            _, body_text = _parse_frontmatter(p.read_text(encoding="utf-8"))
+            body = json.loads(body_text)
+            if isinstance(body, list):
+                count: int | None = len(body)
+            elif isinstance(body, dict) and isinstance(body.get("messages"), list):
+                count = len(body["messages"])
+            else:
+                continue
+        except Exception:
+            continue
+        entries.append((p.stem, p.stat().st_mtime, count))
+
+    entries.sort(key=lambda e: e[1], reverse=True)
+    return [(sid, count) for sid, _mtime, count in entries]
 
 
 def _prune_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -74,34 +211,134 @@ def _prune_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 class Session:
     """A conversation transcript stored with full fidelity on disk.
 
-    Every launch creates a fresh file; there is no resume of prior transcripts.
+    A fresh launch creates a new file whose session id is unique even across
+    concurrent same-second launches (timestamp + pid). ``Session.resume`` loads
+    an existing transcript by session id and continues appending to it.
 
     Args:
         project_root: Root directory of the project (str or Path).
         model: Model identifier for this session.
         system_prompt: Base system prompt for the assistant.
+        session_id: When resuming, the existing session id to reuse. Leave unset
+            to mint a fresh id for a new session.
+        messages: When resuming, the prior message list to seed the transcript with.
+        summary: When resuming, a previously persisted compaction summary, if any.
+        summary_covers: When resuming, how many leading messages ``summary`` covers.
+        created_at: When resuming, the original creation timestamp to preserve.
+        episodic_watermark: When resuming, the row count already handed to the
+            episodic encoder, so a resumed session does not re-mine old history.
+
+    Raises:
+        RuntimeError: If another live process already holds the lock on this
+            session's transcript (see ``_acquire_lock``).
     """
 
-    def __init__(self, project_root: str | Path, model: str, system_prompt: str) -> None:
+    def __init__(
+        self,
+        project_root: str | Path,
+        model: str,
+        system_prompt: str,
+        *,
+        session_id: str | None = None,
+        messages: List[Dict[str, Any]] | None = None,
+        summary: str | None = None,
+        summary_covers: int = 0,
+        created_at: datetime | None = None,
+        episodic_watermark: int = 0,
+    ) -> None:
         self.project_root = Path(project_root).resolve()
         self.model = model
         self.system_prompt = system_prompt
-        self._messages: List[Dict[str, Any]] = []
+        self._messages: List[Dict[str, Any]] = list(messages) if messages is not None else []
 
-        now_local = datetime.now()
-        now_utc = now_local.astimezone(timezone.utc)
-        self.created_at = now_utc
-        self.session_id = now_local.strftime("%Y-%m-%dT%H:%M:%S").replace(":", "-")
+        if session_id is not None:
+            self.session_id = session_id
+            self.created_at = created_at or datetime.now(timezone.utc)
+        else:
+            now_local = datetime.now()
+            now_utc = now_local.astimezone(timezone.utc)
+            self.created_at = now_utc
+            self.session_id = (
+                f"{now_local.strftime('%Y-%m-%dT%H:%M:%S').replace(':', '-')}-{os.getpid()}"
+            )
 
         session_dir = self.project_root / ".coding_agent" / "sessions"
         session_dir.mkdir(parents=True, exist_ok=True)
         self.transcript_path: Path = session_dir / f"{self.session_id}.json"
+        self._lock_path: Path = self.transcript_path.with_suffix(
+            self.transcript_path.suffix + ".lock"
+        )
 
         # Compaction watermark: when a summary is set, the first ``_summary_covers``
         # entries of ``_messages`` are replaced by ``_summary`` in the ASSEMBLED
         # view only. The on-disk transcript (_messages) always stays full-fidelity.
-        self._summary: str | None = None
-        self._summary_covers: int = 0
+        self._summary: str | None = summary
+        self._summary_covers: int = summary_covers
+
+        # Episodic-extraction watermark: row count already handed to the encoder.
+        # Persisted so a resumed session does not re-mine already-mined history.
+        self.episodic_watermark: int = episodic_watermark
+
+        self._acquire_lock()
+
+    @classmethod
+    def resume(
+        cls, project_root: str | Path, model: str, system_prompt: str, session_id: str
+    ) -> "Session":
+        """Load an existing transcript by *session_id* and return a resumable Session.
+
+        Any previously persisted compaction summary is restored so the assembled
+        context picks up exactly where the prior run left off. Legacy transcripts
+        that predate the episodic watermark field seed it to the full message
+        count, so old history is never re-mined.
+
+        Args:
+            project_root: Root directory of the project (str or Path).
+            model: Model identifier to use going forward (may differ from the
+                model recorded in the transcript's frontmatter).
+            system_prompt: Base system prompt for the assistant.
+            session_id: The session id to resume (matches an existing
+                ``<session_id>.json`` transcript file).
+
+        Returns:
+            A ``Session`` seeded with the prior transcript's messages and summary.
+
+        Raises:
+            FileNotFoundError: If no transcript exists for *session_id*, listing
+                the available session ids for the project.
+            ValueError: If the transcript file exists but its JSON body is
+                corrupt or not shaped like a transcript.
+            RuntimeError: If another live process already holds the lock on
+                this session.
+        """
+        root = Path(project_root).resolve()
+        session_dir = root / ".coding_agent" / "sessions"
+        path = session_dir / f"{session_id}.json"
+
+        if not path.exists():
+            available = [sid for sid, _ in list_sessions(root)]
+            available_str = ", ".join(available) if available else "(none found)"
+            raise FileNotFoundError(
+                f"session '{session_id}' not found at {path}. "
+                f"Available sessions: {available_str}"
+            )
+
+        messages, summary, summary_covers, created_at, episodic_watermark = _load_transcript(path)
+        if episodic_watermark is None:
+            # Legacy transcript with no persisted watermark: skip re-mining old history.
+            episodic_watermark = len(messages)
+
+        return cls(
+            root,
+            model,
+            system_prompt,
+            session_id=session_id,
+            messages=messages,
+            summary=summary,
+            summary_covers=summary_covers,
+            created_at=created_at,
+            episodic_watermark=episodic_watermark,
+        )
 
     def append_user(self, text: str) -> None:
         """Append a user message and persist.
@@ -181,6 +418,19 @@ class Session:
         self._summary = summary_text
         self._summary_covers = covers_count
 
+    def set_episodic_watermark(self, count: int) -> None:
+        """Persist the episodic-extraction watermark (row count already mined).
+
+        Called by the episodic-extraction hook whenever it advances the
+        watermark, so a resumed session picks up where mining left off instead
+        of re-enqueueing already-mined history.
+
+        Args:
+            count: Total messages already handed to the episodic encoder.
+        """
+        self.episodic_watermark = count
+        self._persist()
+
     def assemble_context(self) -> List[Dict[str, str]]:
         """Return the list of message dicts to send to the LLM.
 
@@ -222,7 +472,13 @@ class Session:
     # ------------------------------------------------------------------ private
 
     def _persist(self) -> None:
-        """Write YAML frontmatter followed by the JSON messages array to disk."""
+        """Write YAML frontmatter followed by the JSON messages array to disk.
+
+        Writes to a pid-suffixed sibling temp file first, then atomically
+        renames it into place via ``os.replace`` so a resuming reader never
+        observes a partially-written transcript (the file is now load-bearing
+        for ``Session.resume``, not just an append-only log).
+        """
         lines = [
             "---",
             f"session_id: {self.session_id}",
@@ -232,8 +488,72 @@ class Session:
             "---",
         ]
 
-        body = _format_json(self._messages)
+        body_obj: Dict[str, Any] = {"messages": self._messages}
+        if self._summary:
+            body_obj["summary"] = self._summary
+            body_obj["summary_covers"] = self._summary_covers
+        if self.episodic_watermark:
+            body_obj["episodic_watermark"] = self.episodic_watermark
+
+        body = _format_json(body_obj)
         file_contents = "\n".join(lines) + "\n" + body
 
-        with open(self.transcript_path, "w", encoding="utf-8") as f:
+        tmp_path = self.transcript_path.with_suffix(
+            self.transcript_path.suffix + f".{os.getpid()}.tmp"
+        )
+        with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(file_contents)
+        os.replace(tmp_path, self.transcript_path)
+
+    def _acquire_lock(self) -> None:
+        """Claim an advisory lock on this session's transcript.
+
+        Writes ``<transcript>.lock`` containing this process's pid. If a lock
+        file already exists and its pid is still alive, refuse to proceed —
+        two processes must never append to the same transcript concurrently.
+        A lock left behind by a dead process is treated as stale and replaced.
+
+        Raises:
+            RuntimeError: If another live process already holds the lock.
+        """
+        if self._lock_path.exists():
+            try:
+                existing_pid_text = self._lock_path.read_text(encoding="utf-8").strip()
+                existing_pid = int(existing_pid_text)
+            except (OSError, ValueError):
+                existing_pid = None
+
+            alive = False
+            if existing_pid is not None:
+                try:
+                    os.kill(existing_pid, 0)
+                    alive = True
+                except ProcessLookupError:
+                    alive = False
+                except PermissionError:
+                    # Process exists but we can't signal it — treat as alive.
+                    alive = True
+                except OSError:
+                    alive = False
+
+            if alive:
+                raise RuntimeError(
+                    f"session '{self.session_id}' is already active in process "
+                    f"{existing_pid} — resume it from that process or use a "
+                    f"different --session id"
+                )
+
+        self._lock_path.write_text(str(os.getpid()), encoding="utf-8")
+
+    def close(self) -> None:
+        """Release this session's advisory lock file, if this process still owns it.
+
+        Safe to call multiple times and safe to call even if the lock was
+        never successfully acquired (e.g. constructor raised before writing
+        it) — both cases are silently no-ops.
+        """
+        try:
+            if self._lock_path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                self._lock_path.unlink()
+        except OSError:
+            pass

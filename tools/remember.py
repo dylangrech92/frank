@@ -19,6 +19,7 @@ class Remember(Tool):
     """
 
     name = 'remember'
+    summary = 'Persist a durable (kind, key, value) fact to memory.'
     description = (
         'Save a durable fact as a (kind, key, value) atom in the project memory. '
         'Always reuse the same *key* when updating an existing fact so it is '

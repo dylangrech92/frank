@@ -23,12 +23,15 @@ class RunCommand(Tool):
     """
 
     name = 'run_command'
+    summary = 'Run a shell command (foreground or background).'
     description = (
         'Runs a shell command inside the project root. The default mode is '
         'foreground and waits for result; set background=true to run it in '
         'the background and poll later. A deny-list blocks certain hazardous '
         'commands before they are executed.'
     )
+    action = 'run the command'
+    oversize_hint = 'pipe the output through head/tail or redirect it to a file and read a slice'
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {

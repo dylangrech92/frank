@@ -108,12 +108,15 @@ class Git(Tool):
     """
 
     name = 'git'
+    summary = 'Run an allow-listed git subcommand in the project.'
     description = (
         'Runs a restricted set of git subcommands inside the project root. '
         'Only whitelisted subcommands are allowed; destructive operations (reset, clean, '
         'restore checkout -- style) are blocked by default. Set '
         '`git.allow_destructive` to true in config.json to enable them.'
     )
+    action = 'run the git command'
+    oversize_hint = 'limit with -n, a path filter, or --stat'
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {

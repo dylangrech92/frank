@@ -15,7 +15,7 @@ from tools.result import ToolResult
 class GetDiagnostics(Tool):
     """Reports LSP diagnostics for every open file in the sandbox.
 
-    When *file* is given, only diagnostics whose resolved path ends with that
+    When *path* is given, only diagnostics whose resolved path ends with that
     string are included.
 
     The body is one line per diagnostic::
@@ -27,14 +27,15 @@ class GetDiagnostics(Tool):
     """
 
     name = 'get_diagnostics'
+    summary = 'Report current LSP diagnostics for a file or project.'
     description = (
         'Report current language-server diagnostics for the project or a single file. '
-        'When file is given, restrict to diagnostics whose path ends with that string.'
+        'When path is given, restrict to diagnostics whose path ends with that string.'
     )
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {
-            'file': {
+            'path': {
                 'type': 'string',
                 'description': 'Optional file path suffix to filter diagnostics (e.g. "main.py"). '
                                'When absent, report all diagnostics.',
@@ -47,7 +48,7 @@ class GetDiagnostics(Tool):
 
         Args:
             **kwargs: Parsed from LLM function-call payload.  Expects optional
-                ``file`` (str) to filter diagnostics by path suffix.
+                ``path`` (str) to filter diagnostics by path suffix.
 
         Returns:
             A ``ToolResult`` with formatted diagnostic lines as its body on success,
@@ -61,7 +62,7 @@ class GetDiagnostics(Tool):
                 code='lsp-unavailable',
             )
 
-        file_filter = kwargs.get('file')
+        file_filter = kwargs.get('path')
         pairs = STORE.full(file_filter=file_filter)
 
         if not pairs:

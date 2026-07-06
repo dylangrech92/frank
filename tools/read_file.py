@@ -19,10 +19,14 @@ class ReadFile(Tool):
     """
 
     name = 'read_file'
+    summary = 'Read a file\u2019s contents with optional line-range paging.'
     description = (
         'Reads a file inside the project returning its contents with optional line range. '
         'The path must be relative to the project root.'
     )
+    action = 'read the file'
+    oversize_hint = 'use start_line/end_line to read a smaller range'
+    alternative = 'list_files to check the path exists'
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {

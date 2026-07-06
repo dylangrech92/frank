@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.base import Tool
-from tools.result import ToolResult, truncate
+from tools.result import ToolResult
 from tools._sandbox import resolve_in_root
 
 
@@ -18,20 +18,27 @@ class Find(Tool):
 
     Returns matching lines with file path and line number. The *path* parameter
     limits the search to a subdirectory relative to the project root. When
-    *fuzzy* is false (the default), *term* is matched as a literal fixed string.
-    When *fuzzy* is true, *term* is split on whitespace and each part is matched
+    *fuzzy* is false (the default), *query* is matched as a literal fixed string.
+    When *fuzzy* is true, *query* is split on whitespace and each part is matched
     as a case-insensitive regular expression with anything between the parts.
+
+    For symbol names use find_symbol; for usages of a known symbol use find_references.
     """
 
     name = 'find'
+    summary = 'Search file contents across the project (ripgrep).'
     description = (
         'Searches file contents across the project using ripgrep, returning matching '
-        'lines with file and line number.'
+        'lines with file and line number. For symbol names use find_symbol; for usages '
+        'of a known symbol use find_references.'
     )
+    action = 'search'
+    oversize_hint = 'narrow the query or pass path to limit the scope'
+    alternative = 'find_symbol (symbol names) or find_references (usages)'
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {
-            'term': {
+            'query': {
                 'type': 'string',
                 'description': (
                     'The text to search for. When fuzzy is false, matched as a literal '
@@ -50,20 +57,20 @@ class Find(Tool):
                 'type': 'boolean',
                 'default': False,
                 'description': (
-                    'When false, term is matched as a literal fixed string. '
-                    'When true, term is split on whitespace and matched case-insensitively '
+                    'When false, query is matched as a literal fixed string. '
+                    'When true, query is split on whitespace and matched case-insensitively '
                     'with anything allowed between the whitespace-separated parts.'
                 ),
             },
         },
-        'required': ['term'],
+        'required': ['query'],
     }
 
     def run(self, **kwargs: Any) -> ToolResult:
         """Execute the find tool, searching file contents with ripgrep.
 
         Args:
-            **kwargs: Parsed from LLM function-call payload. Expects *term*
+            **kwargs: Parsed from LLM function-call payload. Expects *query*
                 (required), optional *path* (subdirectory to limit search), and
                 optional *fuzzy* (boolean toggle for pattern matching mode).
 
@@ -73,7 +80,7 @@ class Find(Tool):
             the project root.  On failure, a ``ToolResult.err`` with an
             appropriate kebab-case error code.
         """
-        term: str = kwargs.get('term', '') if isinstance(kwargs.get('term'), str) else ''
+        term: str = kwargs.get('query', '') if isinstance(kwargs.get('query'), str) else ''
         raw_path: str | None = kwargs.get('path')
         fuzzy: bool = kwargs.get('fuzzy', False)
 
@@ -147,12 +154,8 @@ class Find(Tool):
             lines = output.splitlines()
             lines = [l[2:] if l.startswith("./") else l for l in lines]
             output = '\n'.join(lines)
-            truncated, did_trunc = truncate(output, 20000)
             match_count = len(output.splitlines())
-            extra_meta: dict[str, object] = {'match_count': match_count}
-            if did_trunc:
-                extra_meta['truncation_note'] = 'Output was truncated to 20000 characters.'
-            return ToolResult.ok(truncated, **extra_meta)
+            return ToolResult.ok(output, match_count=match_count)
 
         # Exit code 1: no matches
         if result.returncode == 1:

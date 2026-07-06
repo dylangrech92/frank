@@ -9,7 +9,7 @@ from typing import Any
 
 from tools._sandbox import emit_mutation
 from tools.base import Tool
-from tools.result import ToolResult, truncate
+from tools.result import ToolResult
 
 # Directories always skipped during the tree walk.
 _SKIP_DIRS = ('.git', '.coding_agent', '__pycache__')
@@ -26,6 +26,7 @@ class ReplaceMany(Tool):
     """
 
     name = 'replace_many'
+    summary = 'Replace every occurrence of a literal string across the project.'
     description = (
         'Replaces every occurrence of a literal string across the project and reports '
         'per-file replacement counts. When a ``glob`` pattern is provided, only file names '
@@ -65,8 +66,7 @@ class ReplaceMany(Tool):
 
         Returns:
             A ``ToolResult`` with a body listing per-file replacement counts on success,
-            or the string "no occurrences were found" when none matched.  The body is
-            truncated at 20 000 characters when exceeded.
+            or the string "no occurrences were found" when none matched.
         """
         search = kwargs.get('search', '') if isinstance(kwargs.get('search'), str) else ''
         replace = kwargs.get('replace', '') if isinstance(kwargs.get('replace'), str) else ''
@@ -127,12 +127,9 @@ class ReplaceMany(Tool):
 
         total = sum(c for _, c in changed_files)
         body_lines = [f'{path}: {cnt}' for path, cnt in changed_files]
-        body_str, truncated = truncate('\n'.join(body_lines), 20_000)
-        if truncated:
-            body_str += '\noutput truncated'
 
         return ToolResult.ok(
-            body_str,
+            '\n'.join(body_lines),
             files_changed=len(changed_files),
             total_replacements=total,
         )

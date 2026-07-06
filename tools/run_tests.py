@@ -32,11 +32,14 @@ class RunTests(Tool):
     """
 
     name = 'run_tests'
+    summary = 'Detect the test framework and run tests (pytest/jest/phpunit).'
     description = (
         'Detect the test framework (pytest, jest, or phpunit) for a directory '
         'and run its tests, returning structured per-test results. Optional pattern '
         'filters tests by name (-k / -t / --filter).'
     )
+    action = 'run the tests'
+    oversize_hint = 'use pattern to run a subset'
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {

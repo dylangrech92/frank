@@ -22,6 +22,7 @@ class DocumentSymbols(Tool):
     """
 
     name = 'document_symbols'
+    summary = 'Get the outline (classes/functions) of a file.'
     description = (
         'Returns the outline (classes, functions, methods) of a file. '
         'Requires path relative to the project root.'

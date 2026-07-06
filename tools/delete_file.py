@@ -20,6 +20,7 @@ class DeleteFile(Tool):
     """
 
     name = 'delete_file'
+    summary = 'Delete a file or empty directory.'
     description = (
         'Deletes a file or an empty directory inside the project. '
         'The path must be relative to the project root.'

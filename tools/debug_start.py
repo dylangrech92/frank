@@ -35,32 +35,33 @@ def _format_stop(d: dict, root: str) -> str:
 
 
 class DebugStart(Tool):
-    """Start a debug session for a target script (or a raw launch-config dict).
+    """Start a debug session for a script at ``path`` (or a raw launch-config dict).
 
     Runs to the first breakpoint or program end and reports where execution stopped,
     with the call stack.
     """
 
     name = "debug_start"
+    summary = 'Start a debug session for a script, run to first breakpoint.'
     description = (
-        'Start a debug session for a target script (or a raw launch-config dict). '
+        'Start a debug session for a script at path (or a raw launch-config dict). '
         'Runs to the first breakpoint or program end and reports where execution stopped, '
         'with the call stack.'
     )
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
-            "target": {
+            "path": {
                 "type": "string",
-                "description": "Path to the script to debug (relative to project root or absolute).",
+                "description": "Path of the script to debug (relative to project root or absolute).",
             },
             "config": {
                 "type": "object",
-                "description": "A raw DAP launch-config dict (advanced; used instead of target).",
+                "description": "A raw DAP launch-config dict (advanced; used instead of path).",
             },
             "language": {
                 "type": "string",
-                "description": "Debug adapter language. If omitted, it is inferred from the target file extension (e.g. .py->python, .php->php, .js->javascript); an unknown extension yields no adapter and a clear refusal.",
+                "description": "Debug adapter language. If omitted, it is inferred from the path's file extension (e.g. .py->python, .php->php, .js->javascript); an unknown extension yields no adapter and a clear refusal.",
             },
         },
     }
@@ -74,7 +75,7 @@ class DebugStart(Tool):
                 code="debug-unavailable",
             )
 
-        target = kwargs.get("target")
+        target = kwargs.get("path")
         config = kwargs.get("config")
         language = kwargs.get("language")
         if not language:
