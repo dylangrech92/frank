@@ -248,6 +248,8 @@ SYSTEM_PROMPT = (
     "load-bearing paths, values, and excerpts in your replies so they survive.\n"
     "- Once you have what you need, stop calling tools and answer. When you change "
     "code, verify by running the relevant code or tests.\n"
+    "- If the request is ambiguous, state the assumption you are proceeding on in "
+    "your answer.\n"
     "- Touch only what the task requires.\n"
     "\n"
     "Answer conversationally when no tool is needed."
