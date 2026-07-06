@@ -167,7 +167,9 @@ SYSTEM_PROMPT = (
     "You are a coding agent operating on the user's project through tools. Only "
     "`load_tool` is loaded by default; the system message lists every other tool "
     "as name(params): summary — call load_tool(name) and that tool becomes "
-    "callable immediately.\n"
+    "callable immediately. You are a software engineering agent: if a request is "
+    "unrelated to this project or software work, say so briefly and decline "
+    "rather than pursuing it.\n"
     "\n"
     "Working rules:\n"
     "- Ground claims in tool results; if you have not looked, look before answering.\n"
@@ -332,11 +334,18 @@ def main() -> None:
                 print(ui.error("one-shot task is empty"), file=sys.stderr)
                 exit_code = 1
             else:
+                # Stream deltas to stderr as live progress; stdout stays the
+                # pure final-answer channel for the orchestrating caller.
+                def _stderr_delta(piece: str) -> None:
+                    sys.stderr.write(piece)
+                    sys.stderr.flush()
+
                 try:
                     answer: str = handle_user_message(
-                        task, session, client, args.verbose, cfg.compaction
+                        task, session, client, args.verbose, cfg.compaction,
+                        on_delta=_stderr_delta,
                     )
-                    print(ui.assistant(answer))
+                    print(answer)
                 except Exception as exc:
                     print(ui.error(f"Error: {type(exc).__name__}: {exc}"), file=sys.stderr)
                     exit_code = 1
@@ -354,11 +363,25 @@ def main() -> None:
                 if stripped in ("exit", "quit"):
                     break
 
+                # Stream assistant text to stdout as it arrives. The agent loop
+                # guarantees the final answer reaches this sink exactly once
+                # (streamed or delivered whole on fallback), so nothing is
+                # printed again after handle_user_message returns.
+                first_piece = True
+
+                def _stdout_delta(piece: str) -> None:
+                    nonlocal first_piece
+                    if first_piece:
+                        first_piece = False
+                        sys.stdout.write(ui.assistant(""))
+                    sys.stdout.write(piece)
+                    sys.stdout.flush()
+
                 try:
-                    assistant_text: str = handle_user_message(
-                        stripped, session, client, args.verbose, cfg.compaction
+                    handle_user_message(
+                        stripped, session, client, args.verbose, cfg.compaction,
+                        on_delta=_stdout_delta,
                     )
-                    print(ui.assistant(assistant_text))
                 except Exception as exc:
                     print(ui.error(f"Error: {type(exc).__name__}: {exc}"), file=sys.stderr)
                     continue

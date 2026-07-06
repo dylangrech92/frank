@@ -12,6 +12,9 @@ import time
 import compaction
 import ui
 
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable
+
 from llm import ChatResponse, LLMClient, OverCapError, ToolCall
 from session import Session
 from tools.registry import dispatch, get_tool, schemas
@@ -347,6 +350,48 @@ def _loop_guard_check(
     return rendered + steer
 
 
+def _web_search_focus_check(name: str, result: ToolResult, rendered: str, searches_without_read: int) -> tuple[str, int]:
+    """Nudge the model to stop paraphrase-searching and read a result instead.
+
+    Reactive, zero-cost-on-happy-path mechanism mirroring ``_loop_guard_check``:
+    tracks consecutive successful ``web_search`` calls (per turn) with no
+    intervening ``web_read``.  Only ``web_search`` and ``web_read`` participate —
+    every other tool passes through the counter untouched.  Failed ``web_search``
+    calls do not count (the loop-guard already owns repeated failures).
+
+    Args:
+        name: Registered tool name for this call.
+        result: The (possibly oversize-guard-substituted) ``ToolResult``.
+        rendered: The rendered result text for this call.
+        searches_without_read: Running per-turn count of consecutive successful
+            ``web_search`` calls since the last ``web_read``.
+
+    Returns:
+        ``(rendered, searches_without_read)`` — *rendered* gets a ``[focus]``
+        suffix appended when this is the 3rd+ consecutive successful
+        ``web_search`` without a ``web_read`` in between; the updated counter is
+        always returned.
+    """
+    if name == "web_read":
+        return rendered, 0
+
+    if name != "web_search" or result.status != "success":
+        return rendered, searches_without_read
+
+    searches_without_read += 1
+    if searches_without_read >= 3:
+        n = searches_without_read
+        focus = (
+            f"\n\n[focus] This is web search #{n} this turn without reading any "
+            f"result. Searching again is unlikely to add new information — pick "
+            f"the most relevant result and web_read it, or answer with what you "
+            f"already have."
+        )
+        rendered = rendered + focus
+
+    return rendered, searches_without_read
+
+
 # =============================================================================
 # Main entry point
 # =============================================================================
@@ -357,6 +402,7 @@ def handle_user_message(
     client: LLMClient,
     verbose: bool = False,
     compaction_cfg: dict | None = None,
+    on_delta: Callable[[str], None] | None = None,
 ) -> str:
     """Execute one agent turn in response to a user message.
 
@@ -385,6 +431,13 @@ def handle_user_message(
         client: An ``LLMClient`` instance for sending chat requests.
         verbose: If True, prints the full assembled context lines (prefixed by
             "assembled context") to stderr before each LLM call.
+        on_delta: Optional sink for assistant text as it is produced. When set,
+            the final answer is guaranteed to be delivered through it exactly
+            once — streamed fragment-by-fragment when the provider streams,
+            or as one whole-text call on the non-streaming fallback — followed
+            by a single ``"\\n"``. Intermediate assistant text on tool-call
+            iterations streams through it too. Callers that pass *on_delta*
+            must NOT print the returned string again.
 
     Returns:
         The final assistant text string — either a normal turn response, an
@@ -401,6 +454,22 @@ def handle_user_message(
     # Per-turn (reset on every handle_user_message call) tracking of rendered
     # error envelopes seen so far, for the repeated-identical-failure loop-guard.
     seen_errors: dict[tuple[str, str], int] = {}
+    # Per-turn (reset on every handle_user_message call) count of consecutive
+    # successful web_search calls since the last web_read, for the reactive
+    # web-search focus nudge.
+    searches_without_read = 0
+
+    # Chars streamed through on_delta for the CURRENT client.chat call only
+    # (reset before each call), so the final-return path knows whether the
+    # answer already reached the sink or must be delivered whole (fallback).
+    streamed = 0
+
+    def _sink(piece: str) -> None:
+        nonlocal streamed
+        streamed += len(piece)
+        on_delta(piece)  # type: ignore[misc]  # only ever passed when on_delta is set
+
+    delta_cb = _sink if on_delta is not None else None
 
     def _over_cap_giveup() -> str:
         msg = (
@@ -408,6 +477,8 @@ def handle_user_message(
             "reduce it further. Start a new session or shorten the request."
         )
         session.append_assistant(msg)
+        if on_delta is not None:
+            on_delta(msg + "\n")
         return msg
 
     while True:
@@ -451,7 +522,8 @@ def handle_user_message(
             print("\n".join(msg_lines), file=sys.stderr)
 
         try:
-            response: ChatResponse = client.chat(context, tool_schemas)
+            streamed = 0
+            response: ChatResponse = client.chat(context, tool_schemas, delta_cb)
         except OverCapError:
             # Provider rejected on length despite the estimate — compact and retry.
             if compactions >= max_compactions or not compaction.compact(
@@ -467,19 +539,53 @@ def handle_user_message(
         session.append_assistant(response.text or "", tool_calls=tool_calls)
 
         if not response.tool_calls:
+            if on_delta is not None and response.text:
+                if streamed == 0:
+                    on_delta(response.text)  # non-streaming fallback: deliver whole
+                on_delta("\n")
             episodic_maybe_extract(session, client)
             return response.text
 
-        for call in response.tool_calls:
-            print(
-                ui.tool_call(f"Tool call: {call.name}({json.dumps(call.arguments)})"),
-                file=sys.stderr,
-            )
+        calls = response.tool_calls
+        # Intermediate assistant text on a tool-call iteration that did NOT
+        # stream is still worth surfacing; streamed text already reached the sink.
+        if on_delta is not None and response.text:
+            if streamed == 0:
+                on_delta(response.text)
+            on_delta("\n")
 
-            result = dispatch(call.name, call.arguments)
+        # Concurrent dispatch when the whole batch is read-only and thread-safe
+        # (see Tool.parallel_safe). Any unsafe or unknown tool in the batch
+        # forces the sequential path, preserving effect ordering.
+        parallel_results: list[ToolResult] | None = None
+        if len(calls) > 1 and all(
+            getattr(get_tool(c.name), "parallel_safe", False) for c in calls
+        ):
+            for call in calls:
+                print(
+                    ui.tool_call(f"Tool call: {call.name}({json.dumps(call.arguments)})"),
+                    file=sys.stderr,
+                )
+            with ThreadPoolExecutor(max_workers=min(8, len(calls))) as pool:
+                parallel_results = list(
+                    pool.map(lambda c: dispatch(c.name, c.arguments), calls)
+                )
+
+        for i, call in enumerate(calls):
+            if parallel_results is not None:
+                result = parallel_results[i]
+            else:
+                print(
+                    ui.tool_call(f"Tool call: {call.name}({json.dumps(call.arguments)})"),
+                    file=sys.stderr,
+                )
+                result = dispatch(call.name, call.arguments)
             rendered = render_tool_result(call.name, result)
             result, rendered = _guard_oversize_result(call.name, result, rendered, cap, est)
             rendered = _loop_guard_check(call.name, rendered, seen_errors)
+            rendered, searches_without_read = _web_search_focus_check(
+                call.name, result, rendered, searches_without_read
+            )
 
             print(ui.tool_result(rendered), file=sys.stderr)
 
