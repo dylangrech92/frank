@@ -20,6 +20,15 @@ from typing import Any, Callable, Dict, List
 _MAX_ATTEMPTS = 2
 _RETRY_BACKOFF_SECONDS = 1.0
 
+# Without an explicit timeout, requests blocks forever — one half-dead
+# keep-alive connection (or a request the server accepted and then dropped)
+# hangs the whole agent with an ESTABLISHED-but-silent socket. The read
+# timeout is per-read-gap, not whole-response: an SSE stream only trips it
+# when the server goes silent mid-generation longer than this, so it must
+# cover the silent prompt-processing phase of a large local-model prompt.
+_CONNECT_TIMEOUT_SECONDS = 10.0
+_READ_TIMEOUT_SECONDS = 600.0
+
 
 class OverCapError(Exception):
     """Raised when the provider rejects a request because the context is too long."""
@@ -335,7 +344,13 @@ class LLMClient:
         for attempt in range(_MAX_ATTEMPTS):
             is_last_attempt = attempt == _MAX_ATTEMPTS - 1
             try:
-                resp = self._session.post(url, json=body, headers=headers, stream=stream)
+                resp = self._session.post(
+                    url,
+                    json=body,
+                    headers=headers,
+                    stream=stream,
+                    timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+                )
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
                 last_exc = exc
                 if not is_last_attempt:
