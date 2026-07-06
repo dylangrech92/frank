@@ -362,6 +362,55 @@ bounced and then runs the tests (or declares unverified); a turn that already
 ran tests is untouched; a stubborn double-refusal yields the marker; the
 bounce fires at most once per turn.
 
+## S4 — structured result envelope for one-shot mode
+
+**Gap:** the executor returns prose on stdout. An orchestrator driving many
+instances must re-read each executor's work to know what happened — which
+files changed, whether anything verified the change, what it cost. The
+`[UNVERIFIED CHANGES]` marker was the first byte of this contract; the rest
+is missing.
+
+**Mechanism:** new `--json` flag, valid only with `-p` (argparse error
+otherwise). With it, stdout carries exactly ONE JSON object and nothing else;
+stderr behavior (streaming deltas, telemetry) is unchanged; exit codes are
+unchanged. Envelope shape (version-pinned):
+
+    {
+      "envelope": 1,
+      "status": "ok" | "error",
+      "error": null | "<message>",
+      "answer": "<final answer text, WITHOUT the [UNVERIFIED CHANGES] prefix>",
+      "verified": true | false,
+      "declared_unverified": true | false,
+      "files_changed": [{"path": "...", "tool": "replace_one"}, ...],
+      "verification_runs": [{"tool": "run_tests", "status": "success",
+                             "detail": "<command or short descriptor>"}, ...],
+      "usage": {"prompt_tokens": N|null, "completion_tokens": N|null,
+                "llm_calls": N},
+      "session_id": "...",
+      "duration_s": 12.3
+    }
+
+Collection happens in `agent.py`: a per-turn report accumulated alongside the
+existing trackers — mutation records captured at the `_TURN_MUTATIONS` append
+site (NOT by reading the list later; the diagnostics/lint injection drains
+it), verification tool calls (`run_tests`/`run_command`) with their result
+status, usage summed per LLM call, and the S3 gate outcome. `files_changed`
+is deduped by path, first-tool-wins. In `--json` mode the S3 marker is not
+prefixed onto the answer; the `verified`/`declared_unverified` fields carry
+that state instead (prose mode keeps the marker exactly as today). On a turn
+error the envelope is still emitted (status "error", answer null/partial,
+exit 1). The report surface is exposed to `main.py` via the session object.
+
+**Done when:** an offline probe covers: mutation + verification run →
+`verified: true` with the run listed; mutation + none → `verified: false`;
+model self-declares → `declared_unverified: true`; error path emits a valid
+envelope with status "error" and exit 1; plain mode (no `--json`) behaves
+byte-identically to today. The existing regression suite stays ALL PASS. A
+live `--json` one-shot that edits a file parses with `json.loads`, shows the
+edit in `files_changed`, the verification run, real usage numbers, and a
+clean answer.
+
 ## S-series sequencing & concurrency rules
 
 S1 (new tool file + registry + config) and S3 (`agent.py` final-answer path)
