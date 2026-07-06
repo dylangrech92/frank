@@ -129,6 +129,71 @@ def _memory_maintenance(project_root: str, client: LLMClient) -> None:
         print(f"session-start-memory-error: {exc}", file=sys.stderr)
 
 
+def _repair_interrupted_turn(session: Session) -> int:
+    """Repair a transcript left mid-turn by a Ctrl-C interrupt.
+
+    ``handle_user_message`` appends the assistant's tool-calling message to the
+    transcript *before* dispatching the calls one at a time (see
+    ``agent.handle_user_message``), so a ``KeyboardInterrupt`` delivered while a
+    tool is running (or between two tool calls in the sequential-dispatch loop)
+    can leave that assistant message's ``tool_calls`` only partially answered.
+    An OpenAI-format request with an assistant ``tool_calls`` entry that has no
+    matching ``tool`` message for one of its call ids is rejected by strict
+    providers on the very next turn, so this must be repaired before the REPL
+    accepts another prompt.
+
+    The smallest correct fix that fits ``Session``'s existing API: find the
+    last assistant message carrying ``tool_calls``, determine which of its call
+    ids already have a ``tool`` result appended after it, and append a
+    synthetic ``[interrupted]`` tool result (via the existing
+    ``append_tool_result`` method — no new ``Session`` API needed) for every
+    call id still missing one, in call order.
+
+    Args:
+        session: The active session whose in-memory/on-disk transcript may be
+            mid-turn.
+
+    Returns:
+        The number of synthetic tool results appended (0 when the turn was
+        interrupted before any tool-calling assistant message was recorded, or
+        when every call already had a result).
+    """
+    messages = session._messages
+
+    last_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            last_idx = i
+            break
+
+    if last_idx is None:
+        return 0
+
+    tool_calls = messages[last_idx]["tool_calls"]
+    answered_ids = {
+        m.get("tool_call_id")
+        for m in messages[last_idx + 1:]
+        if m.get("role") == "tool"
+    }
+
+    repaired = 0
+    for call in tool_calls:
+        call_id = call.get("id")
+        if call_id in answered_ids:
+            continue
+        name = (call.get("function") or {}).get("name", "unknown")
+        session.append_tool_result(
+            call_id,
+            name,
+            "[interrupted] Tool call aborted: the turn was cancelled by the "
+            "user (Ctrl-C) before this call produced a result.",
+        )
+        repaired += 1
+
+    return repaired
+
+
 def session_end_jobs(session: Session, client: LLMClient) -> None:
     """Run once when the REPL exits: drain the episodic write queue so an in-flight
     extraction from the final turn is not lost, then mine the freshly-written
@@ -382,6 +447,18 @@ def main() -> None:
                         stripped, session, client, args.verbose, cfg.compaction,
                         on_delta=_stdout_delta,
                     )
+                except KeyboardInterrupt:
+                    # Mid-turn Ctrl-C: abandon this turn but keep the session alive.
+                    # A partial streamed answer may have left stdout without a
+                    # trailing newline — start the notice on its own line.
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    repaired = _repair_interrupted_turn(session)
+                    note = "Turn interrupted (Ctrl-C) — back at the prompt."
+                    if repaired:
+                        note += f" Repaired {repaired} pending tool result(s) in the transcript."
+                    print(ui.error(note), file=sys.stderr)
+                    continue
                 except Exception as exc:
                     print(ui.error(f"Error: {type(exc).__name__}: {exc}"), file=sys.stderr)
                     continue
