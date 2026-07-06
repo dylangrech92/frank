@@ -615,6 +615,28 @@ def handle_user_message(
     session.append_user(text)
     flashback_maybe_seed(session)
 
+    # S4 — per-turn structured result report for --json one-shot mode. Reset at
+    # the start of every turn and exposed via ``session.turn_report`` so a
+    # caller (main.py) can build a result envelope even when this call raises
+    # before reaching a return statement below -- whatever was accumulated up
+    # to the exception still reflects reality. ``answer`` is filled in at each
+    # return site with the UNPREFIXED text (the same value the transcript
+    # already holds per S3's design) so it is the single source of truth for
+    # both the returned string (which may still get the "[UNVERIFIED CHANGES] "
+    # prefix layered on for prose-mode callers) and the envelope's answer field.
+    turn_report: dict = {
+        "files_changed": [],
+        "verification_runs": [],
+        "verified": False,
+        "declared_unverified": False,
+        "answer": None,
+        "usage": {"prompt_tokens": None, "completion_tokens": None, "llm_calls": 0},
+    }
+    session.turn_report = turn_report
+    # Per-turn (reset every call) dedupe set for files_changed: first-tool-wins,
+    # order of first mutation.
+    _files_changed_seen: set[str] = set()
+
     window = client.config.context_limit
     comp_cfg = compaction_cfg or {}
     cap = compaction.compute_cap(window, comp_cfg)
@@ -662,6 +684,7 @@ def handle_user_message(
             "reduce it further. Start a new session or shorten the request."
         )
         session.append_assistant(msg)
+        turn_report["answer"] = msg
         if on_delta is not None:
             on_delta(msg + "\n")
         return msg
@@ -738,6 +761,7 @@ def handle_user_message(
             streamed = 0
             gate_pending = verification_nudge_fired and needs_verification
             chat_delta_cb = None if gate_pending else delta_cb
+            turn_report["usage"]["llm_calls"] += 1
             response: ChatResponse = client.chat(context, tool_schemas, chat_delta_cb)
         except OverCapError:
             # Provider rejected on length despite the estimate — compact and retry.
@@ -766,6 +790,18 @@ def handle_user_message(
                     f"[ema {session.token_estimate_ratio:.2f}]"
                 ),
                 file=sys.stderr,
+            )
+
+        # S4 — sum usage across every LLM call this turn (None until the first
+        # real figure arrives, then a running total; stays None all turn on
+        # providers that never report usage).
+        if response.prompt_tokens is not None:
+            turn_report["usage"]["prompt_tokens"] = (
+                (turn_report["usage"]["prompt_tokens"] or 0) + response.prompt_tokens
+            )
+        if response.completion_tokens is not None:
+            turn_report["usage"]["completion_tokens"] = (
+                (turn_report["usage"]["completion_tokens"] or 0) + response.completion_tokens
             )
 
         tool_calls: list[ToolCall] | None = (
@@ -833,8 +869,14 @@ def handle_user_message(
             # unprefixed text — only the return value / on_delta payload gets
             # the marker.
             final_text = response.text or ""
+            # S4 — record the UNPREFIXED answer before any marker is layered on;
+            # this is the single source of truth the --json envelope reads back
+            # via session.turn_report, independent of what prose-mode return
+            # value/on_delta payload below gets prefixed with.
+            turn_report["answer"] = final_text
             if needs_verification and verification_nudge_fired:
-                if "unverified" not in final_text.lower():
+                turn_report["declared_unverified"] = "unverified" in final_text.lower()
+                if not turn_report["declared_unverified"]:
                     final_text = "[UNVERIFIED CHANGES] " + final_text
                     print(
                         ui.telemetry(
@@ -843,6 +885,7 @@ def handle_user_message(
                         ),
                         file=sys.stderr,
                     )
+            turn_report["verified"] = bool(mutated_paths) and not needs_verification
 
             if on_delta is not None and final_text:
                 if streamed == 0:
@@ -903,6 +946,21 @@ def handle_user_message(
                     if any_relevant:
                         needs_verification = True
                         mutated_paths |= new_paths
+                        # S4 — captured here (correlated with this dispatched
+                        # call's own slice of _TURN_MUTATIONS), NOT by reading
+                        # the module-level list later: diagnostics_inject_summary
+                        # drains it at the end of this same loop iteration.
+                        # Deduped by path, first-tool-wins, in order of first
+                        # mutation.
+                        for _ev in new_events:
+                            if _ev.get("kind") not in ("created", "changed", "renamed"):
+                                continue
+                            _ev_path = _ev.get("path")
+                            if _ev_path and _ev_path not in _files_changed_seen:
+                                _files_changed_seen.add(_ev_path)
+                                turn_report["files_changed"].append(
+                                    {"path": _ev_path, "tool": call.name}
+                                )
                         resolved_call_path = _lint_resolve_call_path(
                             call, str(session.project_root)
                         )
@@ -911,8 +969,16 @@ def handle_user_message(
                                 lint_pre, call, str(session.project_root)
                             )
 
-            if call.name in ("run_tests", "run_command") and result.status == "success":
-                needs_verification = False
+            if call.name in ("run_tests", "run_command"):
+                if call.name == "run_command":
+                    detail = str(call.arguments.get("cmd", ""))
+                else:
+                    detail = str(call.arguments.get("path") or ".")
+                turn_report["verification_runs"].append(
+                    {"tool": call.name, "status": result.status, "detail": detail}
+                )
+                if result.status == "success":
+                    needs_verification = False
             if call.name in ("record_decision", "record_spec"):
                 record_decision_or_spec_called = True
 

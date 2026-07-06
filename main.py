@@ -5,9 +5,11 @@ whose final answer goes to stdout — everything else prints to stderr.
 """
 
 import argparse
+import json
 import os
 import sys
 import threading
+import time
 
 import ui
 from agent import handle_user_message
@@ -262,6 +264,50 @@ MANAGER: LSPManager | None = None
 DEBUG_MANAGER: DAPManager | None = None
 
 
+def _build_envelope(
+    session: Session, status: str, error: str | None, duration_s: float
+) -> dict:
+    """Assemble the S4 structured result envelope for one-shot ``--json`` mode.
+
+    Reads ``session.turn_report`` -- the per-turn accumulator ``agent.handle_user_message``
+    builds and keeps up to date throughout the turn (see its docstring) -- so this
+    still produces a valid envelope even when *status* is ``"error"`` because the
+    turn raised partway through: whatever the report accumulated up to that point
+    (files already changed, verification runs already made, usage already billed)
+    is reported as-is, with ``answer`` left ``None``.
+
+    Args:
+        session: The session the turn ran against; ``turn_report`` may be absent
+            entirely if the turn never started (falls back to all-empty/defaults).
+        status: ``"ok"`` or ``"error"``.
+        error: ``None`` on success, else a short message describing the failure.
+        duration_s: Wall-clock seconds the turn took, from ``time.monotonic()``.
+
+    Returns:
+        A JSON-serializable dict matching the envelope schema pinned in
+        DESIGN.md's one-shot mode section.
+    """
+    report = getattr(session, "turn_report", None) or {}
+    usage = report.get("usage") or {}
+    return {
+        "envelope": 1,
+        "status": status,
+        "error": error,
+        "answer": report.get("answer"),
+        "verified": report.get("verified", False),
+        "declared_unverified": report.get("declared_unverified", False),
+        "files_changed": report.get("files_changed", []),
+        "verification_runs": report.get("verification_runs", []),
+        "usage": {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "llm_calls": usage.get("llm_calls", 0),
+        },
+        "session_id": session.session_id,
+        "duration_s": duration_s,
+    }
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -317,7 +363,18 @@ def main() -> None:
             "run — useful for ephemeral one-shot subagent calls"
         ),
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "One-shot mode only (requires -p/--prompt): print exactly one JSON "
+            "result envelope to stdout instead of prose. Streaming/telemetry on "
+            "stderr and exit codes are unchanged. See DESIGN.md for the schema."
+        ),
+    )
     args = parser.parse_args()
+    if args.json and args.prompt is None:
+        parser.error("--json requires -p/--prompt")
     ui.enable(args.pretty)
 
     project_root: str = os.getcwd()
@@ -398,23 +455,42 @@ def main() -> None:
             task = sys.stdin.read() if args.prompt == "-" else args.prompt
             task = task.strip()
             if not task:
-                print(ui.error("one-shot task is empty"), file=sys.stderr)
+                if args.json:
+                    print(json.dumps(
+                        _build_envelope(session, "error", "one-shot task is empty", 0.0)
+                    ))
+                else:
+                    print(ui.error("one-shot task is empty"), file=sys.stderr)
                 exit_code = 1
             else:
                 # Stream deltas to stderr as live progress; stdout stays the
-                # pure final-answer channel for the orchestrating caller.
+                # pure final-answer channel for the orchestrating caller (either
+                # the raw prose answer, or -- with --json -- exactly one result
+                # envelope) in both modes.
                 def _stderr_delta(piece: str) -> None:
                     sys.stderr.write(piece)
                     sys.stderr.flush()
 
+                start_t = time.monotonic()
                 try:
                     answer: str = handle_user_message(
                         task, session, client, args.verbose, cfg.compaction,
                         on_delta=_stderr_delta,
                     )
-                    print(answer)
+                    if args.json:
+                        duration_s = time.monotonic() - start_t
+                        print(json.dumps(_build_envelope(session, "ok", None, duration_s)))
+                    else:
+                        print(answer)
                 except Exception as exc:
-                    print(ui.error(f"Error: {type(exc).__name__}: {exc}"), file=sys.stderr)
+                    duration_s = time.monotonic() - start_t
+                    error_msg = f"{type(exc).__name__}: {exc}"
+                    if args.json:
+                        print(json.dumps(
+                            _build_envelope(session, "error", error_msg, duration_s)
+                        ))
+                    else:
+                        print(ui.error(f"Error: {error_msg}"), file=sys.stderr)
                     exit_code = 1
         else:
             while True:

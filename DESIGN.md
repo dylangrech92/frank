@@ -307,6 +307,26 @@ def handle_user_message(text):
 - **Graph-memory usage nudge (H5)** — a turn whose mutations touch 3+ distinct files with no `record_decision`/`record_spec` call gets a one-line reminder appended to the last tool result, at most once per session.
 - **Hard verify gate (H1 bounce, hardened by S3)** — when a final answer (no tool calls) ends a turn that mutated files with no successful `run_tests`/`run_command` call since, the harness bounces once: it injects a synthetic user-role steer telling the model to verify now or state explicitly that the change is unverified, then loops again instead of returning. If the *second* final answer still has neither a verification call nor an "unverified" declaration (case-insensitive match), the harness accepts it but prefixes the **returned** text (never the transcript) with `[UNVERIFIED CHANGES] `. At most one bounce per turn. The one `client.chat` call immediately after the bounce is delivered through `on_delta` whole rather than streamed fragment-by-fragment, since whether the marker applies can only be decided once the full response is in hand — this keeps the "final text exactly once, plus one trailing `\n`" streaming contract intact even when the gate rewrites the answer.
 
+**Structured result envelope (`--json`, S4).** One-shot mode accepts a `--json` flag (rejected by argparse unless `-p/--prompt` is also given) that swaps stdout's plain-text answer for exactly one JSON object and nothing else; stderr streaming/telemetry and exit codes are unchanged. Shape (version-pinned via the `envelope` field):
+
+```json
+{
+  "envelope": 1,
+  "status": "ok",
+  "error": null,
+  "answer": "<final answer text, WITHOUT the [UNVERIFIED CHANGES] prefix>",
+  "verified": true,
+  "declared_unverified": false,
+  "files_changed": [{"path": "...", "tool": "replace_one"}],
+  "verification_runs": [{"tool": "run_tests", "status": "success", "detail": "tests/"}],
+  "usage": {"prompt_tokens": 11966, "completion_tokens": 409, "llm_calls": 6},
+  "session_id": "...",
+  "duration_s": 12.3
+}
+```
+
+`handle_user_message` accumulates a per-turn report on `session.turn_report` alongside the existing trackers: `files_changed` is captured where the H1/S3 mutation tracking already correlates a dispatched call with its `_TURN_MUTATIONS` slice (deduped by path, first-tool-wins, in order of first mutation — not read back later, since `diagnostics_inject_summary` drains the module-level list at the end of each iteration); `verification_runs` records every `run_tests`/`run_command` call with its result status and a short detail (the command, or the target path); `usage` sums `prompt_tokens`/`completion_tokens` across every `client.chat` call this turn and counts the calls. `verified`/`declared_unverified` carry the S3 gate's outcome, and in `--json` mode the `[UNVERIFIED CHANGES] ` marker is *not* prefixed onto `answer` — the two flags carry that state instead, so an orchestrator branches on structured fields rather than string-matching a prefix. Prose mode (no `--json`) is untouched: the returned string still gets the marker exactly as before. On a turn exception the envelope is still emitted, with `status: "error"`, `answer: null`, and whatever the report had accumulated up to that point — the caller exits 1 either way.
+
 ## 10. config.json
 
 Config is per-agent-install, not per-project: it defaults to `config.json` next to `main.py` in the agent's own directory, and `--config <path>` overrides that for testing or alternate setups.
