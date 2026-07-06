@@ -23,6 +23,7 @@ class SignatureHelp(Tool):
     """
 
     name = 'signature_help'
+    parallel_safe = True  # read-only LSP query; doc-sync is lock-guarded (F3)
     summary = 'Get parameter hints for a function call at a position.'
     description = (
         'Get parameter hints for a function call at a position '
@@ -116,10 +117,9 @@ class SignatureHelp(Tool):
                 code='lsp-unavailable',
             )
 
-        # --- ensure document is open/synced ----------------------------------
+        # --- ensure document is open/synced (thread-safe check-and-open) -----
         uri = path_to_uri(str(resolved))
-        if uri not in MANAGER._open_docs:
-            MANAGER._did_open(str(resolved))
+        MANAGER.ensure_document_open(str(resolved))
 
         METHOD = 'textDocument/signatureHelp'
         try:

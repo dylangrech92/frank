@@ -91,7 +91,13 @@ class LSPManager:
         # Optional callback taking a client, invoked after client.initialize() succeeds.
         self.on_client_start: callable | None = None
         # Serializes spawn/cache mutation so a background prewarm racing a tool's
-        # get_client never double-spawns a server for the same language.
+        # get_client never double-spawns a server for the same language. Also
+        # guards document-sync state (_open_docs, didOpen/didChange/didClose
+        # sequencing) so two threads can never interleave a partial open/change
+        # for the same document (F3). One RLock for both concerns — doc-sync
+        # already calls back into get_client, so a dedicated second lock would
+        # need careful ordering to avoid deadlock for no real benefit; reusing
+        # the same reentrant lock keeps that call chain trivially safe.
         self._spawn_lock = threading.RLock()
 
         # Wire LSPManager into the file-mutation event bus.
@@ -283,6 +289,33 @@ class LSPManager:
         """
         self._purge_callbacks.append(callback)
 
+    def ensure_document_open(self, path: str) -> None:
+        """Thread-safe check-and-open: send ``didOpen`` for *path* if not yet tracked.
+
+        Read-only navigation tools call this before issuing an LSP request instead
+        of inspecting ``_open_docs`` themselves — doing the check-then-act under
+        ``_spawn_lock`` closes the race where two concurrent calls for the same
+        untracked document both see it missing and both send ``didOpen``.
+
+        Args:
+            path: Absolute file path on disk.
+        """
+        uri = path_to_uri(path)
+        with self._spawn_lock:
+            if uri not in self._open_docs:
+                self._did_open(path)
+
+    def snapshot_clients(self) -> list[tuple[str, LSPClient]]:
+        """Return a thread-safe point-in-time copy of the language->client mapping.
+
+        Returns:
+            A list of ``(language, client)`` pairs copied from ``_clients`` while
+            holding ``_spawn_lock``, safe to iterate even if another thread spawns
+            a new client concurrently (plain dict iteration is not).
+        """
+        with self._spawn_lock:
+            return list(self._clients.items())
+
     def _client_for_file(self, path: str) -> LSPClient | None:
         """Return a running client for *path*, or ``None`` when no pre-warmed server exists.
 
@@ -321,20 +354,21 @@ class LSPManager:
 
         uri = path_to_uri(path)
         language = self.language_for_path(path)  # type: ignore[assignment]
-        self._open_docs[uri] = 1
 
-        client = self.get_client(language, spawn=False)
-        client.notify(
-            "textDocument/didOpen",
-            {
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": language,
-                    "version": 1,
-                    "text": text,
-                }
-            },
-        )
+        with self._spawn_lock:
+            self._open_docs[uri] = 1
+            client = self.get_client(language, spawn=False)
+            client.notify(
+                "textDocument/didOpen",
+                {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": language,
+                        "version": 1,
+                        "text": text,
+                    }
+                },
+            )
 
     def _did_change(self, path: str) -> None:
         """Send ``textDocument/didChange`` (full-document sync) for *path*.
@@ -347,26 +381,27 @@ class LSPManager:
         uri = path_to_uri(path)
         language = self.language_for_path(path)  # type: ignore[assignment]
 
-        if uri not in self._open_docs:
-            self._did_open(path)
-            return
+        with self._spawn_lock:
+            if uri not in self._open_docs:
+                self._did_open(path)
+                return
 
-        self._open_docs[uri] += 1
-        n = self._open_docs[uri]
+            self._open_docs[uri] += 1
+            n = self._open_docs[uri]
 
-        try:
-            text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return
+            try:
+                text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return
 
-        client = self.get_client(language, spawn=False)
-        client.notify(
-            "textDocument/didChange",
-            {
-                "textDocument": {"uri": uri, "version": n},
-                "contentChanges": [{"text": text}],
-            },
-        )
+            client = self.get_client(language, spawn=False)
+            client.notify(
+                "textDocument/didChange",
+                {
+                    "textDocument": {"uri": uri, "version": n},
+                    "contentChanges": [{"text": text}],
+                },
+            )
 
     def _did_close(self, path: str) -> None:
         """Send ``textDocument/didClose`` for *path* and invoke purge callbacks.
@@ -380,13 +415,14 @@ class LSPManager:
         uri = path_to_uri(path)
         language = self.language_for_path(path)  # type: ignore[assignment]
 
-        if uri in self._open_docs:
-            del self._open_docs[uri]
-            client = self.get_client(language, spawn=False)
-            client.notify(
-                "textDocument/didClose",
-                {"textDocument": {"uri": uri}},
-            )
+        with self._spawn_lock:
+            if uri in self._open_docs:
+                del self._open_docs[uri]
+                client = self.get_client(language, spawn=False)
+                client.notify(
+                    "textDocument/didClose",
+                    {"textDocument": {"uri": uri}},
+                )
 
         for callback in self._purge_callbacks:
             try:

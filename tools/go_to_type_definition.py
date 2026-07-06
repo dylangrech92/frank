@@ -23,6 +23,7 @@ class GoToTypeDefinition(Tool):
     """
 
     name = 'go_to_type_definition'
+    parallel_safe = True  # read-only LSP query; doc-sync is lock-guarded (F3)
     summary = 'Jump to the type definition of the symbol at a position.'
     description = (
         'Navigate to the type definition of the symbol at a position in a file. '
@@ -116,10 +117,9 @@ class GoToTypeDefinition(Tool):
                 code='lsp-unavailable',
             )
 
-        # --- ensure document is open/synced ----------------------------------
+        # --- ensure document is open/synced (thread-safe check-and-open) -----
         uri = path_to_uri(str(resolved))
-        if uri not in MANAGER._open_docs:
-            MANAGER._did_open(str(resolved))
+        MANAGER.ensure_document_open(str(resolved))
 
         METHOD = 'textDocument/typeDefinition'
         try:

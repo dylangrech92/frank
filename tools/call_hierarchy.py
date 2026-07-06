@@ -25,6 +25,7 @@ class CallHierarchy(Tool):
     """
 
     name = 'call_hierarchy'
+    parallel_safe = True  # read-only LSP query; doc-sync is lock-guarded (F3)
     summary = 'Inspect incoming/outgoing callers of a symbol.'
     description = (
         'Inspect the call hierarchy of a symbol at a position in a file. '
@@ -138,10 +139,9 @@ class CallHierarchy(Tool):
                 code='lsp-unavailable',
             )
 
-        # --- ensure document is open/synced ----------------------------------
+        # --- ensure document is open/synced (thread-safe check-and-open) -----
         uri = path_to_uri(str(resolved))
-        if uri not in MANAGER._open_docs:
-            MANAGER._did_open(str(resolved))
+        MANAGER.ensure_document_open(str(resolved))
 
         # ---- Step 1: prepare call hierarchy ---------------------------------
         prepare_method = 'textDocument/prepareCallHierarchy'

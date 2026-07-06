@@ -17,6 +17,7 @@ class FindSymbol(Tool):
     """
 
     name = 'find_symbol'
+    parallel_safe = True  # read-only LSP query; client-map read is lock-guarded (F3)
     summary = 'Fuzzy-search symbols by name across the workspace.'
     description = (
         'Fuzzy-search symbols by name across the whole workspace (like an IDE\'s '
@@ -60,7 +61,9 @@ class FindSymbol(Tool):
             )
 
         MANAGER = main_module.MANAGER
-        clients = list(MANAGER._clients.items())
+        # Thread-safe snapshot: plain dict iteration would race a concurrent
+        # spawn mutating _clients under _spawn_lock (F3).
+        clients = MANAGER.snapshot_clients()
         if not clients:
             return ToolResult.err(
                 'no language servers are running',

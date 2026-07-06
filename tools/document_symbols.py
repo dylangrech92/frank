@@ -22,6 +22,7 @@ class DocumentSymbols(Tool):
     """
 
     name = 'document_symbols'
+    parallel_safe = True  # read-only LSP query; doc-sync is lock-guarded (F3)
     summary = 'Get the outline (classes/functions) of a file.'
     description = (
         'Returns the outline (classes, functions, methods) of a file. '
@@ -89,10 +90,9 @@ class DocumentSymbols(Tool):
                 code='lsp-unavailable',
             )
 
-        # --- ensure document is open/synced ----------------------------------
+        # --- ensure document is open/synced (thread-safe check-and-open) -----
         uri = path_to_uri(str(resolved))
-        if uri not in MANAGER._open_docs:
-            MANAGER._did_open(str(resolved))
+        MANAGER.ensure_document_open(str(resolved))
 
         METHOD = 'textDocument/documentSymbol'
         try:

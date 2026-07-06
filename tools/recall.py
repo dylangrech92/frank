@@ -16,6 +16,7 @@ class Recall(Tool):
     """
 
     name = 'recall'
+    parallel_safe = True  # opens its own fresh store/connection per call (F4)
     summary = 'Search project memory for facts relevant to a query.'
     description = (
         'Search the project persistent memory for facts relevant to a '
@@ -53,11 +54,58 @@ class Recall(Tool):
             limit = 10
         limit = max(1, min(50, limit))
 
-        from memory.recall import recall as _recall  # pylint: disable=import-outside-toplevel
-
-        results = _recall(query_raw, limit=limit)
+        results = _recall_fresh(query_raw, limit=limit)
         if not results:
             return ToolResult.ok('No relevant memories found.', count=0)
 
         body = '\n'.join(str(r['text']) for r in results)
         return ToolResult.ok(body, count=len(results))
+
+
+def _recall_fresh(query: str, limit: int) -> list[dict]:
+    """Hybrid recall across all registered layers using a store opened fresh for this call.
+
+    ``memory.recall.recall()`` rides ``get_memory()``'s cached main-thread SQLite
+    connection, which is unsafe to touch from a worker thread. This mirrors that
+    function's logic but opens (and closes) its own :class:`MemoryStore` and
+    :class:`EmbeddingService` on whichever thread calls it -- the same
+    fresh-store-per-thread pattern used by ``main._memory_maintenance`` and the
+    episodic writer (``memory/episodic.py``) -- so the tool can join a parallel
+    batch.
+
+    Args:
+        query: Natural-language search string.
+        limit: Maximum number of results to return.
+
+    Returns:
+        Up to *limit* result dicts (each with at least ``text`` and ``score``),
+        sorted by score descending.
+    """
+    import os
+
+    from memory.embedding import EmbeddingService
+    from memory.recall import MemoryContext, _LAYERS, _ensure_layers_registered
+    from memory.store import open_store
+
+    project_root = os.path.abspath(os.getcwd())
+    store = open_store(project_root)
+    try:
+        model_path = os.environ.get('CODING_AGENT_EMBED_MODEL') or None
+        embedder = EmbeddingService(model_path=model_path)
+        ctx = MemoryContext(store=store, embedder=embedder, project_root=project_root)
+        _ensure_layers_registered()
+
+        results: list[dict] = []
+        for layer in _LAYERS:
+            try:
+                hits = layer['recall'](ctx, query, limit)
+            except Exception:
+                continue
+            if hits:
+                results.extend(hits)
+        if not results:
+            return []
+        results.sort(key=lambda d: d['score'], reverse=True)
+        return results[:limit]
+    finally:
+        store.close()
