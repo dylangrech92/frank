@@ -1,8 +1,13 @@
-"""CLI entry point for coding-agent: a REPL that connects an LLM to a project."""
+"""CLI entry point for coding-agent: connects an LLM to a project.
+
+Runs either an interactive REPL (default) or a one-shot task (``-p/--prompt``)
+whose final answer goes to stdout — everything else prints to stderr.
+"""
 
 import argparse
 import os
 import sys
+import threading
 
 import ui
 from agent import handle_user_message
@@ -25,14 +30,34 @@ sys.modules.setdefault("main", sys.modules[__name__])
 # =============================================================================
 
 
-def session_start_jobs(session: Session, client: LLMClient) -> None:
+def register_catalog_provider() -> None:
+    """Register the tool-catalog system-message block (deferred tool loading).
+
+    Memory-independent — the model cannot load tools without it, so it runs
+    even under ``--no-memory``.
+    """
+    try:
+        from session import CONTEXT_PROVIDERS
+        from tools.registry import render_catalog_block
+
+        CONTEXT_PROVIDERS.append(lambda _session: render_catalog_block())
+    except Exception:
+        pass
+
+
+def session_start_jobs(session: Session, client: LLMClient) -> threading.Thread | None:
     """Run once after the session is created.
 
-    Registers the always-on rules provider and the gated flashback provider, then
-    runs long-term-memory maintenance: evict stale episodes, purge expired TTL
-    facts, and mine any not-yet-extracted episode gists into durable facts (a
-    catch-up sweep for episodes left unmined by a prior session). Every step is
-    isolated so one failure never blocks session startup.
+    Registers the always-on rules provider and the gated flashback provider
+    synchronously (cheap, needed before turn 0), then kicks long-term-memory
+    maintenance — evict stale episodes, purge expired TTL facts, mine unmined
+    episode gists into durable facts (an LLM call) — onto a background thread so
+    the first prompt is never blocked behind it. Every step is isolated so one
+    failure never blocks session startup.
+
+    Returns:
+        The started maintenance thread (join it before ``session_end_jobs`` so
+        two fact-extractor sweeps never overlap), or ``None`` if it failed to start.
     """
     try:
         from memory.graph import register_graph_provider
@@ -49,37 +74,57 @@ def session_start_jobs(session: Session, client: LLMClient) -> None:
         pass
 
     try:
-        from session import CONTEXT_PROVIDERS
-        from tools.registry import render_catalog_block
+        thread = threading.Thread(
+            target=_memory_maintenance,
+            args=(str(session.project_root), client),
+            name="memory-maintenance",
+            daemon=True,
+        )
+        thread.start()
+        return thread
+    except Exception as exc:
+        print(f"session-start-memory-error: {exc}", file=sys.stderr)
+        return None
 
-        CONTEXT_PROVIDERS.append(lambda _session: render_catalog_block())
-    except Exception:
-        pass
 
+def _memory_maintenance(project_root: str, client: LLMClient) -> None:
+    """Long-term-memory maintenance, run on its own thread.
+
+    Opens a FRESH store on this thread (SQLite connections are never shared
+    across threads — the same rule the episodic writer follows; WAL serializes
+    concurrent writers) and closes it before returning.
+    """
     try:
-        from memory.recall import get_memory
+        from memory.embedding import EmbeddingService
+        from memory.recall import MemoryContext
+        from memory.store import open_store
         import memory.episodic as episodic
         import memory.atomic as atomic
 
-        ctx = get_memory(session.project_root)
+        store = open_store(project_root)
+        embedder = EmbeddingService(model_path=os.environ.get("CODING_AGENT_EMBED_MODEL") or None)
+        ctx = MemoryContext(store=store, embedder=embedder, project_root=project_root)
         try:
-            evicted = episodic.evict_episodes(ctx.store)
-            if evicted:
-                print(f"episodic: evicted {evicted} stale episode(s)", file=sys.stderr)
-        except Exception as exc:
-            print(f"session-start-evict-error: {exc}", file=sys.stderr)
-        try:
-            purged = atomic.purge_expired(ctx)
-            if purged:
-                print(f"facts: purged {purged} expired atom(s)", file=sys.stderr)
-        except Exception as exc:
-            print(f"session-start-purge-error: {exc}", file=sys.stderr)
-        try:
-            stats = atomic.extract_facts(ctx, client)
-            if stats.get("processed"):
-                print(f"facts: start-of-session extractor {stats}", file=sys.stderr)
-        except Exception as exc:
-            print(f"session-start-extract-error: {exc}", file=sys.stderr)
+            try:
+                evicted = episodic.evict_episodes(ctx.store)
+                if evicted:
+                    print(f"episodic: evicted {evicted} stale episode(s)", file=sys.stderr)
+            except Exception as exc:
+                print(f"session-start-evict-error: {exc}", file=sys.stderr)
+            try:
+                purged = atomic.purge_expired(ctx)
+                if purged:
+                    print(f"facts: purged {purged} expired atom(s)", file=sys.stderr)
+            except Exception as exc:
+                print(f"session-start-purge-error: {exc}", file=sys.stderr)
+            try:
+                stats = atomic.extract_facts(ctx, client)
+                if stats.get("processed"):
+                    print(f"facts: start-of-session extractor {stats}", file=sys.stderr)
+            except Exception as exc:
+                print(f"session-start-extract-error: {exc}", file=sys.stderr)
+        finally:
+            store.close()
     except Exception as exc:
         print(f"session-start-memory-error: {exc}", file=sys.stderr)
 
@@ -154,7 +199,7 @@ DEBUG_MANAGER: DAPManager | None = None
 
 
 def main() -> None:
-    """Parse args, load config, build client and session, then run the REPL loop."""
+    """Parse args, load config, build client and session, then run the REPL or one-shot task."""
     parser = argparse.ArgumentParser(description="Coding agent CLI")
     parser.add_argument(
         "--verbose",
@@ -182,6 +227,26 @@ def main() -> None:
         "--pretty",
         action="store_true",
         help="Colorize interactive output (tool calls, results, telemetry, errors)",
+    )
+    parser.add_argument(
+        "-p",
+        "--prompt",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "One-shot mode: run this single task instead of the REPL, print the "
+            "final answer to stdout, and exit (0 on success, 1 on error). "
+            "Pass '-' to read the task from stdin."
+        ),
+    )
+    parser.add_argument(
+        "--no-memory",
+        action="store_true",
+        help=(
+            "Skip all long-term-memory work (flashback, rules provider, "
+            "maintenance, end-of-session extraction) for the fastest possible "
+            "run — useful for ephemeral one-shot subagent calls"
+        ),
     )
     args = parser.parse_args()
     ui.enable(args.pretty)
@@ -219,17 +284,34 @@ def main() -> None:
         print(ui.error(str(exc)), file=sys.stderr)
         sys.exit(1)
 
+    exit_code = 0
     try:
-        session_start_jobs(session, client)
+        register_catalog_provider()
+        maintenance_thread: threading.Thread | None = None
+        if args.no_memory:
+            import agent as agent_module
+
+            agent_module.MEMORY_ENABLED = False
+        else:
+            maintenance_thread = session_start_jobs(session, client)
 
         global MANAGER
-        MANAGER = LSPManager(cfg.language_servers, project_root)
-        MANAGER.on_client_start = lambda client: client.on_notification(
+        manager = LSPManager(cfg.language_servers, project_root)
+        MANAGER = manager
+        manager.on_client_start = lambda client: client.on_notification(
             "textDocument/publishDiagnostics", STORE.handle_publish
         )
-        MANAGER.on_purge(STORE.purge)
-        for line in MANAGER.prewarm():
-            print(line, file=sys.stderr)
+        manager.on_purge(STORE.purge)
+
+        def _prewarm() -> None:
+            for line in manager.prewarm():
+                print(ui.telemetry(line), file=sys.stderr)
+
+        # Prewarm off the critical path: server spawns overlap with the first
+        # LLM round-trip instead of delaying it. get_client is lock-guarded, so
+        # a tool call racing the prewarm at worst waits for one server init.
+        prewarm_thread = threading.Thread(target=_prewarm, name="lsp-prewarm", daemon=True)
+        prewarm_thread.start()
 
         print(
             ui.telemetry(
@@ -243,27 +325,43 @@ def main() -> None:
         global DEBUG_MANAGER
         DEBUG_MANAGER = DAPManager(cfg.debug_adapters, project_root)
 
-        while True:
-            try:
-                text: str = input(ui.prompt_marker("> "))
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
+        if args.prompt is not None:
+            task = sys.stdin.read() if args.prompt == "-" else args.prompt
+            task = task.strip()
+            if not task:
+                print(ui.error("one-shot task is empty"), file=sys.stderr)
+                exit_code = 1
+            else:
+                try:
+                    answer: str = handle_user_message(
+                        task, session, client, args.verbose, cfg.compaction
+                    )
+                    print(ui.assistant(answer))
+                except Exception as exc:
+                    print(ui.error(f"Error: {type(exc).__name__}: {exc}"), file=sys.stderr)
+                    exit_code = 1
+        else:
+            while True:
+                try:
+                    text: str = input(ui.prompt_marker("> "))
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
 
-            stripped = text.strip()
-            if not stripped:
-                continue
-            if stripped in ("exit", "quit"):
-                break
+                stripped = text.strip()
+                if not stripped:
+                    continue
+                if stripped in ("exit", "quit"):
+                    break
 
-            try:
-                assistant_text: str = handle_user_message(
-                    stripped, session, client, args.verbose, cfg.compaction
-                )
-                print(ui.assistant(assistant_text))
-            except Exception as exc:
-                print(ui.error(f"Error: {type(exc).__name__}: {exc}"), file=sys.stderr)
-                continue
+                try:
+                    assistant_text: str = handle_user_message(
+                        stripped, session, client, args.verbose, cfg.compaction
+                    )
+                    print(ui.assistant(assistant_text))
+                except Exception as exc:
+                    print(ui.error(f"Error: {type(exc).__name__}: {exc}"), file=sys.stderr)
+                    continue
 
         reaped = reap_all()
         if reaped:
@@ -272,15 +370,31 @@ def main() -> None:
                 file=sys.stderr,
             )
 
+        prewarm_thread.join(timeout=10)
         if MANAGER is not None:
             MANAGER.shutdown_all()
 
         if DEBUG_MANAGER is not None and DEBUG_MANAGER.active:
             DEBUG_MANAGER.stop()
 
-        session_end_jobs(session, client)
+        if not args.no_memory:
+            # Never overlap the start-of-session and end-of-session extractor sweeps.
+            if maintenance_thread is not None:
+                maintenance_thread.join(timeout=60)
+                if maintenance_thread.is_alive():
+                    print(
+                        "memory-maintenance still running at shutdown — skipping "
+                        "end-of-session extraction to avoid overlapping sweeps",
+                        file=sys.stderr,
+                    )
+                else:
+                    session_end_jobs(session, client)
+            else:
+                session_end_jobs(session, client)
     finally:
         session.close()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

@@ -126,6 +126,11 @@ def diagnostics_inject_summary(session: Session) -> None:
         print(f"diagnostics-inject-error: {exc}", file=sys.stderr, flush=True)
 
 
+# Master switch for long-term-memory work inside the turn loop (flashback
+# seeding + episodic extraction). main.py flips it off under --no-memory.
+MEMORY_ENABLED: bool = True
+
+
 def flashback_maybe_seed(session: Session) -> None:
     """Turn-zero memory recall injection seam.
 
@@ -135,6 +140,8 @@ def flashback_maybe_seed(session: Session) -> None:
     ``session._flashback_block`` and injected by the flashback context provider;
     it is never persisted to the transcript. Never raises.
     """
+    if not MEMORY_ENABLED:
+        return
     try:
         import memory.flashback as flashback
 
@@ -150,6 +157,8 @@ def episodic_maybe_extract(session: Session, client: LLMClient) -> None:
     Non-blocking: it only measures the row count and hands a window to the episodic
     write queue, then returns immediately so the REPL prompt never stalls.
     """
+    if not MEMORY_ENABLED:
+        return
     try:
         import memory.episodic as episodic
     except Exception:
