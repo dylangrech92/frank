@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import threading
 import urllib.parse
 import urllib.request
 from typing import Any
@@ -89,6 +90,9 @@ class LSPManager:
         self._purge_callbacks: list[callable] = []
         # Optional callback taking a client, invoked after client.initialize() succeeds.
         self.on_client_start: callable | None = None
+        # Serializes spawn/cache mutation so a background prewarm racing a tool's
+        # get_client never double-spawns a server for the same language.
+        self._spawn_lock = threading.RLock()
 
         # Wire LSPManager into the file-mutation event bus.
         from tools import _sandbox  # pylint: disable=import-outside-toplevel
@@ -109,6 +113,11 @@ class LSPManager:
         return EXTENSION_LANGUAGES.get(ext)
 
     def get_client(self, language: str, *, spawn: bool = True) -> LSPClient:
+        """Thread-safe wrapper around :meth:`_get_client` (see it for the contract)."""
+        with self._spawn_lock:
+            return self._get_client(language, spawn=spawn)
+
+    def _get_client(self, language: str, *, spawn: bool = True) -> LSPClient:
         """Ensure a running client for *language*, returning it or raising ``LSPUnavailableError``.
 
         Args:
@@ -257,8 +266,9 @@ class LSPManager:
 
         Deduplicates shared instances so each server process is terminated once.
         """
-        distinct_clients = list(set(self._clients.values()))
-        self._clients.clear()
+        with self._spawn_lock:
+            distinct_clients = list(set(self._clients.values()))
+            self._clients.clear()
         for client in distinct_clients:
             try:
                 client.shutdown()
