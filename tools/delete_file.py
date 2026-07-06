@@ -7,6 +7,7 @@ from typing import Any
 
 from tools.base import Tool
 from tools.result import ToolResult
+from tools._read_registry import check_fresh, forget
 from tools._sandbox import emit_mutation, resolve_in_root
 
 
@@ -88,11 +89,32 @@ class DeleteFile(Tool):
                 code='unsupported-file-type',
             )
 
+        # Refuse to delete a stale or never-read view of the file -- another
+        # process may have changed it since this session last saw it. This
+        # gate only applies to regular files; directories carry no read stamp.
+        if resolved.is_file():
+            freshness = check_fresh(resolved)
+            if freshness == 'stale':
+                return ToolResult.err(
+                    f'{raw_path} changed on disk after you last read it — another process may have modified it.',
+                    code='file-changed-on-disk',
+                    hint='Re-read the file with read_file, then re-apply your edit against the current content.',
+                )
+            if freshness == 'unread':
+                return ToolResult.err(
+                    f'{raw_path} has not been read yet in this session.',
+                    code='not-read-yet',
+                    hint='Read the file with read_file before editing it.',
+                )
+
         # Remove the file or empty directory
         if resolved.is_file():
             resolved.unlink()
         elif resolved.is_dir():
             resolved.rmdir()
+
+        # Drop any stamp for the now-deleted path.
+        forget(resolved)
 
         # Emit the mutation event (exactly once on success)
         emit_mutation('deleted', resolved)

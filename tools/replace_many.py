@@ -7,6 +7,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
+from tools._read_registry import check_fresh, record_read
 from tools._sandbox import emit_mutation
 from tools.base import Tool
 from tools.result import ToolResult
@@ -84,6 +85,9 @@ class ReplaceMany(Tool):
 
         # Accumulate per-file results as (relative_path, count) tuples.
         changed_files: list[tuple[str, int]] = []
+        # Files skipped because this session's view of them is stale (another
+        # process modified them after this session last read them).
+        skipped_stale: list[str] = []
 
         for dirpath, dirnames, filenames in os.walk(root):
             # Prune skip directories in-place so os.walk descends no further.
@@ -110,8 +114,21 @@ class ReplaceMany(Tool):
                 if count == 0:
                     continue
 
+                # Skip files this session read earlier but that changed on
+                # disk since -- another process may have modified them.
+                # ('unread' is not gated here: replace_many by design sweeps
+                # files the caller never individually read, so that would
+                # defeat its purpose.)
+                if check_fresh(real_file) == 'stale':
+                    skipped_stale.append(rel_path)
+                    continue
+
                 new_content = content.replace(search, replace, count)
                 real_file.write_text(new_content, encoding='utf-8')
+
+                # Re-stamp so this session's own write doesn't make the file
+                # look stale for its next edit.
+                record_read(real_file)
 
                 # Emit exactly one mutation event per changed file.
                 emit_mutation('changed', real_file)
@@ -119,6 +136,13 @@ class ReplaceMany(Tool):
                 changed_files.append((rel_path, count))
 
         if not changed_files:
+            if skipped_stale:
+                return ToolResult.err(
+                    'No files were changed; all matching files changed on disk after you last read '
+                    'them: ' + ', '.join(skipped_stale),
+                    code='file-changed-on-disk',
+                    hint='Re-read the affected files with read_file, then re-apply the replacement.',
+                )
             return ToolResult.ok(
                 'No occurrences were found.',
                 files_changed=0,
@@ -127,9 +151,14 @@ class ReplaceMany(Tool):
 
         total = sum(c for _, c in changed_files)
         body_lines = [f'{path}: {cnt}' for path, cnt in changed_files]
+        if skipped_stale:
+            body_lines.append(
+                'Skipped (changed on disk since last read): ' + ', '.join(skipped_stale)
+            )
 
         return ToolResult.ok(
             '\n'.join(body_lines),
             files_changed=len(changed_files),
             total_replacements=total,
+            files_skipped_stale=len(skipped_stale),
         )

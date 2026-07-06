@@ -7,6 +7,7 @@ from typing import Any
 
 from tools.base import Tool
 from tools.result import ToolResult
+from tools._read_registry import check_fresh, record_read
 from tools._sandbox import emit_mutation, resolve_in_root
 
 
@@ -74,8 +75,28 @@ class UpdateFile(Tool):
                 code='not-a-file',
             )
 
+        # Refuse to overwrite a stale or never-read view of the file --
+        # another process may have changed it since this session last saw it.
+        freshness = check_fresh(resolved)
+        if freshness == 'stale':
+            return ToolResult.err(
+                f'{raw_path} changed on disk after you last read it — another process may have modified it.',
+                code='file-changed-on-disk',
+                hint='Re-read the file with read_file, then re-apply your edit against the current content.',
+            )
+        if freshness == 'unread':
+            return ToolResult.err(
+                f'{raw_path} has not been read yet in this session.',
+                code='not-read-yet',
+                hint='Read the file with read_file before editing it.',
+            )
+
         # Write content as UTF-8
         resolved.write_text(content, encoding='utf-8')
+
+        # Re-stamp so this session's own write doesn't make the file look
+        # stale for its next edit.
+        record_read(resolved)
 
         # Emit the mutation event (exactly once on success)
         emit_mutation('changed', resolved)

@@ -7,6 +7,7 @@ from typing import Any
 
 from tools.base import Tool
 from tools.result import ToolResult
+from tools._read_registry import record_read
 from tools._sandbox import resolve_in_root
 
 
@@ -92,6 +93,7 @@ class ReadFile(Tool):
 
             # Content fits without paging — return full file
             lines_count = len(content.splitlines())
+            record_read(resolved)
             return ToolResult.ok(content, total_lines=lines_count)
 
         if start_line is not None and end_line is not None:
@@ -155,4 +157,5 @@ class ReadFile(Tool):
                 code='file-too-large',
                 hint='Call read_file again with a narrower start_line and end_line range.',
             )
+        record_read(resolved)
         return ToolResult.ok(returned, total_lines=total_lines, returned_lines=len(sliced))
