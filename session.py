@@ -296,6 +296,11 @@ class Session:
         self.last_prompt_tokens: int | None = None
         self.last_prompt_context_len: int = 0
         self.token_estimate_ratio: float = 1.0
+        # Per-turn execution report (files changed, verification runs, gate
+        # outcome, usage) written by the agent loop at the start of every
+        # turn; consumed by one-shot ``--json`` mode to build the S4 result
+        # envelope.
+        self.turn_report: dict = {}
 
         self._acquire_lock()
 
