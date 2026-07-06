@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from diagnostics import STORE
+from diagnostics import STORE, is_deprecated
 from lsp.manager import uri_to_path
 from tools.base import Tool
 from tools.result import ToolResult
@@ -20,10 +20,13 @@ class GetDiagnostics(Tool):
 
     The body is one line per diagnostic::
 
-        <relative-path>:<line>:<col> <severity-word> <message>
+        <relative-path>:<line>:<col> <severity-word> [deprecated] <message>
 
-    followed by a summary line ``-- N diagnostics``.  Meta carries the total
-    count as ``{'count': N}``.
+    The ``[deprecated]`` marker is only present when the diagnostic carries
+    the LSP ``DiagnosticTag.Deprecated`` tag (requires a language server that
+    emits diagnostic tags -- see ``lsp/client.py``'s ``tagSupport``
+    capability declaration). The line is followed by a summary line
+    ``-- N diagnostics``.  Meta carries the total count as ``{'count': N}``.
     """
 
     name = 'get_diagnostics'
@@ -92,8 +95,9 @@ class GetDiagnostics(Tool):
             severity_code = diagnostic.get('severity') or 1
             severity_word = severity_map.get(severity_code, 'error')
             message = diagnostic.get('message', '')
+            marker = ' [deprecated]' if is_deprecated(diagnostic) else ''
 
-            lines.append(f'{rel}:{line + 1}:{col + 1} {severity_word} {message}')
+            lines.append(f'{rel}:{line + 1}:{col + 1} {severity_word}{marker} {message}')
 
         n = len(lines)
         lines.append(f'-- {n} diagnostics')

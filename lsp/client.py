@@ -285,7 +285,13 @@ class LSPClient:
             "workspaceFolders": [{"uri": root_uri, "name": base_name}],
             "capabilities": {
                 "textDocument": {
-                    "publishDiagnostics": {},
+                    # tagSupport must be declared or servers silently omit the
+                    # `tags` field (pyright) or downgrade deprecated diagnostics
+                    # to a Hint-severity message convention instead (tsserver).
+                    # Verified empirically against pyright-langserver and
+                    # typescript-language-server: both emit
+                    # DiagnosticTag.Deprecated (tag value 2) only once this is set.
+                    "publishDiagnostics": {"tagSupport": {"valueSet": [1, 2]}},
                     "hover": {"contentFormat": ["markdown", "plaintext"]},
                     "synchronization": {"didSave": True},
                 },

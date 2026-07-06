@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,53 @@ from tools.result import ToolResult
 
 # Unexecutable / non-testable file suffixes.
 _NO_TEST_SUFFICES = frozenset({'.html', '.htm', '.css', '.scss'})
+
+# Matches one entry inside pytest's "warnings summary" section, e.g.:
+#   /path/to/mod.py:5: DeprecationWarning: old_api is deprecated
+_DEPRECATION_WARNING_RE = re.compile(
+    r'^\s*(\S+:\d+):\s*(DeprecationWarning|PendingDeprecationWarning):\s*(.+?)\s*$'
+)
+
+# Cap on how many unique deprecation entries are rendered per run.
+_DEPRECATIONS_CAP = 10
+
+
+def _parse_pytest_deprecations(output_tail: str, cap: int = _DEPRECATIONS_CAP) -> list[str]:
+    """Extract unique Deprecation/PendingDeprecationWarning entries from pytest output.
+
+    Pytest renders a ``warnings summary`` section near the end of its output with
+    one indented ``<path>:<line>: <Category>: <message>`` line per warning
+    occurrence (preceded by the originating test's node id). This scans that
+    section only for the two deprecation categories -- other warning categories
+    (e.g. ``UserWarning``) are intentionally left out of scope for this tool.
+    This never adds ``-W error``; it only reads whatever pytest already printed.
+
+    Args:
+        output_tail: Tail of the combined stdout+stderr from a pytest run.
+        cap: Maximum number of unique entries to return (default 10).
+
+    Returns:
+        A list of ``"<origin> <category>: <message>"`` strings, deduplicated
+        and capped at *cap* entries, in first-seen order. Empty when no
+        deprecation warnings are present.
+    """
+    if 'warnings summary' not in output_tail:
+        return []
+
+    seen: dict[str, None] = {}
+    for line in output_tail.splitlines():
+        match = _DEPRECATION_WARNING_RE.match(line)
+        if not match:
+            continue
+
+        origin, category, message = match.group(1), match.group(2), match.group(3)
+        entry = f'{origin} {category}: {message[:200]}'
+        if entry not in seen:
+            seen[entry] = None
+            if len(seen) >= cap:
+                break
+
+    return list(seen)
 
 
 class RunTests(Tool):
@@ -146,6 +194,15 @@ class RunTests(Tool):
         degraded = result.get('degraded', False)
         if degraded and 'degraded' not in note.lower():
             lines.append('note: degraded parse \u2014 per-test detail may be incomplete.')
+
+        if framework == 'pytest':
+            deprecations = _parse_pytest_deprecations(str(result.get('output_tail', '') or ''))
+            if deprecations:
+                lines.append('deprecations:')
+                for entry in deprecations:
+                    lines.append(f'  {entry}')
+                if len(deprecations) >= _DEPRECATIONS_CAP:
+                    lines.append(f'  ... capped at {_DEPRECATIONS_CAP} unique entries')
 
         body = '\n'.join(lines)
 

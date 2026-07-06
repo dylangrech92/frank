@@ -4,6 +4,24 @@ import time
 import threading
 from lsp.manager import uri_to_path
 
+# LSP DiagnosticTag.Deprecated (the other defined tag, 1, is Unnecessary and
+# is not surfaced here).
+_TAG_DEPRECATED = 2
+
+
+def is_deprecated(diagnostic: dict) -> bool:
+    """Whether *diagnostic* carries the LSP ``DiagnosticTag.Deprecated`` tag.
+
+    Args:
+        diagnostic: A single LSP diagnostic dict, as stored verbatim from
+            ``textDocument/publishDiagnostics``.
+
+    Returns:
+        ``True`` when the diagnostic's ``tags`` list contains ``2``
+        (``DiagnosticTag.Deprecated``).
+    """
+    return _TAG_DEPRECATED in (diagnostic.get("tags") or [])
+
 
 class DiagnosticsStore:
     """Thread-safe store for LSP ``textDocument/publishDiagnostics`` output.
@@ -109,11 +127,14 @@ class DiagnosticsStore:
 
         Returns:
             A formatted string like ``"3 errors, 2 warnings in 2 files"``,
-            or ``None`` when there are zero errors and zero warnings.
+            with a trailing ``", N deprecated"`` clause when any counted
+            diagnostic carries the LSP ``DiagnosticTag.Deprecated`` tag, or
+            ``None`` when there are zero errors and zero warnings.
         """
         with self.condition:
             errors = 0
             warnings = 0
+            deprecated = 0
             files_with_issues: set[str] = set()
 
             for uri, diags in self._diags.items():
@@ -131,6 +152,11 @@ class DiagnosticsStore:
                     elif severity is None:
                         errors += 1
                         files_with_issues.add(file_path)
+                    else:
+                        continue
+
+                    if is_deprecated(diag):
+                        deprecated += 1
 
             if errors == 0 and warnings == 0:
                 return None
@@ -146,7 +172,12 @@ class DiagnosticsStore:
                 parts.append(f"{warnings} {warning_word}")
 
             file_word = "file" if len(files_with_issues) == 1 else "files"
-            return "⚠ " + ", ".join(parts) + f" in {len(files_with_issues)} {file_word}"
+            result = "⚠ " + ", ".join(parts) + f" in {len(files_with_issues)} {file_word}"
+
+            if deprecated > 0:
+                result += f", {deprecated} [deprecated]"
+
+            return result
 
     def full(self, file_filter: str | None = None) -> list[tuple[str, dict]]:
         """Return every stored (uri, diagnostic) pair sorted by uri then line.
