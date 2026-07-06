@@ -76,3 +76,118 @@ single-file edit never does.
 H2 + H4 first (touch tools/evals only). H1 + H3 + H5 after the slice-G commit lands
 (they edit `agent.py`/`main.py`). Every slice: offline probe first, then live
 verification on the standard endpoint, then commit.
+
+# Spec refinement — speed & robustness pass (F-series)
+
+Seven improvements identified 2026-07-07 after the P19 streaming/parallel-dispatch
+work. Work on F1–F7 is being executed by parallel agents; check `git log` before
+picking one up to avoid double-work.
+
+## F1 — HTTP connection reuse in llm.py
+
+**Gap:** every `LLMClient.chat()` opens a fresh connection via
+`urllib.request.urlopen`, so each of the 2–10 round-trips per turn pays TCP (+TLS)
+setup.
+
+**Mechanism:** persistent keep-alive connection per client — `http.client`
+connection reused across calls (or `requests.Session`; requests is already a
+dependency via web_read). Must preserve the SSE streaming path
+(`_read_sse_response` iterates the raw response) and the OverCapError /
+RuntimeError error contract.
+
+**Done when:** an offline probe shows connection reuse (single TCP connect across
+sequential chats) and a live one-shot turn still streams and answers correctly.
+
+## F2 — KV-cache-stable context prefix
+
+**Gap:** provider-side prompt caches (llama.cpp/Ollama) reuse the prefill only up
+to the first changed byte. Context providers (catalog, graph, flashback) inject
+blocks each turn; any early-position block that varies per turn forces a full
+re-prefill of everything after it — most of the TTFT on a 27b model.
+
+**Mechanism:** audit `session.assemble_context()` ordering with evidence (dump
+two consecutive turns' assembled contexts and diff). Pin static blocks (system
+prompt, catalog) at the top; move per-turn-varying blocks (flashback, graph,
+diagnostics) as late in the message list as their semantics allow.
+
+**Done when:** consecutive-turn context dumps share a byte-identical prefix
+covering the system + catalog blocks, and a live 2-turn session shows reduced
+prompt-eval time on turn 2 (or the audit proves ordering was already optimal).
+
+## F3 — Thread-safe LSP doc sync → parallel-safe navigation tools
+
+**Gap:** the LSP request layer is thread-safe (locked framed writes, per-request
+Events) but `LSPManager` doc sync (`_open_docs`, didOpen/didChange) is unguarded,
+which is the only reason read-only navigation tools are excluded from P19
+parallel dispatch.
+
+**Mechanism:** guard doc-sync state with a lock (reuse/extend `_spawn_lock`
+discipline), then set `parallel_safe = True` on the read-only navigation tools:
+go_to_definition, go_to_implementation, go_to_type_definition, find_references,
+find_symbol, document_symbols, hover, signature_help, call_hierarchy.
+
+**Done when:** a stub batch of 2+ navigation calls dispatches concurrently with
+correct results and transcript order, and a concurrent didOpen stress probe shows
+no corruption/exception.
+
+## F4 — parallel-safe recall via fresh-per-call store
+
+**Gap:** `recall` rides `get_memory`'s main-thread cached SQLite connection, so it
+cannot join parallel batches.
+
+**Mechanism:** open a fresh store per call inside the tool (the established
+fresh-store-per-thread pattern from `_memory_maintenance` / the episodic writer),
+then set `parallel_safe = True`.
+
+**Done when:** recall works from a worker thread in a stub parallel batch and
+returns identical results to the main-thread path.
+
+## F5 — bounded retry on transient LLM errors
+
+**Gap:** `chat()` raises `RuntimeError` on any non-2xx; one 502/connection-reset
+kills the whole turn (exit 1 in one-shot, which an orchestrator reads as task
+failure).
+
+**Mechanism:** one retry with short backoff on 5xx and connection-level errors
+(URLError/ConnectionError/timeouts). Never retry 4xx; never retry after streaming
+has begun delivering deltas (non-idempotent display).
+
+**Done when:** a stub endpoint that 502s once then succeeds yields a successful
+turn; a 400 still fails immediately; OverCapError path unchanged.
+
+## F6 — capture real token usage
+
+**Gap:** compaction runs off a chars/4 estimate; both plain and SSE responses
+carry a `usage` field that is currently dropped.
+
+**Mechanism:** parse `usage` (prompt_tokens/completion_tokens) from the response
+(SSE: the final chunk that carries it) onto `ChatResponse`; surface it in the
+per-turn telemetry line next to the estimate so drift is visible; optionally feed
+it back to calibrate the estimator.
+
+**Done when:** the telemetry line shows actual vs estimated tokens on a live turn
+against a provider that reports usage, and estimates remain the fallback when
+usage is absent.
+
+## F7 — graceful Ctrl-C mid-turn in the REPL
+
+**Gap:** an interrupt during a long turn propagates out of
+`handle_user_message` and is swallowed by the generic error handler (or exits),
+losing the session.
+
+**Mechanism:** catch `KeyboardInterrupt` at the REPL loop boundary: abandon the
+in-flight turn cleanly (transcript remains consistent — no dangling tool_calls
+without results), print an "interrupted" notice, and return to the prompt.
+Double Ctrl-C at the prompt still exits.
+
+**Done when:** a scripted REPL session interrupted mid-turn returns to the prompt
+with a valid transcript and can run a follow-up turn; Ctrl-C at the idle prompt
+still exits.
+
+## F-series sequencing & concurrency rules
+
+F1/F5/F6 share `llm.py` — one owner works them together. F3+F4 share the
+parallel-dispatch surface. F2 is `session.py`; F7 is `main.py` REPL. Multiple
+agents share this directory: never run `git checkout --`/`restore`/`stash`/
+`clean`/`reset`; stage and commit only your own hunks; if a needed file carries
+someone else's uncommitted work, stage your hunk with `git apply --cached`.
