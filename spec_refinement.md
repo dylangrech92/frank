@@ -191,3 +191,184 @@ parallel-dispatch surface. F2 is `session.py`; F7 is `main.py` REPL. Multiple
 agents share this directory: never run `git checkout --`/`restore`/`stash`/
 `clean`/`reset`; stage and commit only your own hunks; if a needed file carries
 someone else's uncommitted work, stage your hunk with `git apply --cached`.
+
+# Spec refinement — static-analysis pass (I-series)
+
+Goal: the harness provides analysis tooling well beyond what ad-hoc shell
+commands offer, elevating what the model can deliver. Today the only analysis
+surface is LSP diagnostics (`get_diagnostics`), `format`, and `code_actions` —
+no linting, no dead-code detection, no deprecation scanning.
+
+External analyzers are config-declared optional binaries (same posture as the
+language servers and debug adapters): when one is missing the tool degrades to
+a clear `lint-unavailable`-style error naming the missing binary, never a
+crash. `requests` is the only accepted third-party *library*; analyzers are
+external processes.
+
+## I1 — `lint` tool + shared runner layer
+
+**Gap:** style/bug-pattern linting only happens if the model thinks to run a
+linter via `run_command`, and raw linter output is unbounded and unnormalized.
+
+**Mechanism:** new `tools/_lint.py` shared layer + `tools/lint.py` tool.
+Config gains a `linters` block mapping language → command template (defaults:
+`ruff` for Python via `--output-format json`, `eslint` for JS/TS via
+`--format json`, `phpstan` for PHP via `--error-format json`). The shared
+layer exposes the pinned interface (I2 builds against it, do not change the
+shape without updating I2):
+
+    run_lint(paths, project_root) -> LintReport
+    LintReport.issues: list[LintIssue]   # path, line, col, rule, severity, message, source
+    LintReport.unavailable: dict[str, str]  # language -> reason (missing binary etc.)
+
+`lint(path?)` tool: lints one file or the project, renders issues normalized
+(`path:line:col rule severity message`), severity-sorted, capped at a count
+that cannot blow the context budget, with a `+N more` tail line.
+
+**Done when:** an offline probe on a file with known ruff findings returns the
+normalized issues; a missing-binary language yields the unavailable note; a
+clean file returns "no issues".
+
+## I2 — reactive lint-delta injection
+
+**Gap:** the model gets LSP diagnostics injected after edits, but no lint
+feedback — and asking it to lint after every edit is a standing instruction
+(the anti-pattern; steers must stay reactive and evidence-gated).
+
+**Mechanism:** in `agent.py`, mirror the existing diagnostics-injection path:
+before a write tool mutates a file, capture the file's lint issues; after the
+write succeeds, lint again and append ONLY the issues new since the pre-edit
+snapshot to the tool result (`[lint] path:line rule message`, capped).
+No new issues → append nothing. Uses `tools/_lint.py:run_lint` (I1's pinned
+interface). Skips silently when the language has no configured/available
+linter. Delta-only is the point: pre-existing project lint noise must never
+flood the context.
+
+**Done when:** an offline probe that introduces a new ruff-detectable issue
+via `replace_one` sees exactly the new issue appended to the tool result; an
+edit that introduces nothing new appends nothing; projects with pre-existing
+issues never see them injected.
+
+## I3 — `find_dead_code` tool
+
+**Gap:** proving a symbol dead today takes one `find_references` call per
+symbol — nothing sweeps a file or project for unreachable/unused code.
+
+**Mechanism:** new `tools/find_dead_code.py`. Primary adapters: `vulture`
+(Python, JSON-ish parseable output) and — when present — `knip`/`ts-prune`
+(TS/JS). Fallback for any LSP-supported language: walk `document_symbols` for
+the target file and count `find_references` per symbol (excluding the
+declaration itself); zero references → reported as potentially dead with a
+"verify before deleting (dynamic dispatch, exports, reflection)" caveat in the
+rendered output. Results normalized and capped like I1.
+
+**Done when:** an offline probe on a fixture with a provably-unused function
+reports it via vulture AND via the LSP fallback path; a fully-used fixture
+reports none.
+
+## I4 — deprecation surfacing
+
+**Gap:** deprecated-API usage is invisible: LSP servers send
+`DiagnosticTag.Deprecated` on symbols but the diagnostics store drops tags;
+test runs swallow `DeprecationWarning`s.
+
+**Mechanism:** two small cuts. (a) Preserve LSP diagnostic `tags` through the
+diagnostics store and render `[deprecated]` markers in `get_diagnostics`
+output and the post-edit injection line. (b) `run_tests` (pytest path): parse
+the warnings summary for `DeprecationWarning`/`PendingDeprecationWarning`
+entries and append a compact `deprecations:` section to the rendered result
+(no `-W error` — never turn warnings into failures behind the user's back).
+Additionally ruff's deprecation-adjacent rules ride in free via I1 defaults.
+
+**Done when:** a fixture calling a deprecated API shows the `[deprecated]`
+marker in `get_diagnostics` (verify pyright/typescript-language-server
+actually emit the tag; if a server never does, document that and rely on the
+other cuts); a pytest fixture raising a DeprecationWarning shows the
+`deprecations:` section in `run_tests` output.
+
+## I-series sequencing & ownership
+
+I1 owns `tools/_lint.py`, `tools/lint.py`, the `linters` config block.
+I2 owns the `agent.py` wiring ONLY (imports I1's pinned interface) and starts
+after the H-series `agent.py` commit lands. I3 owns `tools/find_dead_code.py`.
+I4 owns `tools/get_diagnostics.py`, `diagnostics.py` store, `tools/run_tests.py`.
+No two slices share a file. Registry/config additions follow the existing
+patterns (`load_tool` deferred schemas; config parsing in `config.py`).
+Every slice: offline probe first, then live verification, then commit.
+
+# Spec refinement — CC-parity pass (S-series)
+
+Three structural upgrades identified 2026-07-07: close the gaps that make the
+harness weaker than mainstream agent CLIs when driving a strong model, while
+keeping its native advantages (DAP debugging, LSP refactors, injected
+diagnostics). A fourth candidate (capability-tiered guardrail profile) was
+explicitly deferred by the owner.
+
+## S1 — subagent fan-out tool
+
+**Gap:** the harness has exactly one context window. Every file read to answer
+a broad question burns the parent's context, while P18 already made concurrent
+one-shot instances safe (pid-unique sessions, WAL memory db, advisory locks,
+`--no-memory`) — the fan-out capability exists but no tool exposes it.
+
+**Mechanism:** new `spawn_agents` tool: accepts a list of `{prompt, cwd?}`
+specs (cwd defaults to the project root), launches each as a child one-shot
+(`python3 <install_dir>/main.py --no-memory -p -`, prompt on stdin) via
+subprocess, all children concurrent up to `subagents.max_concurrent` (config,
+default 4), bounded per-child timeout (`subagents.timeout_s`, default 600).
+Returns per-child: answer (stdout), exit code, stderr tail on failure.
+Recursion guard: children get `CODING_AGENT_DEPTH=parent+1`; the tool refuses
+at depth >= 2. Not `parallel_safe` (children may mutate files).
+
+**Done when:** a live parent one-shot fans out 2 children answering different
+questions about this repo, both answers come back correct, and wall-clock is
+clearly under the sum of two sequential child runs; a depth-2 spawn attempt is
+refused with a clear error.
+
+## S2 — usage-driven context accounting
+
+**Gap:** compaction triggers off a chars/4 estimate; F6 now captures real
+`usage` (prompt/completion tokens) but only prints it in telemetry — the
+number that matters is dropped where it matters most.
+
+**Mechanism:** carry the latest real `prompt_tokens` on the session; use it as
+the primary compaction-trigger signal when present (the estimate stays as the
+fallback for providers that omit usage). Calibrate the estimator with an EMA
+of observed real-vs-estimated ratio so the fallback drifts toward truth.
+Depends on F6 being landed.
+
+**Done when:** a live multi-turn session logs compaction decisions with real
+token counts; a forced near-cap probe compacts at the real threshold; a stub
+response without usage falls back to the (now calibrated) estimate.
+
+## S3 — hard verify gate (upgrade of H1's nudge)
+
+**Gap:** a nudge can be ignored; the harness still lets a turn that mutated
+files end with an unverified "done". A senior never ships unverified work
+silently.
+
+**Mechanism:** harness-enforced in `agent.py`: when a final answer arrives on
+a turn whose mutation tracker recorded file changes and no `run_tests`/
+`run_command` ran this turn, bounce once — inject a system-side message
+requiring the model to either verify now or state the work is unverified. If
+the second final answer still has neither, accept it but prefix the answer
+with a harness-side `[UNVERIFIED CHANGES]` marker so the caller (human or
+orchestrator) sees the state. One bounce max per turn — no loops. If H1's
+nudge already landed from the other session, upgrade it in place rather than
+adding a parallel mechanism (one source of truth).
+
+**Done when:** a live session that edits a file and immediately answers gets
+bounced and then runs the tests (or declares unverified); a turn that already
+ran tests is untouched; a stubborn double-refusal yields the marker; the
+bounce fires at most once per turn.
+
+## S-series sequencing & concurrency rules
+
+S1 (new tool file + registry + config) and S3 (`agent.py` final-answer path)
+are disjoint — parallel owners. S3 coordinates with H1/I2 (same `agent.py`
+surface): whoever lands second integrates, never duplicates. S2 waits for
+F1/F5/F6 to land and the regression suite to pass, since it builds directly on
+F6's usage capture. Same shared-directory rules as the F-series: never
+`git checkout --`/`restore`/`stash`/`clean`/`reset`; stage and commit only
+your own hunks (`git apply --cached` for shared files); leave other agents'
+uncommitted hunks alone.
