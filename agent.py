@@ -51,6 +51,10 @@ def _mutate_tracker(event: dict) -> None:
 # Per-session episodic-extraction watermark (row count already handed to the encoder).
 _EPISODIC_WATERMARKS: dict[int, int] = {}
 
+# Per-session flag for the graph-memory usage nudge (H5) — fires at most once per
+# session, mirroring the _EPISODIC_WATERMARKS id(session) pattern.
+_GRAPH_MEMORY_NUDGE_FIRED: dict[int, bool] = {}
+
 
 from tools import _sandbox
 
@@ -350,6 +354,29 @@ def _loop_guard_check(
     return rendered + steer
 
 
+def _scan_new_mutations(events: list[dict]) -> tuple[bool, set[str]]:
+    """Inspect newly observed mutation events for H1/H5 tracking.
+
+    Args:
+        events: A slice of ``_TURN_MUTATIONS`` added since the last check.
+
+    Returns:
+        ``(any_relevant, paths)`` — whether any event's ``kind`` is one of
+        ``created``/``changed``/``renamed`` (the kinds that count as a real file
+        mutation for verification/graph-memory purposes), and the set of
+        distinct ``path`` values among those relevant events.
+    """
+    any_relevant = False
+    paths: set[str] = set()
+    for event in events:
+        if event.get("kind") in ("created", "changed", "renamed"):
+            any_relevant = True
+            path_val = event.get("path")
+            if path_val:
+                paths.add(path_val)
+    return any_relevant, paths
+
+
 def _web_search_focus_check(name: str, result: ToolResult, rendered: str, searches_without_read: int) -> tuple[str, int]:
     """Nudge the model to stop paraphrase-searching and read a result instead.
 
@@ -417,13 +444,22 @@ def handle_user_message(
           exceeded the model limit; return that same text (turn ends without retry).
           *A later phase replaces this behaviour with compact-then-retry.*
        e. **normal success** — append_assistant(text, tool_calls), then:
-          i.  If no tool calls → episodic_maybe_extract(session) + return response.text.
-          ii. For each tool call:
+          i.  If no tool calls and files were mutated this turn with no
+              successful run_tests/run_command since → bounce once (S3 hard
+              verify gate, upgrading H1's nudge): inject a synthetic user
+              steer and loop again instead of returning. A second such
+              final answer is accepted, but the *returned* text (not the
+              transcript) is prefixed with "[UNVERIFIED CHANGES] " unless the
+              model's own text already says "unverified".
+          ii. If no tool calls (and the gate above doesn't bounce) →
+              episodic_maybe_extract(session) + return response.text (or the
+              gate-marked variant).
+          iii. For each tool call:
               - echo to stderr the call name and arguments.
               - dispatch via registry (dispatch(name, arguments)).
               - echo rendered result to stderr via render_tool_result().
               - store append_tool_result(call.id, call.name, rendered_result).
-          iii. After all calls -> diagnostics_inject_summary(session); continue loop.
+          iv. After all calls -> diagnostics_inject_summary(session); continue loop.
 
     Args:
         text: User message string to begin the turn with.
@@ -437,11 +473,18 @@ def handle_user_message(
             or as one whole-text call on the non-streaming fallback — followed
             by a single ``"\\n"``. Intermediate assistant text on tool-call
             iterations streams through it too. Callers that pass *on_delta*
-            must NOT print the returned string again.
+            must NOT print the returned string again. The one client.chat call
+            immediately after the S3 verify-gate bounce is always delivered
+            whole (never streamed fragment-by-fragment), since whether it
+            needs the "[UNVERIFIED CHANGES] " prefix can only be decided once
+            the full response is in hand.
 
     Returns:
         The final assistant text string — either a normal turn response, an
-        episodic extraction pass-through, or the over-cap sentinel message.
+        episodic extraction pass-through, the over-cap sentinel message, or a
+        turn response prefixed with "[UNVERIFIED CHANGES] " when the S3 hard
+        verify gate bounced once and the follow-up answer still neither
+        verified the mutation nor declared it unverified.
     """
     session.append_user(text)
     flashback_maybe_seed(session)
@@ -458,6 +501,22 @@ def handle_user_message(
     # successful web_search calls since the last web_read, for the reactive
     # web-search focus nudge.
     searches_without_read = 0
+
+    # Per-turn (reset on every handle_user_message call) state for the
+    # post-mutation verification nudge (H1): True once a file was created,
+    # changed, or renamed without a subsequent successful run_tests/run_command
+    # call; cleared the moment such a verification call succeeds. Fires at most
+    # once per turn via verification_nudge_fired.
+    needs_verification = False
+    verification_nudge_fired = False
+
+    # Per-turn (reset on every handle_user_message call) state for the
+    # graph-memory usage nudge (H5): every distinct path touched by a mutation
+    # this turn, and whether record_decision/record_spec was called this turn.
+    # Fired-once-per-session state lives in _GRAPH_MEMORY_NUDGE_FIRED, keyed by
+    # id(session) (see that dict's docstring).
+    mutated_paths: set[str] = set()
+    record_decision_or_spec_called = False
 
     # Chars streamed through on_delta for the CURRENT client.chat call only
     # (reset before each call), so the final-return path knows whether the
@@ -521,9 +580,21 @@ def handle_user_message(
                 )
             print("\n".join(msg_lines), file=sys.stderr)
 
+        # S3 — hard verify gate: once the H1 bounce has fired and the mutation
+        # is still unresolved, this call's answer may need a harness-added
+        # "[UNVERIFIED CHANGES] " prefix decided *after* the response is fully
+        # in hand. Streaming the raw text through on_delta as it arrives would
+        # violate the "sink receives the final text exactly once" contract (the
+        # prefix must lead, and it can't be inserted retroactively into an
+        # already-streamed prefix-less stream). So this one call is buffered
+        # (delta_cb withheld) and delivered whole — with or without the marker —
+        # once the gate decision is made below. Any iteration where the gate
+        # isn't in this pending state streams exactly as before.
         try:
             streamed = 0
-            response: ChatResponse = client.chat(context, tool_schemas, delta_cb)
+            gate_pending = verification_nudge_fired and needs_verification
+            chat_delta_cb = None if gate_pending else delta_cb
+            response: ChatResponse = client.chat(context, tool_schemas, chat_delta_cb)
         except OverCapError:
             # Provider rejected on length despite the estimate — compact and retry.
             if compactions >= max_compactions or not compaction.compact(
@@ -545,15 +616,85 @@ def handle_user_message(
         tool_calls: list[ToolCall] | None = (
             response.tool_calls if response.tool_calls else None
         )
+
+        if not response.tool_calls:
+            # H5 — graph-memory usage nudge: this turn's mutations spanned 3+
+            # distinct paths with no record_decision/record_spec call anywhere
+            # in the turn. Append to the last tool result already in the
+            # transcript (same append mechanism diagnostics_inject_summary
+            # uses). Must run BEFORE session.append_assistant below, since
+            # amend_last_tool_result only touches _messages[-1] when its role
+            # is "tool" — after append_assistant records this turn's answer,
+            # the last message would be the assistant's, not the tool result.
+            # Fires at most once per session.
+            if (
+                len(mutated_paths) >= 3
+                and not record_decision_or_spec_called
+                and not _GRAPH_MEMORY_NUDGE_FIRED.get(id(session), False)
+            ):
+                _GRAPH_MEMORY_NUDGE_FIRED[id(session)] = True
+                print(ui.telemetry("graph-memory-nudge: fired"), file=sys.stderr)
+                session.amend_last_tool_result(
+                    "\n\n[memory] This change spans several files. If a design "
+                    "decision drove it, record it with record_decision so future "
+                    "sessions inherit the reasoning."
+                )
+
         session.append_assistant(response.text or "", tool_calls=tool_calls)
 
         if not response.tool_calls:
-            if on_delta is not None and response.text:
+            # H1 — post-mutation verification nudge: the model is about to end
+            # the turn having mutated files without running anything to verify
+            # the change. Inject a synthetic user-role steer (see module docs
+            # for why: session.py has no mid-transcript system-role append, and
+            # a fabricated tool-role message here would not follow a matching
+            # assistant tool_calls entry, which strict OpenAI-compatible APIs
+            # reject) and do one more loop iteration instead of returning.
+            # Fires at most once per turn.
+            if needs_verification and not verification_nudge_fired:
+                verification_nudge_fired = True
+                print(
+                    ui.telemetry("verification-nudge: fired (unverified file mutation)"),
+                    file=sys.stderr,
+                )
+                session.append_user(
+                    "You modified files this turn but ran nothing to verify the "
+                    "change. Run the relevant tests or code now, or state "
+                    "explicitly in your answer that the change is unverified. "
+                    "Either way, end your answer with a one-line verification "
+                    "breakdown: what you checked (tests, commands, diagnostics) "
+                    "and what it showed."
+                )
+                continue
+
+            # S3 — hard verify gate: this is the SECOND final answer of the
+            # turn (the bounce above already fired once and needs_verification
+            # is still set — a run_tests/run_command call never succeeded in
+            # between). Accept it, but mark it: prefix the *returned* text with
+            # a harness-side "[UNVERIFIED CHANGES] " so the caller sees the
+            # state, unless the model already declared the change unverified
+            # in its own words (case-insensitive "unverified" match). The
+            # transcript above already recorded the model's original,
+            # unprefixed text — only the return value / on_delta payload gets
+            # the marker.
+            final_text = response.text or ""
+            if needs_verification and verification_nudge_fired:
+                if "unverified" not in final_text.lower():
+                    final_text = "[UNVERIFIED CHANGES] " + final_text
+                    print(
+                        ui.telemetry(
+                            "verification-gate: unresolved after bounce — "
+                            "marking [UNVERIFIED CHANGES]"
+                        ),
+                        file=sys.stderr,
+                    )
+
+            if on_delta is not None and final_text:
                 if streamed == 0:
-                    on_delta(response.text)  # non-streaming fallback: deliver whole
+                    on_delta(final_text)  # non-streaming / gated fallback: deliver whole
                 on_delta("\n")
             episodic_maybe_extract(session, client)
-            return response.text
+            return final_text
 
         calls = response.tool_calls
         # Intermediate assistant text on a tool-call iteration that did NOT
@@ -588,7 +729,23 @@ def handle_user_message(
                     ui.tool_call(f"Tool call: {call.name}({json.dumps(call.arguments)})"),
                     file=sys.stderr,
                 )
+                # Snapshot before/after this specific call so a mutation event
+                # can be attributed to it (parallel_safe tools never mutate, so
+                # this tracking only needs the sequential path — see Tool.parallel_safe).
+                pre_mutation_len = len(_TURN_MUTATIONS)
                 result = dispatch(call.name, call.arguments)
+                new_events = _TURN_MUTATIONS[pre_mutation_len:]
+                if new_events:
+                    any_relevant, new_paths = _scan_new_mutations(new_events)
+                    if any_relevant:
+                        needs_verification = True
+                        mutated_paths |= new_paths
+
+            if call.name in ("run_tests", "run_command") and result.status == "success":
+                needs_verification = False
+            if call.name in ("record_decision", "record_spec"):
+                record_decision_or_spec_called = True
+
             rendered = render_tool_result(call.name, result)
             result, rendered = _guard_oversize_result(call.name, result, rendered, cap, est)
             rendered = _loop_guard_check(call.name, rendered, seen_errors)
