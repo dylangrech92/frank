@@ -274,6 +274,8 @@ Chalie runs a 5-minute idle "subconscious" worker; a session-based CLI has no su
 
 Reactive only, mirroring Chalie: a pre-flight token estimate against `cap = window − max(0.10·window, 8000)`; if a send would exceed it (or the provider returns `context_length_exceeded`), compact then retry — no periodic polling. The summarization prompt is Chalie's `ChatHistoryCompactionSystemPrompt`, re-themed for coding with fixed sections **Task / State / Files-touched / Open / Decisions / Last**. Persistence is simplified: replace everything above a watermark with a single summary message and keep the recent tail (no fork/watermark machinery). Token estimation uses `tiktoken` when available, else a `chars/4` heuristic.
 
+**Usage-driven trigger.** Providers that report `usage.prompt_tokens` on a response give a real count — but it only measures the prompt of *that* request, and the context keeps growing after it (that response's own text, then new tool results). So the compaction gate compares against a composed signal, not the estimate alone: the session's most recent real `prompt_tokens` plus a calibrated estimate of only what was appended to the context since that request was built. When no real usage has been seen yet (or a compaction just reshaped the context, invalidating the baseline), the gate falls back to the plain estimate. Either way the estimate is scaled by an EMA (α = 0.3) of observed real-vs-estimated ratios carried on the session, so the `chars/4` fallback drifts toward the provider's real tokenizer over the life of a session instead of carrying a fixed, unverified undershoot.
+
 ## 9. Agent loop
 
 ```python

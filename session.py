@@ -279,6 +279,24 @@ class Session:
         # Persisted so a resumed session does not re-mine already-mined history.
         self.episodic_watermark: int = episodic_watermark
 
+        # S2 — usage-driven compaction trigger state (in-memory only; not
+        # persisted, since it is re-derived from the next real response).
+        # ``last_prompt_tokens`` is the real ``prompt_tokens`` usage reported by
+        # the most recent provider response, or None until one arrives.
+        # ``last_prompt_context_len`` is the length of the assembled context
+        # list that request was built from, so callers can estimate only what
+        # has been appended since (that response's own text plus any new tool
+        # results) instead of re-estimating the whole transcript. Reset to
+        # None by the caller whenever compaction reshapes the assembled
+        # context, since the recorded length no longer lines up.
+        # ``token_estimate_ratio`` is an EMA (alpha 0.3) of observed
+        # real/estimated ratios, seeded neutral at 1.0, that calibrates the
+        # fallback chars/4-or-tiktoken estimator toward the provider's actual
+        # tokenizer over the life of the session.
+        self.last_prompt_tokens: int | None = None
+        self.last_prompt_context_len: int = 0
+        self.token_estimate_ratio: float = 1.0
+
         self._acquire_lock()
 
     @classmethod

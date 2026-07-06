@@ -79,6 +79,77 @@ def estimate_tokens(
         return max(1, len(text) // 4)
 
 
+def trigger_estimate(
+    session: "Session",
+    context: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]] | None = None,
+) -> int:
+    """Return the compaction-trigger signal for the assembled *context*.
+
+    ``prompt_tokens`` from the most recent provider response only measures the
+    prompt of *that* request — the context has grown since (that response's
+    own text plus whatever tool results followed it). So when a real
+    measurement is available, the signal is composed as::
+
+        trigger = last_real_prompt_tokens + calibrated_estimate(messages appended since)
+
+    rather than trusting the real number alone (stale) or re-estimating the
+    whole transcript (throws away the real measurement). ``session``'s
+    ``last_prompt_context_len`` marks where that measurement's context ended;
+    everything in *context* beyond it is new and only estimated. The estimate
+    of that delta (and the whole-context fallback estimate below) is scaled by
+    ``session.token_estimate_ratio``, the EMA-calibrated real/estimated ratio,
+    so both paths drift toward the provider's real tokenizer over time.
+
+    Falls back to the plain (calibrated) estimate of the whole context when no
+    real measurement exists yet, or when the recorded baseline no longer fits
+    *context* (e.g. right after a compaction reshaped it — callers reset
+    ``last_prompt_tokens`` to None in that case).
+
+    Args:
+        session: The active Session carrying the usage/calibration state.
+        context: The just-assembled message list for the upcoming request.
+        tools: Tool schemas for the upcoming request (counted in the fallback
+            estimate; omitted from the delta estimate since the real
+            measurement already accounted for them).
+
+    Returns:
+        An integer token estimate to compare against the compaction cap.
+    """
+    if (
+        session.last_prompt_tokens is not None
+        and session.last_prompt_context_len <= len(context)
+    ):
+        new_messages = context[session.last_prompt_context_len:]
+        delta_est = estimate_tokens(new_messages) if new_messages else 0
+        return session.last_prompt_tokens + int(delta_est * session.token_estimate_ratio)
+
+    return int(estimate_tokens(context, tools) * session.token_estimate_ratio)
+
+
+def update_calibration(
+    session: "Session", real_tokens: int, estimated_tokens: int, alpha: float = 0.3
+) -> None:
+    """Update the session's real-vs-estimate EMA ratio with a new observation.
+
+    Skipped when *estimated_tokens* is non-positive (nothing to divide by;
+    the ratio stays at its previous value until a usable observation arrives).
+
+    Args:
+        session: The active Session whose ``token_estimate_ratio`` is updated.
+        real_tokens: The real ``prompt_tokens`` reported for a request.
+        estimated_tokens: The raw (uncalibrated) estimate computed for the
+            same request's assembled context.
+        alpha: EMA smoothing factor; higher weighs the new observation more.
+    """
+    if estimated_tokens <= 0:
+        return
+    observed_ratio = real_tokens / estimated_tokens
+    session.token_estimate_ratio = (
+        alpha * observed_ratio + (1 - alpha) * session.token_estimate_ratio
+    )
+
+
 def compute_cap(window: int, compaction_cfg: Dict[str, Any] | None = None) -> int:
     """Return the usable token cap below the model's context window.
 

@@ -550,18 +550,36 @@ def handle_user_message(
         # compacting older turns before the call is ever made.
         context = session.assemble_context()
         est = compaction.estimate_tokens(context, tool_schemas)
+        # S2 — usage-driven trigger: real prompt_tokens from the last response
+        # (plus a calibrated estimate of what was appended since) when
+        # available, otherwise the calibrated fallback estimate. See
+        # compaction.trigger_estimate for the composition rationale.
+        trigger = compaction.trigger_estimate(session, context, tool_schemas)
         print(
             ui.telemetry(f"context: {len(context)} messages, ~{est} tokens (cap {cap})"),
             file=sys.stderr,
         )
-        while est > cap:
+        if session.last_prompt_tokens is not None:
+            print(
+                ui.telemetry(
+                    f"trigger: ~{trigger} tokens (real {session.last_prompt_tokens} "
+                    f"+ calibrated delta, ema {session.token_estimate_ratio:.2f})"
+                ),
+                file=sys.stderr,
+            )
+        while trigger > cap:
             if compactions >= max_compactions or not compaction.compact(
                 session, client, window, comp_cfg
             ):
                 return _over_cap_giveup()
             compactions += 1
+            # Compaction reshaped the assembled context (summary spliced in),
+            # so the prior real-usage baseline's index no longer lines up —
+            # fall back to the calibrated estimate until the next response.
+            session.last_prompt_tokens = None
             context = session.assemble_context()
             est = compaction.estimate_tokens(context, tool_schemas)
+            trigger = compaction.trigger_estimate(session, context, tool_schemas)
             print(
                 ui.telemetry(
                     f"context: {len(context)} messages, ~{est} tokens "
@@ -602,13 +620,24 @@ def handle_user_message(
             ):
                 return _over_cap_giveup()
             compactions += 1
+            # Same reasoning as the pre-flight compaction path above: the
+            # baseline this real measurement was keyed to no longer applies.
+            session.last_prompt_tokens = None
             continue
 
         if response.prompt_tokens is not None:
+            # S2 — calibrate the fallback estimator toward this request's real
+            # usage, then remember it (plus where this context ended) so the
+            # next pre-flight trigger check can compose real + delta instead
+            # of re-estimating the whole transcript from scratch.
+            compaction.update_calibration(session, response.prompt_tokens, est)
+            session.last_prompt_tokens = response.prompt_tokens
+            session.last_prompt_context_len = len(context)
             print(
                 ui.telemetry(
                     f"usage: actual prompt_tokens={response.prompt_tokens} "
-                    f"vs estimated ~{est} tokens (delta {response.prompt_tokens - est:+d})"
+                    f"vs estimated ~{est} tokens (delta {response.prompt_tokens - est:+d}) "
+                    f"[ema {session.token_estimate_ratio:.2f}]"
                 ),
                 file=sys.stderr,
             )
