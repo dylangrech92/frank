@@ -27,6 +27,7 @@ class ReadFile(Tool):
     action = 'read the file'
     oversize_hint = 'use start_line/end_line to read a smaller range'
     alternative = 'list_files to check the path exists'
+    parallel_safe = True  # pure filesystem read
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {

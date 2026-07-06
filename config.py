@@ -15,6 +15,7 @@ class LLMConfig:
     temperature: float = 0.2
     max_tokens: int | None = None
     context_limit: int = 128000
+    stream: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +50,7 @@ def load(path: str | Path = 'config.json') -> Config:
             raise ValueError(f"missing required 'llm.{key}'")
         llm_data[key] = raw_llm[key]
 
-    EXTRA_LLM_KEYS = ('temperature', 'max_tokens', 'context_limit')
+    EXTRA_LLM_KEYS = ('temperature', 'max_tokens', 'context_limit', 'stream')
     for key in EXTRA_LLM_KEYS:
         if key in raw_llm:
             llm_data[key] = raw_llm[key]

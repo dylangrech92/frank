@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from config import LLMConfig
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 
 class OverCapError(Exception):
@@ -174,6 +174,73 @@ def _tool_call_from_dict(raw: Dict[str, Any]) -> ToolCall:
     return ToolCall(id=raw["id"], name=name, arguments=arguments)
 
 
+def _read_sse_response(resp: Any, on_delta: Callable[[str], None]) -> ChatResponse:
+    """Consume a ``text/event-stream`` chat-completions response into a ChatResponse.
+
+    Iterates ``data:`` lines until ``[DONE]``, forwarding every assistant-text
+    fragment to *on_delta* as it arrives and accumulating tool-call fragments
+    (OpenAI streaming format: index-keyed deltas whose ``arguments`` strings
+    concatenate). Callback exceptions are swallowed — display must never kill
+    the request. Unparseable data lines are skipped.
+
+    Args:
+        resp: The open ``urlopen`` response object (file-like, yields bytes lines).
+        on_delta: Called with each non-empty ``delta.content`` fragment.
+
+    Returns:
+        A ``ChatResponse`` identical in shape to the non-streaming parse.
+    """
+    text_parts: list[str] = []
+    calls_by_index: dict[int, dict[str, Any]] = {}
+
+    for raw_line in resp:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            continue
+        data_str = line[len("data:"):].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+
+        piece = delta.get("content")
+        if piece:
+            text_parts.append(piece)
+            try:
+                on_delta(piece)
+            except Exception:
+                pass
+
+        for frag in delta.get("tool_calls") or []:
+            idx = frag.get("index", 0)
+            slot = calls_by_index.setdefault(
+                idx, {"id": None, "function": {"name": "", "arguments": ""}}
+            )
+            if frag.get("id"):
+                slot["id"] = frag["id"]
+            func = frag.get("function") or {}
+            if func.get("name"):
+                slot["function"]["name"] = func["name"]
+            if func.get("arguments"):
+                slot["function"]["arguments"] += func["arguments"]
+
+    tool_calls: List[ToolCall] = []
+    for idx in sorted(calls_by_index):
+        slot = calls_by_index[idx]
+        if slot["id"] is None:
+            slot["id"] = f"call_{idx}"  # some providers omit ids on streamed calls
+        tool_calls.append(_tool_call_from_dict(slot))
+
+    return ChatResponse(text="".join(text_parts), tool_calls=tool_calls)
+
+
 class LLMClient:
     """Thin HTTP client for OpenAI-compatible chat-completions endpoints.
 
@@ -195,6 +262,7 @@ class LLMClient:
         self,
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]] | None = None,
+        on_delta: Callable[[str], None] | None = None,
     ) -> ChatResponse:
         """Send a chat request and return the parsed response.
 
@@ -203,6 +271,11 @@ class LLMClient:
             Each dict typically carries keys like ``role`` and ``content``.
         tools: Optional list of tool/function-schema dicts (as per the OpenAI
             format). Only included in the request body when non-empty.
+        on_delta: Optional callback invoked with each assistant-text fragment as
+            it streams in. Streaming (SSE) is requested only when this is set
+            AND ``config.stream`` is true; the return value is identical either
+            way. A provider that ignores ``stream`` and answers with plain JSON
+            is handled transparently (``on_delta`` is then never called).
 
     Returns:
         A ``ChatResponse`` with ``text`` and ``tool_calls`` populated from
@@ -214,11 +287,15 @@ class LLMClient:
         RuntimeError: For all other non-2xx responses, including the HTTP status
             and response body text.
     """
+        want_stream = on_delta is not None and self.config.stream
         body: Dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
             "temperature": self.config.temperature,
         }
+
+        if want_stream:
+            body["stream"] = True
 
         if self.config.max_tokens is not None:
             body["max_tokens"] = self.config.max_tokens
@@ -240,6 +317,8 @@ class LLMClient:
 
         try:
             resp = urllib.request.urlopen(req)
+            if on_delta is not None and want_stream and resp.headers.get_content_type() == "text/event-stream":
+                return _read_sse_response(resp, on_delta)
             data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body_text = exc.read().decode("utf-8", errors="replace")

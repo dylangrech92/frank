@@ -28,6 +28,7 @@ class WebRead(Tool):
     )
     action = 'fetch the page'
     oversize_hint = 'request a more specific URL or section'
+    parallel_safe = True  # network only, no shared state
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {

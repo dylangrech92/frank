@@ -28,6 +28,12 @@ class Tool(ABC):
     oversize_hint: str = "narrow the request or use a more specific tool"
     alternative: str = "a different tool or approach"  # suggested when this tool keeps failing
 
+    # True only for tools that neither mutate any state nor touch a resource
+    # that is unsafe off the main thread (LSP document sync, the main-thread
+    # SQLite connection, process handles).  When every call in an assistant
+    # batch is parallel_safe, the agent loop dispatches the batch concurrently.
+    parallel_safe: bool = False
+
     @abstractmethod
     def run(self, **kwargs: object) -> ToolResult:
         """Execute the tool with the given keyword arguments.

@@ -289,6 +289,10 @@ def handle_user_message(text):
         diagnostics.inject_summary(session)            # "⚠ 3 errors, 2 warnings"
 ```
 
+**Streaming.** `llm.chat` accepts an optional `on_delta` callback; when set (and `llm.stream` is not disabled in config) the request is sent with `stream: true` and the SSE `delta.content` fragments are forwarded to the callback as they arrive, while tool-call fragments accumulate by index (ids synthesized as `call_<idx>` when a provider omits them). A provider that ignores `stream` and answers with plain JSON is handled transparently. The loop guarantees the final answer reaches `on_delta` exactly once — streamed live or delivered whole on fallback — followed by one `"\n"`, so callers that pass a sink never print the return value again. The REPL streams to stdout; one-shot mode streams to stderr, keeping stdout the pure final-answer channel.
+
+**Parallel tool dispatch.** Tools carry a `parallel_safe` class attribute (default `False`), true only for tools that neither mutate state nor touch a main-thread-only resource (LSP document sync, the cached SQLite connection, process handles) — currently `read_file`, `list_files`, `find`, `get_diagnostics`, `web_search`, `web_read`. When an assistant batch has 2+ calls and every one is `parallel_safe`, the loop dispatches them on a `ThreadPoolExecutor` (≤8 workers) and appends results in original call order; any unsafe or unknown tool in the batch forces the fully sequential path, preserving effect ordering.
+
 ## 10. config.json
 
 Config is per-agent-install, not per-project: it defaults to `config.json` next to `main.py` in the agent's own directory, and `--config <path>` overrides that for testing or alternate setups.
@@ -296,7 +300,7 @@ Config is per-agent-install, not per-project: it defaults to `config.json` next 
 ```json
 {
    "llm": { "base_url": "https://api.provider.com/v1", "api_key": "…", "model": "…",
-            "temperature": 0.2, "context_limit": 128000 },
+            "temperature": 0.2, "context_limit": 128000, "stream": true },
   "language_servers": {
     "python": "pyright-langserver --stdio",
     "php": "intelephense --stdio",

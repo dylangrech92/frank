@@ -32,6 +32,7 @@ class GetDiagnostics(Tool):
         'Report current language-server diagnostics for the project or a single file. '
         'When path is given, restrict to diagnostics whose path ends with that string.'
     )
+    parallel_safe = True  # reads the Condition-guarded diagnostics STORE only
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {

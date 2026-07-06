@@ -85,6 +85,7 @@ class ListFiles(Tool):
     )
     action = 'list files'
     oversize_hint = 'pass a subdirectory path'
+    parallel_safe = True  # pure filesystem read
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {

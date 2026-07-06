@@ -71,6 +71,7 @@ class WebSearch(Tool):
     description = (
         "Search the web (DuckDuckGo) and return the top results as titles, URLs, and snippets."
     )
+    parallel_safe = True  # network only; cooldown is guarded by _ddg_lock
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {

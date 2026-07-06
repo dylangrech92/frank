@@ -35,6 +35,7 @@ class Find(Tool):
     action = 'search'
     oversize_hint = 'narrow the query or pass path to limit the scope'
     alternative = 'find_symbol (symbol names) or find_references (usages)'
+    parallel_safe = True  # spawns its own ripgrep subprocess, reads only
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {
