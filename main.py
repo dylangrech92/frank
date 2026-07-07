@@ -477,18 +477,25 @@ def main() -> None:
                         task, session, client, args.verbose, cfg.compaction,
                         on_delta=_stderr_delta,
                     )
+                    # flush=True: stdout is block-buffered when piped, and
+                    # teardown (memory sweep, episodic enqueue) still runs
+                    # after this — a caller-side kill in that window must not
+                    # lose the already-produced answer.
                     if args.json:
                         duration_s = time.monotonic() - start_t
-                        print(json.dumps(_build_envelope(session, "ok", None, duration_s)))
+                        print(
+                            json.dumps(_build_envelope(session, "ok", None, duration_s)),
+                            flush=True,
+                        )
                     else:
-                        print(answer)
+                        print(answer, flush=True)
                 except Exception as exc:
                     duration_s = time.monotonic() - start_t
                     error_msg = f"{type(exc).__name__}: {exc}"
                     if args.json:
                         print(json.dumps(
                             _build_envelope(session, "error", error_msg, duration_s)
-                        ))
+                        ), flush=True)
                     else:
                         print(ui.error(f"Error: {error_msg}"), file=sys.stderr)
                     exit_code = 1
