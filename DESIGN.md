@@ -56,11 +56,15 @@ coding_agent/
     tests.py         # Test-framework detection + structured pass/fail parsing
   memory/
     store.py         # SQLite open/migrate; sqlite-vec + FTS5 wiring
-    episodic.py      # Gist extraction, reconsolidation, decay, eviction
-    atomic.py        # (kind,key,value) atoms; Mem0-style extraction; per-kind decay
+    anchor.py        # Code-anchoring: content-hash + git-commit stamp; anchor-liveness check
+    atomic.py        # (kind,key,value) knowledge atoms; Mem0-style ADD/UPDATE/DELETE/NOOP; anchor-liveness scoring
+    skeleton.py      # LLM-free derived project skeleton, task-personalised (mtime-cached, never persisted)
+    orientation.py   # Task-start hook: zero-LLM code-anchored brief (skeleton + anchored recall + graph hits)
+    consolidation.py # Task-end hook: mines the turn diff + transcript tail into durable anchored atoms, off-thread
+    explorer.py      # Lazy gap-fill: bounded memory-less explorer for cold task areas; persists its brief as atoms
     graph.py         # Rule/Decision/Pivot/Spec nodes + typed edges
     recall.py        # Cross-layer hybrid (vector + FTS) recall + composite scoring
-    flashback.py     # Turn-0 seed injection (terse/continuation gates)
+    episodic.py      # Episodic store retired (M7); now only `_safe_json_array`, a shared LLM-JSON-array parser
   tools/
     base.py          # Tool ABC: name/description/parameters(JSON-Schema)/run() -> ToolResult
     result.py        # ToolResult.ok/err contract (lifted from Chalie)
@@ -74,19 +78,19 @@ Per-project runtime artifacts live under the **project root** (the launch CWD), 
 ```
 <project>/.coding_agent/
   sessions/2026-07-01T20-45-03-48213.json  # id is <timestamp>-<pid>; --session <id> resumes it
-  memory.db                             # SQLite: episodes, facts, graph_nodes/edges (+ vec + fts)
+  memory.db                             # SQLite: facts, graph_nodes/edges (+ vec + fts)
 ```
 
 ## 4. Session, transcript & context assembly
 
 ### 4.1 Lifecycle
-On launch the harness: (1) loads `config.json` from the agent's own install directory by default (`--config` overrides); (2) captures the launch **CWD as the project root** (all file operations are sandboxed to it); (3) creates a **new session transcript** with a `<timestamp>-<pid>` id (unique across concurrent launches), or resumes an existing one when `--session <id>` is passed (`--list-sessions` lists available ids); an advisory lock file guards against two processes appending to the same transcript at once; (4) pre-warms LSP servers for languages detected in the tree **on a background thread** (spawns overlap the first LLM round-trip; `get_client` is lock-guarded against the race); (5) enters a REPL: read user message → run the agent loop → print the assistant's text → persist the turn. **One-shot mode** (`-p/--prompt "task"`, or `-p -` to read the task from stdin) replaces the REPL for orchestrator/subagent use: it runs a single task, prints only the final answer to stdout (all telemetry is on stderr), and exits 0 on success / 1 on error. `--no-memory` skips every long-term-memory job (flashback, rules provider, maintenance, episodic + fact extraction) for the fastest possible ephemeral run. Concurrent instances on the same project are safe: session ids are pid-unique, transcripts are advisory-locked, and memory.db runs WAL with a busy timeout.
+On launch the harness: (1) loads `config.json` from the agent's own install directory by default (`--config` overrides); (2) captures the launch **CWD as the project root** (all file operations are sandboxed to it); (3) creates a **new session transcript** with a `<timestamp>-<pid>` id (unique across concurrent launches), or resumes an existing one when `--session <id>` is passed (`--list-sessions` lists available ids); an advisory lock file guards against two processes appending to the same transcript at once; (4) pre-warms LSP servers for languages detected in the tree **on a background thread** (spawns overlap the first LLM round-trip; `get_client` is lock-guarded against the race); (5) enters a REPL: read user message → run the agent loop → print the assistant's text → persist the turn. **One-shot mode** (`-p/--prompt "task"`, or `-p -` to read the task from stdin) replaces the REPL for orchestrator/subagent use: it runs a single task, prints only the final answer to stdout (all telemetry is on stderr), and exits 0 on success / 1 on error. `--no-memory` skips every long-term-memory job (orientation, rules provider, end-of-session consolidation) for the fastest possible ephemeral run. Concurrent instances on the same project are safe: session ids are pid-unique, transcripts are advisory-locked, and memory.db runs WAL with a busy timeout.
 
 ### 4.2 Message format
 **Native OpenAI tool-role messages.** An `assistant` message carries `tool_calls`; each result is a `role:"tool"` message keyed by `tool_call_id`. This is the standard OpenAI-compatible contract and maps 1:1 onto "tool results attached to the assistant response." (This deliberately diverges from Chalie, which flattens history into a single text user-message; the native format is leaner and standard here.)
 
 ### 4.3 Transcript on disk (full fidelity)
-One file per session: YAML frontmatter (metadata) + a JSON body holding the **flat array of native-OpenAI messages**, plus optional `summary`/`summary_covers` (persisted compaction state) and `episodic_watermark` (persisted extraction watermark) keys so `--session <id>` resumes with the compacted view and without re-mining already-mined history. Legacy transcripts predating these keys — a bare JSON array with no wrapping object — still load: they resume with no summary and an episodic watermark seeded to the full message count. Writes are atomic (temp file + `os.replace`), and an advisory `<transcript>.lock` file (containing the holding pid) prevents two processes from appending to the same transcript concurrently. Nothing is ever pruned from the record.
+One file per session: YAML frontmatter (metadata) + a JSON body holding the **flat array of native-OpenAI messages**, plus an optional `summary`/`summary_covers` (persisted compaction state) key pair so `--session <id>` resumes with the compacted view. `session.py` also still loads/persists a legacy `episodic_watermark` key for transcript-schema back-compat, but no code outside `session.py` reads or advances it anymore (`grep episodic_watermark` across the tree hits only `session.py`): the row-count-gated episodic extractor it watermarked was retired with `memory/episodic.py` (M7), and its replacement, consolidation (§7), has no watermark — it enqueues unconditionally at the end of every turn that produced a final answer. Legacy transcripts predating these keys — a bare JSON array with no wrapping object — still load with no summary. Writes are atomic (temp file + `os.replace`), and an advisory `<transcript>.lock` file (containing the holding pid) prevents two processes from appending to the same transcript concurrently. Nothing is ever pruned from the record.
 
 ```
 ---
@@ -112,10 +116,10 @@ created_at: 2026-07-01T20:45:03Z
 The transcript on disk and the context sent to the model are **different**. `session.assemble_context()` builds the pruned view each step:
 
 - **In-flight turn** (current user message + all its assistant/tool activity so far): **full** native scaffolding — the LLM must see what it just did.
-- **Completed prior turns**: collapse to **`[user message, final assistant answer]` only**. All `tool_calls`, all `tool` result messages, and all mid-chain narration are dropped. (Dropping tool results *requires* stripping the `tool_calls` field too, since the API rejects dangling tool calls.) The record of *how* the work was done survives in episodic memory, not the context window.
+- **Completed prior turns**: collapse to **`[user message, final assistant answer]` only**. All `tool_calls`, all `tool` result messages, and all mid-chain narration are dropped. (Dropping tool results *requires* stripping the `tool_calls` field too, since the API rejects dangling tool calls.) The record of *how* the work was done survives in the full-fidelity on-disk transcript (§4.3, never pruned), not the context window; durable, reusable insight distilled from it is separately captured as anchored knowledge atoms by consolidation (§7), not a narrative copy of the transcript.
 - **Reactive compaction** sits on top: if even the pruned context would exceed `window − max(0.10·window, 8000)`, the oldest turns collapse into a single summary message.
 
-**KV-cache-stable provider ordering (verified cache-stable, F2 audit 2026-07-07):** `CONTEXT_PROVIDERS` blocks are joined into the system message in registration order — catalog (`main.register_catalog_provider`), then active-rules (`memory.graph.register_graph_provider`), then flashback (`memory.flashback.register_flashback_provider`) — and that order is already prefix-optimal for local-provider KV-cache reuse, so **no reordering was made**. Evidence: a two-turn probe against a real project store (seeded with one active rule + one decision, real registration path, no stubbed semantics) dumped both turns' `assemble_context()` output as `json.dumps` and diffed them. `system_prompt` and `catalog` are byte-identical across turns by construction — `render_catalog_block()` lists every tool in the full registry regardless of `load_tool` activation state, so it never varies within a process lifetime. The `graph-rules` block only changes when a `record_rule` call fires mid-session (rare) and is registered *before* flashback. `flashback` is the block that reliably varies turn-to-turn (turn-0/topic-shift gated) and it is registered last, so it already sits at the tail of the system message. Measured: common byte prefix across turns = 4245/4587 bytes, covering all of `system_prompt` + `catalog` + `graph-rules` (4137 chars) with divergence isolated to the trailing `flashback` block only. No `session.py` ordering change was required.
+**KV-cache-stable provider ordering:** `CONTEXT_PROVIDERS` blocks are joined into the system message in registration order — catalog (`main.register_catalog_provider`), then active-rules (`memory.graph.register_graph_provider`), then orientation (`memory.orientation.register_orientation_provider`) — all registered in that order by `main.session_start_jobs`, and that order is prefix-optimal for local-provider KV-cache reuse. `system_prompt` and `catalog` are byte-identical across turns by construction — `render_catalog_block()` lists every tool in the full registry regardless of `load_tool` activation state, so it never varies within a process lifetime. The `graph-rules` block only changes when a `record_rule` call fires mid-session (rare) and is registered *before* orientation. `orientation` is the block that reliably varies turn-to-turn — it runs on **every** turn now, unconditionally (`memory.orientation.orientation_maybe_seed` has no gate; retrieval is already task-relative), and its skeleton + recalled-atom content is a function of the current task text, so it differs whenever the task text does — and it is registered last, so it already sits at the tail of the system message. No `session.py` ordering change is required.
 
 ## 5. Tool catalog
 
@@ -204,34 +208,24 @@ Per-project SQLite store at `<project>/.coding_agent/memory.db` (sqlite-vec `vec
 
 Chalie merges "atomic recall" and "data-graph" into one table with mostly-aspirational edges. We **deliberately split them**, because the two have different write paths, lifecycles, and query patterns.
 
-### 7.1 Layer 1 — Episodic (`episodes`)
-The "what happened" narrative. Gists are auto-extracted at **turn-end**, count-gated (≥ N new transcript rows past a watermark) and run **off-thread** so the turn never blocks. The encoder returns `{gist, transcript_ids, has_open_loop, update_id, delete_id}`, supporting **reconsolidation** (update-in-place via `update_id`) and **obsolescence** (`delete_id`).
-
-```
-episodes(id TEXT PK, gist TEXT, salience INTEGER CHECK(1..10),
-         created_at, last_relevant_at, last_accessed_at,
-         transcript_ids TEXT/*JSON*/, has_open_loop INTEGER,
-         facts_extracted_at,  -- set once the fact-extractor has mined this gist (§7.2)
-         deleted_at)
-episodes_fts(gist)                 -- fts5
-episodes_vec(vec0 float[768])
-```
-
-**Erosion:** exponential decay `weight = (salience/10) · exp(−Δt_hours / τ)`, with `τ_leaf = 14d`, anchored on `last_relevant_at`. **Eviction:** hard-delete when `weight < 0.05 AND salience ≤ 3 AND age > 90d`. Chalie's UMAP+HDBSCAN super-episode clustering is **dropped** (heaviest dependency, marginal value here); leaf gists + decay + reconsolidation deliver "erode over time."
+### 7.1 Layer 1 — Project skeleton (S-DERIVED — ephemeral, never persisted)
+Answers "where things live": a gitignore-aware file tree (reusing `tools.list_files`' filter) plus the top-ranked symbols per most task-relevant file, personalised to the current task text by token-overlap scoring (filename tokens weigh 3x, directory tokens 1x; test-path matches de-prioritised, never excluded). Symbols come from an already-warm LSP server when one is running (queried with `spawn=False` — never blocks on a cold server start), falling back to a local `ast` (Python) or regex (other languages) extractor when no server is warm. Rebuilt fresh from source on every call, mtime-cached (`memory/skeleton.py`), and fit to a token budget (1000 tokens as called from orientation, `orientation.SKELETON_TOKEN_BUDGET`) that truncates the lowest-ranked symbols, then files, first. Zero LLM/embedder calls, and never written to `memory.db` — structural facts go stale silently, so they are *derived* every time, never remembered (MEMORY_REDESIGN.md §2).
 
 ### 7.2 Layer 2 — Atomic recall (`facts`)
-Discrete atoms `(kind, key, value)`, value kept atomic. Written **both** ways: the LLM's `remember` tool **and** a Mem0-style auto-extractor that mines new episode gists into facts (ADD / UPDATE / DELETE / NOOP, shown the top-N most-similar existing facts before deciding). Recall is a hybrid vector + FTS composite score. Bi-temporal `valid_from/valid_to` handles contradiction (supersession sets `valid_to` on the old row).
+Discrete knowledge atoms `(kind, key, value)`, value kept atomic; kinds are `project`, `convention`, `discovery`, `misc` (`memory.atomic.KINDS`). Written three ways, all through the same `remember()`/`forget()` primitive: the LLM's `remember` tool, `consolidation`'s task-end reconciliation (§7.4), and `explorer`'s persisted gap-fill bullets (§7.4) — each an ADD/UPDATE/DELETE/NOOP decision shown the top-N most-similar existing atoms before deciding. Recall is a hybrid vector + FTS composite score. Bi-temporal `valid_from/valid_to` handles contradiction (supersession sets `valid_to` on the old row, scoped by `(kind, key)`).
+
+Every atom carries a **code anchor** (MEMORY_REDESIGN.md §5): `anchor_path`/`anchor_symbol` name what the insight is about (`NULL` = repo-wide), `anchor_hash` is the anchor file's content hash at learn time, `learned_commit` is the git HEAD when learned. **Staleness is anchor drift, not elapsed time** — there is no TTL or time-decay in this layer anymore. On recall (`recall_facts`), each candidate's anchor is re-hashed (`memory.anchor.is_stale`, cached per file for the call) and a missing/drifted anchor is down-weighted (×0.4) with its rendered text labelled `⚠ may be stale`, never silently trusted. Final score = FTS/vector relevance + `0.15·confidence` + `0.15·anchor-freshness`.
 
 ```
 facts(id INTEGER PK, kind TEXT, key TEXT, value TEXT,
-      salience_floor REAL, d_base REAL, retrieval_weight REAL,
+      salience_floor REAL, d_base REAL, retrieval_weight REAL,  -- legacy decay columns, unused since M7
       first_seen_at, last_confirmed_at, last_accessed_at,
-      valid_from, valid_to, active INTEGER, deleted_at)
+      valid_from, valid_to, active INTEGER, deleted_at,
+      anchor_path TEXT, anchor_symbol TEXT, anchor_hash TEXT, learned_commit TEXT,
+      confidence REAL, source TEXT)  -- source: 'consolidation'|'explorer'|'explicit-tool'|'legacy'
 facts_fts(key, value, kind)        -- fts5 porter-stemmed
 facts_key_vec(vec0 float[768]); facts_value_vec(vec0 float[768])
 ```
-
-Kinds (coding-themed): `project` (facts about this codebase), `convention` (observed coding conventions), `discovery` (things learned, 14d TTL), `misc` (short TTL). Per-kind decay is power-law `rw = max(salience_floor, max(1, age_days)^(−d_base))` with per-kind TTL hard-purge.
 
 ### 7.3 Layer 3 — Data-graph (`graph_nodes` + `graph_edges`)
 The project's "why" — and unlike Chalie, this graph has **real, working typed edges**. Four LLM-recorded node types, each timestamped:
@@ -256,19 +250,19 @@ graph_edges(id INTEGER PK,
 graph_nodes_fts(title, body); graph_nodes_vec(vec0 float[768])
 ```
 
-**Write path:** LLM-driven only, via the typed `record_*` tools. A `record_pivot(..., supersedes=[id])` call auto-creates `supersedes` edges and marks the target `superseded_at` — "superseded by" is answered by traversing the edge in reverse; other relations are declared on the recording tool or via `link_nodes`.
+**Write path:** the typed `record_*` tools (LLM-driven, mid-session) and, since M-series, `consolidation`'s task-end pass (§7.4), which emits `DECISION`/`PIVOT` operations for a genuine design "why" or reversal it mines from the turn diff (`memory.consolidation.consolidate` → `graph.create_node`/`graph.record_pivot`). A `record_pivot(..., supersedes=[id])` call (or the equivalent consolidation `PIVOT` op) auto-creates `supersedes` edges and marks the target `superseded_at` — "superseded by" is answered by traversing the edge in reverse; other relations are declared on the recording tool or via `link_nodes`.
 
 **Injection is special:** **active Rules are *always* injected** into context (they are constraints — a living coding-standard the LLM must always honor). Decisions / Specs / Pivots are similarity-recalled and 1-hop graph-expanded. Superseded nodes are excluded from active recall but remain reachable as history.
 
 ### 7.4 Integration (adapted for a CLI, not a daemon)
 Chalie runs a 5-minute idle "subconscious" worker; a session-based CLI has no such loop, so:
 
-- **Decay is computed lazily at read-time** — it is a pure time formula, so no cron is needed; `retrieval_weight` is derived on recall from `last_relevant_at`.
-- **Eviction + fact-extraction** run at **session boundaries** (start and/or end). The start-of-session sweep runs on a **background thread** with its own store connection (same fresh-store-per-thread rule as the episodic writer), so the first prompt never waits behind it; it is joined before the end-of-session sweep so two extractor passes never overlap.
-- **Episodic extraction** runs at **turn-end**, off-thread, count-gated.
-- **Injection** uses Chalie's **turn-0 flashback** pattern: two zero-LLM gates first (skip on terse messages < 8 tokens; skip on continuations where the message embedding is close to the recent-conversation centroid), then render a compact recall bundle — top Decisions/Specs + ≤ 3 dated episode gists + ≤ 5 atoms — that the model reads before iteration 0. Active **Rules** are injected separately and unconditionally by the always-on graph provider (they apply on *every* turn, gate or no gate); the flashback bundle reads them only to de-duplicate, never to re-emit. Both are stitched into the system message by the same `CONTEXT_PROVIDERS` seam, so the model sees rules + recall together.
+- **Staleness is computed lazily at read-time** — anchor-liveness is a hash comparison, not a clock formula, so no cron is needed; `recall_facts` re-hashes each candidate's anchor file on every call (`memory.anchor.is_stale`).
+- **No session-boundary maintenance sweep anymore.** M7 (MEMORY_REDESIGN.md §9) retired the old start-of-session eviction/TTL-purge/gist-mining background thread; `main.session_start_jobs` now only registers the always-on rules provider and the orientation provider (both synchronous, cheap — no LLM call, nothing to background). All durable-knowledge writes route through consolidation instead.
+- **Consolidation** runs at **turn-end**, off the hot path: `agent.consolidation_maybe_extract` snapshots the turn's `files_changed` and a transcript tail and enqueues them on a background writer thread — unconditionally, on every turn that ends without tool calls, with no row-count gate. `main.session_end_jobs` calls `memory.consolidation.drain_and_join()` at shutdown (REPL exit or one-shot teardown) so the final turn's pass is guaranteed to finish before the process exits, without ever firing twice for the same turn.
+- **Injection** — the task-start seam descends from Chalie's turn-0 flashback pattern (stash a block on the session, render it via a `CONTEXT_PROVIDERS` entry), but the content and gating are unrelated: `memory.orientation.orientation_maybe_seed` runs on **every** turn (no terse/continuation gate — retrieval is already task-relative) and renders the derived skeleton (§7.1) + up to 8 anchor-liveness-checked recalled atoms (task text plus any file paths/symbols named in it, reranked to prefer atoms anchored to those paths) + up to 5 recalled Decisions/Specs. On a **cold** task area (fewer than 2 fresh anchored atoms), it additionally spawns a bounded, memory-less gap-fill explorer (`memory.explorer.explore`, ≤5 tool-calling rounds) whose brief the parent persists as anchored atoms (`explorer.persist_brief`) and injects into the current turn. Active **Rules** are injected separately and unconditionally by the always-on graph provider (every turn); the orientation brief reads them only to de-duplicate Decision/Spec hits, never to re-emit them. Both are stitched into the system message by the same `CONTEXT_PROVIDERS` seam, so the model sees rules + recall together.
 
-**LLM-facing memory tools:** `remember` / `recall` / `forget` (atoms + episodes) and the four `record_*` graph tools (+ optional `link_nodes`).
+**LLM-facing memory tools:** `remember` / `recall` / `forget` (knowledge atoms) and the four `record_*` graph tools (+ optional `link_nodes`).
 
 ## 8. Compaction
 
@@ -281,7 +275,7 @@ Reactive only, mirroring Chalie: a pre-flight token estimate against `cap = wind
 ```python
 def handle_user_message(text):
     session.append_user(text)
-    memory.flashback.maybe_seed(session)              # turn-0 recall injection (gated)
+    memory.orientation.orientation_maybe_seed(session)  # task-start brief: skeleton + anchored recall, zero-LLM, every turn
     while True:
         try:
             resp = llm.chat(session.assemble_context(), tools=registry.schemas())
@@ -289,7 +283,7 @@ def handle_user_message(text):
             compaction.run(session); continue         # reactive compaction, then retry
         session.append_assistant(resp.text, resp.tool_calls)
         if not resp.tool_calls:
-            memory.episodic.maybe_extract(session)     # count-gated, off-thread
+            memory.consolidation.enqueue(session, client)  # task-end: off-thread, mines diff + transcript tail
             return print(resp.text)                    # turn ends
         for call in resp.tool_calls:
             session.append_tool_result(call.id, call.name, registry.dispatch(call))
@@ -385,13 +379,13 @@ Config is per-agent-install, not per-project: it defaults to `config.json` next 
 | 8 | Transcript | **Flat message array** under YAML frontmatter |
 | 9 | Context assembly | Full in-flight turn; past turns → **final answer only**; reactive compaction on top |
 | 10 | Memory scope | **Per-project** (`<project>/.coding_agent/memory.db`) |
-| 11 | Memory layers | **Episodic** (decay) + **Atomic recall** (Mem0-style) + **Data-graph** (Rule/Decision/Pivot/Spec, real edges) |
+| 11 | Memory layers | **Project skeleton** (S-DERIVED, ephemeral, zero-LLM) + **Atomic recall** (Mem0-style ADD/UPDATE/DELETE/NOOP, anchor-liveness) + **Data-graph** (Rule/Decision/Pivot/Spec, real edges) |
 | 12 | Embeddings | **Local `gte-modernbert-base`** (768-d, ONNX), FTS-only fallback |
 | 13 | Data-graph write path | **LLM-driven typed tools** (`record_rule/decision/pivot/spec`) |
 
 ## 15. Deliberately out of scope (candidate phase 2)
 
-- Episodic super-episode roll-up (UMAP + HDBSCAN clustering).
-- Auto-mined / hybrid data-graph suggestion.
+- Atom reflection/compaction into higher-level notes at session boundaries, with low-confidence/stale-atom eviction (MEMORY_REDESIGN.md M8, stretch — not built).
+- Cached, LLM-generated architecture-overview doc feeding repo-level orientation (MEMORY_REDESIGN.md M9, stretch — not built).
 - Cross-project (global) memory layer.
 - Multi-provider abstraction beyond OpenAI-compatible (Anthropic/Gemini native).
