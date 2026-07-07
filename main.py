@@ -47,19 +47,16 @@ def register_catalog_provider() -> None:
         pass
 
 
-def session_start_jobs(session: Session, client: LLMClient) -> threading.Thread | None:
+def session_start_jobs(session: Session) -> None:
     """Run once after the session is created.
 
-    Registers the always-on rules provider and the gated flashback provider
-    synchronously (cheap, needed before turn 0), then kicks long-term-memory
-    maintenance — evict stale episodes, purge expired TTL facts, mine unmined
-    episode gists into durable facts (an LLM call) — onto a background thread so
-    the first prompt is never blocked behind it. Every step is isolated so one
-    failure never blocks session startup.
-
-    Returns:
-        The started maintenance thread (join it before ``session_end_jobs`` so
-        two fact-extractor sweeps never overlap), or ``None`` if it failed to start.
+    Registers the always-on rules provider and the orientation provider
+    synchronously (cheap, needed before turn 0). There is no longer a
+    background maintenance sweep here: the old episodic eviction / facts-TTL
+    purge / gist-mining jobs were retired in M7 (MEMORY_REDESIGN.md section 9)
+    -- ``memory.consolidation`` now owns all durable-knowledge writes,
+    entirely off the hot path via its own background writer (see
+    ``agent.consolidation_maybe_extract`` / ``session_end_jobs`` below).
     """
     try:
         from memory.graph import register_graph_provider
@@ -69,66 +66,11 @@ def session_start_jobs(session: Session, client: LLMClient) -> threading.Thread 
         pass
 
     try:
-        from memory.flashback import register_flashback_provider
+        from memory.orientation import register_orientation_provider
 
-        register_flashback_provider()
+        register_orientation_provider()
     except Exception:
         pass
-
-    try:
-        thread = threading.Thread(
-            target=_memory_maintenance,
-            args=(str(session.project_root), client),
-            name="memory-maintenance",
-            daemon=True,
-        )
-        thread.start()
-        return thread
-    except Exception as exc:
-        print(f"session-start-memory-error: {exc}", file=sys.stderr)
-        return None
-
-
-def _memory_maintenance(project_root: str, client: LLMClient) -> None:
-    """Long-term-memory maintenance, run on its own thread.
-
-    Opens a FRESH store on this thread (SQLite connections are never shared
-    across threads — the same rule the episodic writer follows; WAL serializes
-    concurrent writers) and closes it before returning.
-    """
-    try:
-        from memory.embedding import EmbeddingService
-        from memory.recall import MemoryContext
-        from memory.store import open_store
-        import memory.episodic as episodic
-        import memory.atomic as atomic
-
-        store = open_store(project_root)
-        embedder = EmbeddingService(model_path=os.environ.get("CODING_AGENT_EMBED_MODEL") or None)
-        ctx = MemoryContext(store=store, embedder=embedder, project_root=project_root)
-        try:
-            try:
-                evicted = episodic.evict_episodes(ctx.store)
-                if evicted:
-                    print(f"episodic: evicted {evicted} stale episode(s)", file=sys.stderr)
-            except Exception as exc:
-                print(f"session-start-evict-error: {exc}", file=sys.stderr)
-            try:
-                purged = atomic.purge_expired(ctx)
-                if purged:
-                    print(f"facts: purged {purged} expired atom(s)", file=sys.stderr)
-            except Exception as exc:
-                print(f"session-start-purge-error: {exc}", file=sys.stderr)
-            try:
-                stats = atomic.extract_facts(ctx, client)
-                if stats.get("processed"):
-                    print(f"facts: start-of-session extractor {stats}", file=sys.stderr)
-            except Exception as exc:
-                print(f"session-start-extract-error: {exc}", file=sys.stderr)
-        finally:
-            store.close()
-    except Exception as exc:
-        print(f"session-start-memory-error: {exc}", file=sys.stderr)
 
 
 def _repair_interrupted_turn(session: Session) -> int:
@@ -197,33 +139,21 @@ def _repair_interrupted_turn(session: Session) -> int:
 
 
 def session_end_jobs(session: Session, client: LLMClient) -> None:
-    """Run once when the REPL exits: drain the episodic write queue so an in-flight
-    extraction from the final turn is not lost, then mine the freshly-written
-    episodes into durable facts before shutdown."""
+    """Run once when the REPL exits (and once, right after the answer is
+    already printed, in one-shot ``-p`` mode): drain the consolidation write
+    queue so the final turn's off-thread pass -- enqueued from
+    ``agent.consolidation_maybe_extract`` -- is guaranteed to finish before
+    shutdown. This drains rather than re-invokes ``consolidation.consolidate``
+    so a one-shot task's single turn is consolidated exactly once."""
     try:
-        import memory.episodic as episodic
-        episodic.drain_and_join()
-        last = episodic.pop_last_run()
+        import memory.consolidation as consolidation
+
+        consolidation.drain_and_join()
+        last = consolidation.pop_last_run()
         if last is not None:
-            print(
-                f"episodic: final extraction ran={last.get('ran')} "
-                f"stored={last.get('stored')} updated={last.get('updated')} "
-                f"deleted={last.get('deleted')} reason={last.get('reason')}",
-                file=sys.stderr,
-            )
+            print(f"consolidation: final pass {last}", file=sys.stderr)
     except Exception as exc:
-        print(f"session-end-episodic-error: {exc}", file=sys.stderr)
-
-    try:
-        from memory.recall import get_memory
-        import memory.atomic as atomic
-
-        ctx = get_memory(session.project_root)
-        stats = atomic.extract_facts(ctx, client)
-        if stats.get("processed"):
-            print(f"facts: end-of-session extractor {stats}", file=sys.stderr)
-    except Exception as exc:
-        print(f"session-end-extract-error: {exc}", file=sys.stderr)
+        print(f"session-end-consolidation-error: {exc}", file=sys.stderr)
 
 
 # =============================================================================
@@ -358,8 +288,8 @@ def main() -> None:
         "--no-memory",
         action="store_true",
         help=(
-            "Skip all long-term-memory work (flashback, rules provider, "
-            "maintenance, end-of-session extraction) for the fastest possible "
+            "Skip all long-term-memory work (orientation, rules provider, "
+            "end-of-session consolidation) for the fastest possible "
             "run — useful for ephemeral one-shot subagent calls"
         ),
     )
@@ -413,13 +343,12 @@ def main() -> None:
     exit_code = 0
     try:
         register_catalog_provider()
-        maintenance_thread: threading.Thread | None = None
         if args.no_memory:
             import agent as agent_module
 
             agent_module.MEMORY_ENABLED = False
         else:
-            maintenance_thread = session_start_jobs(session, client)
+            session_start_jobs(session)
 
         global MANAGER
         manager = LSPManager(cfg.language_servers, project_root)
@@ -478,9 +407,9 @@ def main() -> None:
                         on_delta=_stderr_delta,
                     )
                     # flush=True: stdout is block-buffered when piped, and
-                    # teardown (memory sweep, episodic enqueue) still runs
-                    # after this — a caller-side kill in that window must not
-                    # lose the already-produced answer.
+                    # teardown (consolidation drain) still runs after this —
+                    # a caller-side kill in that window must not lose the
+                    # already-produced answer.
                     if args.json:
                         duration_s = time.monotonic() - start_t
                         print(
@@ -563,19 +492,7 @@ def main() -> None:
             DEBUG_MANAGER.stop()
 
         if not args.no_memory:
-            # Never overlap the start-of-session and end-of-session extractor sweeps.
-            if maintenance_thread is not None:
-                maintenance_thread.join(timeout=60)
-                if maintenance_thread.is_alive():
-                    print(
-                        "memory-maintenance still running at shutdown — skipping "
-                        "end-of-session extraction to avoid overlapping sweeps",
-                        file=sys.stderr,
-                    )
-                else:
-                    session_end_jobs(session, client)
-            else:
-                session_end_jobs(session, client)
+            session_end_jobs(session, client)
     finally:
         session.close()
 

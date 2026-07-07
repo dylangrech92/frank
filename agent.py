@@ -48,11 +48,8 @@ def _mutate_tracker(event: dict) -> None:
     _TURN_MUTATIONS.append(record)
 
 
-# Per-session episodic-extraction watermark (row count already handed to the encoder).
-_EPISODIC_WATERMARKS: dict[int, int] = {}
-
 # Per-session flag for the graph-memory usage nudge (H5) — fires at most once per
-# session, mirroring the _EPISODIC_WATERMARKS id(session) pattern.
+# session, keyed by id(session).
 _GRAPH_MEMORY_NUDGE_FIRED: dict[int, bool] = {}
 
 
@@ -133,80 +130,69 @@ def diagnostics_inject_summary(session: Session) -> None:
         print(f"diagnostics-inject-error: {exc}", file=sys.stderr, flush=True)
 
 
-# Master switch for long-term-memory work inside the turn loop (flashback
-# seeding + episodic extraction). main.py flips it off under --no-memory.
+# Master switch for long-term-memory work inside the turn loop (orientation
+# seeding + consolidation). main.py flips it off under --no-memory.
 MEMORY_ENABLED: bool = True
 
 
-def flashback_maybe_seed(session: Session) -> None:
-    """Turn-zero memory recall injection seam.
+def orientation_maybe_seed(session: Session) -> None:
+    """Task-start memory orientation injection seam.
 
-    Delegates to the flashback module, which decides -- via the terse and
-    continuation gates -- whether to seed a compact recalled-memory bundle onto
-    the session for this turn. The bundle (if any) is stashed on
-    ``session._flashback_block`` and injected by the flashback context provider;
-    it is never persisted to the transcript. Never raises.
+    Delegates to the orientation module, which builds a code-anchored brief --
+    the zero-LLM derived project skeleton personalised to this turn's task,
+    plus anchored knowledge atoms and graph decisions/specs recalled by a
+    task-relative query -- and stashes it on ``session._orientation_block`` for
+    injection by the orientation context provider. Never persisted to the
+    transcript. Never raises.
     """
     if not MEMORY_ENABLED:
         return
     try:
-        import memory.flashback as flashback
+        import memory.orientation as orientation
 
-        flashback.maybe_seed(session)
+        orientation.orientation_maybe_seed(session)
     except Exception:
         pass
 
 
-def episodic_maybe_extract(session: Session, client: LLMClient) -> None:
-    """End-of-turn episodic extraction: enqueue a transcript window for off-thread
-    encoding once enough new rows have accumulated past this session's watermark.
+def consolidation_maybe_extract(session: Session, client: LLMClient) -> None:
+    """End-of-turn consolidation: hand this turn's diff + transcript tail to the
+    off-thread consolidation writer, which reconciles it into durable, anchored
+    knowledge atoms (and, when warranted, graph decisions/pivots).
 
-    Non-blocking: it only measures the row count and hands a window to the episodic
-    write queue, then returns immediately so the REPL prompt never stalls.
+    Non-blocking: snapshots exactly what ``consolidation.consolidate`` needs --
+    this turn's ``files_changed`` and a copy of the recent transcript tail --
+    and hands it to the background writer queue, then returns immediately so
+    the REPL prompt never stalls on the LLM call. The same queue is drained
+    (not re-invoked) by ``main.session_end_jobs`` at teardown, so a session's
+    final turn is guaranteed to finish before the process exits without being
+    consolidated twice.
     """
     if not MEMORY_ENABLED:
         return
     try:
-        import memory.episodic as episodic
+        import memory.consolidation as consolidation
     except Exception:
         return
 
-    messages = session._messages
-    total = len(messages)
-    prev = _EPISODIC_WATERMARKS.get(id(session), session.episodic_watermark)
-    new_rows = total - prev
-
-    # Emit the outcome of any PRIOR extraction that has since completed.
-    last = episodic.pop_last_run()
+    # Emit the outcome of any PRIOR consolidation pass that has since completed.
+    last = consolidation.pop_last_run()
     if last is not None:
         print(
-            f"episodic: last extraction ran={last.get('ran')} "
-            f"stored={last.get('stored')} updated={last.get('updated')} "
-            f"deleted={last.get('deleted')} reason={last.get('reason')}",
+            f"consolidation: last pass ran={last.get('ran')} added={last.get('added')} "
+            f"updated={last.get('updated')} deleted={last.get('deleted')} "
+            f"decisions={last.get('decisions')} pivots={last.get('pivots')} "
+            f"reason={last.get('reason')}",
             file=sys.stderr,
         )
 
-    if new_rows < episodic.GATE_N:
-        print(
-            f"episodic: gate skipped ({new_rows}/{episodic.GATE_N} new rows past watermark)",
-            file=sys.stderr,
-        )
-        return
-
-    # Advance the watermark and hand off the most-recent window for encoding.
-    _EPISODIC_WATERMARKS[id(session)] = total
-    session.set_episodic_watermark(total)
-    start = max(0, total - episodic.EXTRACTION_WINDOW)
-    window = [(i, messages[i]) for i in range(start, total)]
+    turn_report = dict(getattr(session, "turn_report", {}) or {})
+    messages_tail = list(session._messages[-consolidation.TRANSCRIPT_TAIL_MESSAGES :])
     try:
-        episodic.enqueue(str(session.project_root), window, client)
-        print(
-            f"episodic: enqueued window rows {start}..{total - 1} "
-            f"({new_rows} new past watermark)",
-            file=sys.stderr,
-        )
+        consolidation.enqueue(str(session.project_root), turn_report, messages_tail, client)
+        print("consolidation: enqueued turn for background reconciliation", file=sys.stderr)
     except Exception as exc:
-        print(f"episodic-enqueue-error: {exc}", file=sys.stderr)
+        print(f"consolidation-enqueue-error: {exc}", file=sys.stderr)
 
 
 # The fourth hook — over-cap handling — lives directly in the ``handle_user_message``
@@ -561,7 +547,7 @@ def handle_user_message(
 
     The loop follows this contract exactly:
 
-    1. **setup** — append_user(text), flashback_maybe_seed(session).
+    1. **setup** — append_user(text), orientation_maybe_seed(session).
     2. **loop** (while True):
        a. assemble_context() from session.
        b. verbose → print full assembled context to stderr prefixed by "assembled context".
@@ -578,7 +564,7 @@ def handle_user_message(
               transcript) is prefixed with "[UNVERIFIED CHANGES] " unless the
               model's own text already says "unverified".
           ii. If no tool calls (and the gate above doesn't bounce) →
-              episodic_maybe_extract(session) + return response.text (or the
+              consolidation_maybe_extract(session) + return response.text (or the
               gate-marked variant).
           iii. For each tool call:
               - echo to stderr the call name and arguments.
@@ -606,14 +592,14 @@ def handle_user_message(
             the full response is in hand.
 
     Returns:
-        The final assistant text string — either a normal turn response, an
-        episodic extraction pass-through, the over-cap sentinel message, or a
+        The final assistant text string — either a normal turn response, a
+        consolidation pass-through, the over-cap sentinel message, or a
         turn response prefixed with "[UNVERIFIED CHANGES] " when the S3 hard
         verify gate bounced once and the follow-up answer still neither
         verified the mutation nor declared it unverified.
     """
     session.append_user(text)
-    flashback_maybe_seed(session)
+    orientation_maybe_seed(session)
 
     # S4 — per-turn structured result report for --json one-shot mode. Reset at
     # the start of every turn and exposed via ``session.turn_report`` so a
@@ -891,7 +877,7 @@ def handle_user_message(
                 if streamed == 0:
                     on_delta(final_text)  # non-streaming / gated fallback: deliver whole
                 on_delta("\n")
-            episodic_maybe_extract(session, client)
+            consolidation_maybe_extract(session, client)
             return final_text
 
         calls = response.tool_calls

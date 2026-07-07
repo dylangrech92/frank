@@ -16,7 +16,7 @@ import os
 import sys
 import sqlite3
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def open_store(project_root: str) -> "MemoryStore":
@@ -56,8 +56,11 @@ def open_store(project_root: str) -> "MemoryStore":
 
     # ── idempotent schema migration ───────────────────────────────────────
     current = conn.execute("PRAGMA user_version").fetchone()[0]
-    if current < SCHEMA_VERSION:
+    if current < 1:
         _run_migration(conn, vec_enabled)
+    if current < 2:
+        _migrate_v1_to_v2(conn)
+    if current < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 
@@ -104,7 +107,13 @@ def _run_migration(conn: sqlite3.Connection, vec_enabled: bool) -> None:
             valid_from         TEXT NOT NULL,
             valid_to           TEXT,
             active             INTEGER NOT NULL DEFAULT 1,
-            deleted_at         TEXT
+            deleted_at         TEXT,
+            anchor_path        TEXT,
+            anchor_symbol      TEXT,
+            anchor_hash        TEXT,
+            learned_commit     TEXT,
+            confidence         REAL NOT NULL DEFAULT 0.5,
+            source             TEXT NOT NULL DEFAULT 'legacy'
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
@@ -151,6 +160,30 @@ def _run_migration(conn: sqlite3.Connection, vec_enabled: bool) -> None:
             CREATE VIRTUAL TABLE IF NOT EXISTS graph_nodes_vec
                 USING vec0(embedding float[768]);
         """)
+
+
+# Six anchor columns added to `facts` in schema v2 (code-anchoring, MEMORY_REDESIGN.md §5).
+_V2_ANCHOR_COLUMNS = [
+    ("anchor_path", "TEXT"),
+    ("anchor_symbol", "TEXT"),
+    ("anchor_hash", "TEXT"),
+    ("learned_commit", "TEXT"),
+    ("confidence", "REAL NOT NULL DEFAULT 0.5"),
+    ("source", "TEXT NOT NULL DEFAULT 'legacy'"),
+]
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Additively backfill the anchor columns onto an existing v1 ``facts`` table.
+
+    Introspects ``PRAGMA table_info(facts)`` and ``ALTER TABLE ... ADD COLUMN``s
+    only the columns that are missing -- a no-op on a fresh DB (whose base DDL
+    already declares them) and additive, data-preserving on a real v1 DB.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(facts)").fetchall()}
+    for name, decl in _V2_ANCHOR_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE facts ADD COLUMN {name} {decl}")
 
 
 # ── public class ────────────────────────────────────────────────────────────────
