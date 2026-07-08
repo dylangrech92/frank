@@ -1,8 +1,8 @@
 {
   "llm": {
-    "base_url": "http://grck.lan:30068/v1",
-    "api_key": "ollama",
-    "model": "qwen3.6:27b-128k",
+    "base_url": "http://grck.lan:30069/v1",
+    "api_key": "llama.cpp",
+    "model": "ornith:35b",
     "temperature": 0.2,
     "context_limit": 128000
   },
