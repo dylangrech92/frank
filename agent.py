@@ -1,9 +1,21 @@
 """Core agent loop with four named extension hooks for lifecycle phases.
 
-Implements ``handle_user_message`` as the main entry point that drives the
-read-eval-print cycle between a Session transcript and an LLMClient, plus three
-explicit hook no-op functions and an over-cap handling seam exposed inline in
-the loop body.
+``handle_user_message`` is the public entry point that drives the
+read-eval-print cycle between a Session transcript and an LLMClient. Its body is
+split into a per-turn ``_TurnState`` dataclass (the ~dozen mutable locals the
+turn threads through its LLM calls) plus three focused helpers along the natural
+seams: ``_run_llm_with_compaction`` (the compaction ladder + one chat call, with
+OverCapError retry), ``_dispatch_round`` (the tool-call dispatch loop and its
+guards), and ``_finalize_answer`` (the no-tool-call gate cascade: empty-answer
+bounce → H1 verification nudge → S3 gate marking → placeholder → return). Also
+here: three explicit hook no-op functions and the over-cap give-up seam.
+
+Harness turn guidance (empty-answer bounce, H1 verification nudge) is injected
+via ``Session.append_steer`` — a ``user``-role message flagged ``steer`` and
+content-prefixed with ``session.STEER_PREFIX`` (an explicit "automated message
+from the harness, NOT from the user" marker) — not as a plain user message, so the model,
+the compaction summarizer, and any transcript reader can all tell harness
+guidance from real human input.
 """
 
 import json
@@ -13,6 +25,7 @@ import compaction
 import ui
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Callable
 
 from llm import ChatResponse, LLMClient, OverCapError, ToolCall
@@ -616,6 +629,578 @@ def _web_search_focus_check(name: str, result: ToolResult, rendered: str, search
 
 
 # =============================================================================
+# Per-turn state and loop helpers
+# =============================================================================
+
+@dataclass
+class _TurnState:
+    """Mutable per-turn state threaded through one ``handle_user_message`` call.
+
+    Groups the locals the turn loop shares across its LLM calls, dispatch
+    rounds, and gate cascade so the helpers can read and mutate them by
+    reference. One instance lives for exactly one turn and is discarded.
+    """
+
+    # S4 per-turn report (files_changed, verification_runs, usage, gate flags);
+    # also exposed on ``session.turn_report`` so --json mode can read it back
+    # even if the turn raises before returning. ``answer`` holds the UNPREFIXED
+    # final text — the single source of truth for both the return value (which
+    # may still get the "[UNVERIFIED CHANGES] " prefix layered on for prose
+    # callers) and the envelope's answer field.
+    turn_report: dict
+    cap: int
+    window: int
+    comp_cfg: dict
+    # Token estimate of the assembled context the current chat request was built
+    # from (after any pre-flight compaction). Reused by the oversize-result
+    # guard and the usage calibration for that same request.
+    est: int = 0
+    # Compactions performed this turn, capped across the whole turn.
+    compactions: int = 0
+    # Chars streamed through on_delta for the CURRENT chat call only (reset
+    # before each call), so the return path knows whether the answer already
+    # reached the sink or must be delivered whole (non-streaming/gated fallback).
+    streamed: int = 0
+    # H1/S3 verify gate: True once a file was created/changed/renamed with no
+    # subsequent successful run_tests/run_command/verify_scratch; cleared the
+    # moment such a call succeeds. The nudge fires at most once per turn.
+    needs_verification: bool = False
+    verification_nudge_fired: bool = False
+    # Empty-answer bounce: the model returned no text and no tool calls (a
+    # local-model bare-stop failure mode). Fires at most once per turn; a second
+    # empty turn falls through to a transparent placeholder at the return site.
+    empty_answer_nudge_fired: bool = False
+    # H5 graph-memory nudge input: whether record_decision/record_spec ran this
+    # turn (paired with mutated_paths); the fired-once-per-session flag lives in
+    # _GRAPH_MEMORY_NUDGE_FIRED.
+    record_decision_or_spec_called: bool = False
+    # Reactive web-search focus nudge: consecutive successful web_search calls
+    # since the last web_read.
+    searches_without_read: int = 0
+    # files_changed dedupe set: first-tool-wins, in order of first mutation.
+    files_changed_seen: set[str] = field(default_factory=set)
+    # Rendered error envelopes seen this turn, for the repeated-identical-failure
+    # loop-guard (keyed by (name, rendered)).
+    seen_errors: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Identical (name, arg-signature) pairs dispatched this turn, for the
+    # repeated-successful-call loop-guard steer plus the hard dispatch cap.
+    seen_calls: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Every distinct path mutated this turn (H1/H5 tracking).
+    mutated_paths: set[str] = field(default_factory=set)
+
+
+def _over_cap_giveup(
+    session: Session, state: "_TurnState", on_delta: Callable[[str], None] | None
+) -> str:
+    """Terminal give-up when compaction cannot get the context under cap.
+
+    Records a plain-text explanation as the turn's final answer (transcript,
+    turn_report, and on_delta payload) and returns it verbatim.
+    """
+    msg = (
+        "Context is over the model's token budget and compaction could not "
+        "reduce it further. Start a new session or shorten the request."
+    )
+    session.append_assistant(msg)
+    state.turn_report["answer"] = msg
+    if on_delta is not None:
+        on_delta(msg + "\n")
+    return msg
+
+
+def _record_llm_usage(
+    session: Session,
+    state: "_TurnState",
+    response: ChatResponse,
+    est: int,
+    context: list[dict],
+) -> None:
+    """Fold a completed chat response's token usage into session + turn stats.
+
+    S2 calibration (real ``prompt_tokens`` vs the estimate, remembered together
+    with where this context ended so the next trigger check can compose real +
+    delta), S4 per-turn usage accumulation on ``turn_report``, and the
+    cumulative stats.json row. Usage fields stay ``None`` all turn on providers
+    that never report usage.
+    """
+    if response.prompt_tokens is not None:
+        # S2 — calibrate the fallback estimator toward this request's real
+        # usage, then remember it (plus where this context ended) so the next
+        # pre-flight trigger check can compose real + delta instead of
+        # re-estimating the whole transcript from scratch.
+        compaction.update_calibration(session, response.prompt_tokens, est)
+        session.last_prompt_tokens = response.prompt_tokens
+        session.last_prompt_context_len = len(context)
+        print(
+            ui.telemetry(
+                f"usage: actual prompt_tokens={response.prompt_tokens} "
+                f"vs estimated ~{est} tokens (delta {response.prompt_tokens - est:+d}) "
+                f"[ema {session.token_estimate_ratio:.2f}]"
+            ),
+            file=sys.stderr,
+        )
+
+    # S4 — sum usage across every LLM call this turn (None until the first
+    # real figure arrives, then a running total).
+    if response.prompt_tokens is not None:
+        state.turn_report["usage"]["prompt_tokens"] = (
+            (state.turn_report["usage"]["prompt_tokens"] or 0) + response.prompt_tokens
+        )
+    if response.completion_tokens is not None:
+        state.turn_report["usage"]["completion_tokens"] = (
+            (state.turn_report["usage"]["completion_tokens"] or 0)
+            + response.completion_tokens
+        )
+
+    # Usage stats: fold this LLM call into the session's cumulative stats.json
+    # row (run time, tool-call count, token totals).
+    session.record_llm_call(
+        response.prompt_tokens,
+        response.completion_tokens,
+        len(response.tool_calls),
+    )
+
+
+def _run_llm_with_compaction(
+    session: Session,
+    client: LLMClient,
+    state: "_TurnState",
+    tool_schemas: list[dict],
+    delta_cb: Callable[[str], None] | None,
+    verbose: bool,
+    on_delta: Callable[[str], None] | None,
+) -> ChatResponse | str:
+    """Compact the assembled context under cap, then make one chat call.
+
+    Runs the full pre-flight compaction ladder (summarizer loop with a thrash
+    guard, then the free force_fold last resort), makes exactly one
+    ``client.chat`` call, and folds the response's usage into the session/turn
+    stats. When the provider rejects the request with ``OverCapError`` despite
+    the estimate, it compacts once and retries the whole cycle.
+
+    Returns the ``ChatResponse`` on success, or the over-cap give-up string
+    (already delivered to the transcript/on_delta) when compaction is exhausted
+    — the caller returns that string as the turn's answer.
+    """
+    max_compactions = 5
+    # Thrash guard: bail out of the summarizer loop after this many consecutive
+    # compactions that failed to reduce the context (further calls won't
+    # converge) and fall through to the force_fold last resort.
+    max_non_shrink = 2
+
+    while True:
+        # Pre-flight: keep the assembled request at or below the shared cap,
+        # compacting older turns before the call is ever made.
+        context = session.assemble_context()
+        est = compaction.estimate_tokens(context, tool_schemas)
+        # S2 — usage-driven trigger: real prompt_tokens from the last response
+        # (plus a calibrated estimate of what was appended since) when
+        # available, otherwise the calibrated fallback estimate. See
+        # compaction.trigger_estimate for the composition rationale.
+        trigger = compaction.trigger_estimate(session, context, tool_schemas)
+        print(
+            ui.telemetry(f"context: {len(context)} messages, ~{est} tokens (cap {state.cap})"),
+            file=sys.stderr,
+        )
+        if session.last_prompt_tokens is not None:
+            print(
+                ui.telemetry(
+                    f"trigger: ~{trigger} tokens (real {session.last_prompt_tokens} "
+                    f"+ calibrated delta, ema {session.token_estimate_ratio:.2f})"
+                ),
+                file=sys.stderr,
+            )
+        non_shrink_streak = 0
+        while trigger > state.cap:
+            if state.compactions >= max_compactions or not compaction.compact(
+                session, client, state.window, state.comp_cfg
+            ):
+                # Summarization exhausted (budget or nothing foldable) — break
+                # to the force_fold last resort rather than dead-ending.
+                break
+            state.compactions += 1
+            # Compaction reshaped the assembled context (summary spliced in),
+            # so the prior real-usage baseline's index no longer lines up —
+            # fall back to the calibrated estimate until the next response.
+            session.last_prompt_tokens = None
+            context = session.assemble_context()
+            est = compaction.estimate_tokens(context, tool_schemas)
+            prev_trigger = trigger
+            trigger = compaction.trigger_estimate(session, context, tool_schemas)
+            print(
+                ui.telemetry(
+                    f"context: {len(context)} messages, ~{est} tokens "
+                    f"(cap {state.cap}) [post-compaction #{state.compactions}]"
+                ),
+                file=sys.stderr,
+            )
+            # Thrash guard: stop paying for summarizer calls that aren't
+            # reducing the context. Two consecutive no-reduction compactions
+            # mean further calls won't converge — fall through to force_fold.
+            if trigger >= prev_trigger:
+                non_shrink_streak += 1
+                if non_shrink_streak >= max_non_shrink:
+                    break
+            else:
+                non_shrink_streak = 0
+
+        # Overflow ladder: summarization could not get under cap. As a last
+        # resort, drop all but the most recent messages with no LLM call (older
+        # context is lost rather than failing the turn), then re-check.
+        if trigger > state.cap and compaction.force_fold(session, state.comp_cfg):
+            state.compactions += 1
+            session.last_prompt_tokens = None
+            context = session.assemble_context()
+            est = compaction.estimate_tokens(context, tool_schemas)
+            trigger = compaction.trigger_estimate(session, context, tool_schemas)
+            print(
+                ui.telemetry(
+                    f"context: {len(context)} messages, ~{est} tokens "
+                    f"(cap {state.cap}) [force-fold #{state.compactions}]"
+                ),
+                file=sys.stderr,
+            )
+        if trigger > state.cap:
+            return _over_cap_giveup(session, state, on_delta)
+
+        if verbose:
+            msg_lines: list[str] = []
+            for i, m in enumerate(context):
+                role_val = str(m.get("role", ""))
+                content_val = str(m.get("content", ""))
+                msg_lines.append(
+                    f"assembled context\n[{i}] {role_val}: {content_val}"
+                )
+            print("\n".join(msg_lines), file=sys.stderr)
+
+        # S3 — hard verify gate: once the H1 bounce has fired and the mutation
+        # is still unresolved, this call's answer may need a harness-added
+        # "[UNVERIFIED CHANGES] " prefix decided *after* the response is fully
+        # in hand. Streaming the raw text through on_delta as it arrives would
+        # violate the "sink receives the final text exactly once" contract (the
+        # prefix must lead, and it can't be inserted retroactively into an
+        # already-streamed prefix-less stream). So this one call is buffered
+        # (delta_cb withheld) and delivered whole — with or without the marker —
+        # once the gate decision is made in _finalize_answer. Any iteration
+        # where the gate isn't in this pending state streams exactly as before.
+        try:
+            state.streamed = 0
+            gate_pending = state.verification_nudge_fired and state.needs_verification
+            chat_delta_cb = None if gate_pending else delta_cb
+            state.turn_report["usage"]["llm_calls"] += 1
+            response: ChatResponse = client.chat(context, tool_schemas, chat_delta_cb)
+        except OverCapError:
+            # Provider rejected on length despite the estimate — compact and
+            # retry; if summarization can't help, fall back to force_fold.
+            if state.compactions < max_compactions and compaction.compact(
+                session, client, state.window, state.comp_cfg
+            ):
+                state.compactions += 1
+            elif compaction.force_fold(session, state.comp_cfg):
+                state.compactions += 1
+            else:
+                return _over_cap_giveup(session, state, on_delta)
+            # Same reasoning as the pre-flight compaction path above: the
+            # baseline this real measurement was keyed to no longer applies.
+            session.last_prompt_tokens = None
+            continue
+
+        state.est = est
+        _record_llm_usage(session, state, response, est, context)
+        return response
+
+
+def _maybe_graph_memory_nudge(session: Session, state: "_TurnState") -> None:
+    """H5 — graph-memory usage nudge, fired at most once per session.
+
+    When this turn's mutations spanned 3+ distinct paths with no
+    record_decision/record_spec call, append a one-line reminder to the last
+    tool result already in the transcript (the same append mechanism
+    diagnostics_inject_summary uses). Must run BEFORE ``session.append_assistant``
+    records this turn's answer, since ``amend_last_tool_result`` only touches
+    ``_messages[-1]`` when its role is "tool".
+    """
+    if (
+        len(state.mutated_paths) >= 3
+        and not state.record_decision_or_spec_called
+        and not _GRAPH_MEMORY_NUDGE_FIRED.get(id(session), False)
+    ):
+        _GRAPH_MEMORY_NUDGE_FIRED[id(session)] = True
+        print(ui.telemetry("graph-memory-nudge: fired"), file=sys.stderr)
+        session.amend_last_tool_result(
+            "\n\n[memory] This change spans several files. If a design "
+            "decision drove it, record it with record_decision so future "
+            "sessions inherit the reasoning."
+        )
+
+
+def _dispatch_round(
+    session: Session,
+    state: "_TurnState",
+    response: ChatResponse,
+    on_delta: Callable[[str], None] | None,
+) -> None:
+    """Dispatch this response's tool calls and record their results.
+
+    Streams any intermediate assistant text once, dispatches the batch
+    (concurrently when every call is parallel_safe, else sequentially with the
+    per-call guards: loop-guard hard cap, oversize-result guard, loop-guard /
+    repeat-call / web-search-focus steers, reactive lint-delta, and H1/H5/S4
+    mutation tracking), appends each rendered result to the transcript, then
+    injects the LSP diagnostics summary.
+    """
+    calls = response.tool_calls
+    # Intermediate assistant text on a tool-call iteration that did NOT stream
+    # is still worth surfacing; streamed text already reached the sink.
+    if on_delta is not None and response.text:
+        if state.streamed == 0:
+            on_delta(response.text)
+        on_delta("\n")
+
+    # Concurrent dispatch when the whole batch is read-only and thread-safe
+    # (see Tool.parallel_safe). Any unsafe or unknown tool in the batch forces
+    # the sequential path, preserving effect ordering.
+    parallel_results: list[ToolResult] | None = None
+    if len(calls) > 1 and all(
+        getattr(get_tool(c.name), "parallel_safe", False) for c in calls
+    ):
+        for call in calls:
+            print(
+                ui.tool_call(f"Tool call: {call.name}({json.dumps(call.arguments)})"),
+                file=sys.stderr,
+            )
+        with ThreadPoolExecutor(max_workers=min(8, len(calls))) as pool:
+            parallel_results = list(
+                pool.map(lambda c: dispatch(c.name, c.arguments), calls)
+            )
+
+    for i, call in enumerate(calls):
+        # Only ever populated on the sequential path below (parallel_safe tools
+        # never mutate, so there is nothing to lint-delta there).
+        lint_suffix = ""
+        if parallel_results is not None:
+            result = parallel_results[i]
+        else:
+            print(
+                ui.tool_call(f"Tool call: {call.name}({json.dumps(call.arguments)})"),
+                file=sys.stderr,
+            )
+            # Snapshot before/after this specific call so a mutation event can
+            # be attributed to it (parallel_safe tools never mutate, so this
+            # tracking only needs the sequential path — see Tool.parallel_safe).
+            pre_mutation_len = len(_TURN_MUTATIONS)
+            # I2 — reactive lint-delta injection: snapshot this call's target
+            # file's lint issues BEFORE dispatch (only for the single-path write
+            # tools in _LINT_TRACKED_TOOLS; None means "nothing to compare
+            # against", so no delta is ever appended).
+            lint_pre = _lint_pre_snapshot(call, str(session.project_root))
+            # Loop-guard hard cap: refuse an identical call once it has repeated
+            # _REPEAT_CALL_CAP times this turn (verification tools exempt — a
+            # rebuild/retest cycle legitimately repeats). The count is maintained
+            # post-render by _repeat_call_check; here we read the tally of
+            # *previous* identical calls and block before dispatching,
+            # guaranteeing a stuck no-op loop ends.
+            _repeat_key = (call.name, _call_signature(call.arguments))
+            _repeat_n = state.seen_calls.get(_repeat_key, 0)
+            if (
+                call.name not in _REPEAT_CAP_EXEMPT
+                and _repeat_n >= _REPEAT_CALL_CAP
+            ):
+                result = ToolResult.err(
+                    f"{call.name} has already been called {_repeat_n} "
+                    f"times this turn with identical arguments. Repeating "
+                    f"it makes no progress — the call is blocked. Change "
+                    f"your arguments or approach, or stop and report what "
+                    f"you have.",
+                    code="loop-guard-blocked",
+                )
+                print(
+                    ui.telemetry(
+                        f"loop-guard: blocked repeated {call.name} "
+                        f"(#{_repeat_n + 1} identical this turn)"
+                    ),
+                    file=sys.stderr,
+                )
+            else:
+                result = dispatch(call.name, call.arguments)
+            new_events = _TURN_MUTATIONS[pre_mutation_len:]
+            if new_events:
+                any_relevant, new_paths = _scan_new_mutations(new_events)
+                if any_relevant:
+                    state.needs_verification = True
+                    state.mutated_paths |= new_paths
+                    # S4 — captured here (correlated with this dispatched call's
+                    # own slice of _TURN_MUTATIONS), NOT by reading the
+                    # module-level list later: diagnostics_inject_summary drains
+                    # it at the end of this same loop iteration. Deduped by path,
+                    # first-tool-wins, in order of first mutation.
+                    for _ev in new_events:
+                        if _ev.get("kind") not in ("created", "changed", "renamed"):
+                            continue
+                        _ev_path = _ev.get("path")
+                        if _ev_path and _ev_path not in state.files_changed_seen:
+                            state.files_changed_seen.add(_ev_path)
+                            state.turn_report["files_changed"].append(
+                                {"path": _ev_path, "tool": call.name}
+                            )
+                    resolved_call_path = _lint_resolve_call_path(
+                        call, str(session.project_root)
+                    )
+                    if lint_pre is not None and resolved_call_path in new_paths:
+                        lint_suffix = _lint_delta_suffix(
+                            lint_pre, call, str(session.project_root)
+                        )
+
+        if call.name in ("run_tests", "run_command", "verify_scratch"):
+            if call.name == "run_command":
+                detail = str(call.arguments.get("cmd", ""))
+            else:
+                detail = str(call.arguments.get("path") or ".")
+            state.turn_report["verification_runs"].append(
+                {"tool": call.name, "status": result.status, "detail": detail}
+            )
+            if result.status == "success":
+                state.needs_verification = False
+        if call.name in ("record_decision", "record_spec"):
+            state.record_decision_or_spec_called = True
+
+        rendered = render_tool_result(call.name, result)
+        result, rendered = _guard_oversize_result(
+            call.name, result, rendered, state.cap, state.est
+        )
+        rendered = _loop_guard_check(call.name, rendered, state.seen_errors)
+        rendered = _repeat_call_check(
+            call.name, call.arguments, result, rendered, state.seen_calls
+        )
+        rendered, state.searches_without_read = _web_search_focus_check(
+            call.name, result, rendered, state.searches_without_read
+        )
+        if lint_suffix:
+            rendered = rendered + lint_suffix
+
+        print(ui.tool_result(rendered), file=sys.stderr)
+
+        session.append_tool_result(call.id, call.name, rendered)
+
+    diagnostics_inject_summary(session)
+
+
+def _finalize_answer(
+    session: Session,
+    client: LLMClient,
+    state: "_TurnState",
+    response: ChatResponse,
+    on_delta: Callable[[str], None] | None,
+) -> str | None:
+    """Run the no-tool-call gate cascade and return the turn's answer.
+
+    In order: bounce once on an empty answer (empty-answer nudge), bounce once
+    on an unverified file mutation (H1 verification nudge), then — on the second
+    pass through — mark the S3 verify gate, surface an empty-answer placeholder,
+    deliver the answer through on_delta, and consolidate.
+
+    Returns the final answer string (terminal — the caller returns it), or
+    ``None`` when a nudge bounced (the caller loops again). ``append_assistant``
+    for this response has already run in ``handle_user_message`` before this
+    call, so the transcript holds the model's original, unprefixed text.
+    """
+    text = response.text or ""
+
+    # Empty-answer retry: the model ended the turn with no text and no tool
+    # calls — a common local-model failure mode (a bare stop token after
+    # consuming tool results) that REPL mode would silently swallow (it discards
+    # the return value and only on_delta delivers output, so an empty return
+    # leaves the user at a blank prompt with the tool calls having visibly run).
+    # Inject a harness steer and loop once more rather than re-rolling the
+    # identical request (which risks a deterministic re-collapse). Bounded to a
+    # single retry per turn; a second empty turn is surfaced via the placeholder
+    # below.
+    if not text.strip() and not state.empty_answer_nudge_fired:
+        state.empty_answer_nudge_fired = True
+        print(
+            ui.telemetry("empty-answer-nudge: fired (empty assistant turn)"),
+            file=sys.stderr,
+        )
+        session.append_steer(
+            "You produced no answer this turn. Respond now with a concise "
+            "summary of what you did or found, grounded in the tool results "
+            "above. Do not call more tools unless a result is genuinely missing."
+        )
+        return None
+
+    # H1 — post-mutation verification nudge: the model is about to end the turn
+    # having mutated files without running anything to verify the change. Inject
+    # a harness steer and do one more loop iteration instead of returning. Fires
+    # at most once per turn.
+    if state.needs_verification and not state.verification_nudge_fired:
+        state.verification_nudge_fired = True
+        print(
+            ui.telemetry("verification-nudge: fired (unverified file mutation)"),
+            file=sys.stderr,
+        )
+        session.append_steer(
+            "You modified files this turn but ran nothing to verify the "
+            "change. Verify it now with verify_scratch (a throwaway "
+            "snippet, no file pollution), run_tests, or run_command "
+            "against a separate script — never by adding repro/test code "
+            "to a production file or repurposing its "
+            "`if __name__ == \"__main__\"` block. Or state explicitly in "
+            "your answer that the change is unverified. Either way, end "
+            "your answer with a one-line verification breakdown: what "
+            "you checked (tests, commands, diagnostics) and what it "
+            "showed."
+        )
+        return None
+
+    # S3 — hard verify gate: this is the SECOND final answer of the turn (the
+    # bounce above already fired and needs_verification is still set — a
+    # run_tests/run_command/verify_scratch call never succeeded in between).
+    # Accept it, but mark it: prefix the *returned* text with a harness-side
+    # "[UNVERIFIED CHANGES] " so the caller sees the state, unless the model
+    # already declared the change unverified in its own words (case-insensitive
+    # match). The transcript already recorded the model's original, unprefixed
+    # text — only the return value / on_delta payload gets the marker.
+    final_text = text
+    # S4 — record the UNPREFIXED answer before any marker is layered on; this is
+    # the single source of truth the --json envelope reads back via
+    # session.turn_report.
+    state.turn_report["answer"] = final_text
+    if state.needs_verification and state.verification_nudge_fired:
+        state.turn_report["declared_unverified"] = "unverified" in final_text.lower()
+        if not state.turn_report["declared_unverified"]:
+            final_text = "[UNVERIFIED CHANGES] " + final_text
+            print(
+                ui.telemetry(
+                    "verification-gate: unresolved after bounce — "
+                    "marking [UNVERIFIED CHANGES]"
+                ),
+                file=sys.stderr,
+            )
+    state.turn_report["verified"] = bool(state.mutated_paths) and not state.needs_verification
+
+    # Empty-answer placeholder: if the model returned no text at all (the retry
+    # above already fired once and still came back empty), surface a transparent
+    # placeholder. Layered onto the return value / on_delta payload ONLY — the
+    # transcript and turn_report["answer"] already hold the real empty string as
+    # the source of truth. Uses the original response text (not the
+    # possibly-prefixed final_text) so it overrides a vacuous
+    # "[UNVERIFIED CHANGES] " prefix too.
+    if not text.strip():
+        final_text = "(no response from model)"
+        print(
+            ui.telemetry("empty-answer: no text after retry — surfacing placeholder"),
+            file=sys.stderr,
+        )
+
+    if on_delta is not None and final_text:
+        if state.streamed == 0:
+            on_delta(final_text)  # non-streaming / gated fallback: deliver whole
+        on_delta("\n")
+    consolidation_maybe_extract(session, client)
+    return final_text
+
+
+# =============================================================================
 # Main entry point
 # =============================================================================
 
@@ -642,14 +1227,14 @@ def handle_user_message(
        e. **normal success** — append_assistant(text, tool_calls), then:
            i.  If no tool calls and the assistant produced no text at all (a
                local-model bare-stop failure mode) → bounce once: inject a
-               synthetic user steer and loop again. A second empty turn is
+               harness steer (session.append_steer) and loop again. A second empty turn is
                surfaced via a transparent "(no response from model)"
                placeholder at the return site (ii) so REPL mode never leaves
                the user at a blank prompt.
            ii. If no tool calls and files were mutated this turn with no
                successful run_tests/run_command/verify_scratch since → bounce once (S3 hard
-               verify gate, upgrading H1's nudge): inject a synthetic user
-               steer and loop again instead of returning. A second such
+               verify gate, upgrading H1's nudge): inject a harness steer
+               (session.append_steer) and loop again instead of returning. A second such
                final answer is accepted, but the *returned* text (not the
                transcript) is prefixed with "[UNVERIFIED CHANGES] " unless the
                model's own text already says "unverified".
@@ -691,15 +1276,12 @@ def handle_user_message(
     session.append_user(text)
     orientation_maybe_seed(session)
 
-    # S4 — per-turn structured result report for --json one-shot mode. Reset at
-    # the start of every turn and exposed via ``session.turn_report`` so a
-    # caller (main.py) can build a result envelope even when this call raises
-    # before reaching a return statement below -- whatever was accumulated up
-    # to the exception still reflects reality. ``answer`` is filled in at each
-    # return site with the UNPREFIXED text (the same value the transcript
-    # already holds per S3's design) so it is the single source of truth for
-    # both the returned string (which may still get the "[UNVERIFIED CHANGES] "
-    # prefix layered on for prose-mode callers) and the envelope's answer field.
+    # S4 — per-turn structured result report for --json one-shot mode, exposed
+    # via ``session.turn_report`` so a caller (main.py) can build a result
+    # envelope even when this call raises before returning — whatever was
+    # accumulated up to the exception still reflects reality. ``answer`` holds
+    # the UNPREFIXED text (see _TurnState / _finalize_answer for the single-
+    # source-of-truth contract).
     turn_report: dict = {
         "files_changed": [],
         "verification_runs": [],
@@ -709,79 +1291,21 @@ def handle_user_message(
         "usage": {"prompt_tokens": None, "completion_tokens": None, "llm_calls": 0},
     }
     session.turn_report = turn_report
-    # Per-turn (reset every call) dedupe set for files_changed: first-tool-wins,
-    # order of first mutation.
-    _files_changed_seen: set[str] = set()
 
     window = client.config.context_limit
     comp_cfg = compaction_cfg or {}
-    cap = compaction.compute_cap(window, comp_cfg)
-    max_compactions = 5
-    # Thrash guard: bail out of the summarizer loop after this many consecutive
-    # compactions that failed to reduce the context at all (further calls won't
-    # converge) and fall through to the force_fold last resort.
-    max_non_shrink = 2
-    compactions = 0
-    # Per-turn (reset on every handle_user_message call) tracking of rendered
-    # error envelopes seen so far, for the repeated-identical-failure loop-guard.
-    seen_errors: dict[tuple[str, str], int] = {}
-    # Per-turn (reset on every handle_user_message call) count of identical
-    # (tool, arguments) pairs dispatched so far, for the repeated-successful-
-    # call loop-guard: a steer (via _repeat_call_check) plus a hard dispatch
-    # cap (in the sequential dispatch branch). Keyed by (name, arg-signature).
-    seen_calls: dict[tuple[str, str], int] = {}
-    # Per-turn (reset on every handle_user_message call) count of consecutive
-    # successful web_search calls since the last web_read, for the reactive
-    # web-search focus nudge.
-    searches_without_read = 0
-
-    # Per-turn (reset on every handle_user_message call) state for the
-    # post-mutation verification nudge (H1): True once a file was created,
-    # changed, or renamed without a subsequent successful
-    # run_tests/run_command/verify_scratch call; cleared the moment such a
-    # verification call succeeds. Fires at most
-    # once per turn via verification_nudge_fired.
-    needs_verification = False
-    verification_nudge_fired = False
-
-    # Per-turn (reset on every handle_user_message call) flag for the
-    # empty-answer retry: the model returned no text and no tool calls (a
-    # common local-model failure mode — a bare stop token after consuming
-    # tool results). Fires at most once per turn via
-    # empty_answer_nudge_fired; a second empty turn falls through to a
-    # transparent placeholder at the return site.
-    empty_answer_nudge_fired = False
-
-    # Per-turn (reset on every handle_user_message call) state for the
-    # graph-memory usage nudge (H5): every distinct path touched by a mutation
-    # this turn, and whether record_decision/record_spec was called this turn.
-    # Fired-once-per-session state lives in _GRAPH_MEMORY_NUDGE_FIRED, keyed by
-    # id(session) (see that dict's docstring).
-    mutated_paths: set[str] = set()
-    record_decision_or_spec_called = False
-
-    # Chars streamed through on_delta for the CURRENT client.chat call only
-    # (reset before each call), so the final-return path knows whether the
-    # answer already reached the sink or must be delivered whole (fallback).
-    streamed = 0
+    state = _TurnState(
+        turn_report=turn_report,
+        cap=compaction.compute_cap(window, comp_cfg),
+        window=window,
+        comp_cfg=comp_cfg,
+    )
 
     def _sink(piece: str) -> None:
-        nonlocal streamed
-        streamed += len(piece)
+        state.streamed += len(piece)
         on_delta(piece)  # type: ignore[misc]  # only ever passed when on_delta is set
 
     delta_cb = _sink if on_delta is not None else None
-
-    def _over_cap_giveup() -> str:
-        msg = (
-            "Context is over the model's token budget and compaction could not "
-            "reduce it further. Start a new session or shorten the request."
-        )
-        session.append_assistant(msg)
-        turn_report["answer"] = msg
-        if on_delta is not None:
-            on_delta(msg + "\n")
-        return msg
 
     while True:
         # Recomputed every iteration so a mid-turn load_tool call is reflected in
@@ -789,428 +1313,32 @@ def handle_user_message(
         # withhold the just-loaded tool's schema until the following user turn.
         tool_schemas = schemas()
 
-        # Pre-flight: keep the assembled request at or below the shared cap,
-        # compacting older turns before the call is ever made.
-        context = session.assemble_context()
-        est = compaction.estimate_tokens(context, tool_schemas)
-        # S2 — usage-driven trigger: real prompt_tokens from the last response
-        # (plus a calibrated estimate of what was appended since) when
-        # available, otherwise the calibrated fallback estimate. See
-        # compaction.trigger_estimate for the composition rationale.
-        trigger = compaction.trigger_estimate(session, context, tool_schemas)
-        print(
-            ui.telemetry(f"context: {len(context)} messages, ~{est} tokens (cap {cap})"),
-            file=sys.stderr,
+        # Compaction ladder + one chat call (with OverCapError retry). Returns
+        # the give-up string when compaction is exhausted; the caller returns it.
+        outcome = _run_llm_with_compaction(
+            session, client, state, tool_schemas, delta_cb, verbose, on_delta
         )
-        if session.last_prompt_tokens is not None:
-            print(
-                ui.telemetry(
-                    f"trigger: ~{trigger} tokens (real {session.last_prompt_tokens} "
-                    f"+ calibrated delta, ema {session.token_estimate_ratio:.2f})"
-                ),
-                file=sys.stderr,
-            )
-        non_shrink_streak = 0
-        while trigger > cap:
-            if compactions >= max_compactions or not compaction.compact(
-                session, client, window, comp_cfg
-            ):
-                # Summarization exhausted (budget or nothing foldable) — break
-                # to the force_fold last resort rather than dead-ending.
-                break
-            compactions += 1
-            # Compaction reshaped the assembled context (summary spliced in),
-            # so the prior real-usage baseline's index no longer lines up —
-            # fall back to the calibrated estimate until the next response.
-            session.last_prompt_tokens = None
-            context = session.assemble_context()
-            est = compaction.estimate_tokens(context, tool_schemas)
-            prev_trigger = trigger
-            trigger = compaction.trigger_estimate(session, context, tool_schemas)
-            print(
-                ui.telemetry(
-                    f"context: {len(context)} messages, ~{est} tokens "
-                    f"(cap {cap}) [post-compaction #{compactions}]"
-                ),
-                file=sys.stderr,
-            )
-            # Thrash guard: stop paying for summarizer calls that aren't
-            # reducing the context. Two consecutive no-reduction compactions
-            # mean further calls won't converge — fall through to force_fold.
-            if trigger >= prev_trigger:
-                non_shrink_streak += 1
-                if non_shrink_streak >= max_non_shrink:
-                    break
-            else:
-                non_shrink_streak = 0
-
-        # Overflow ladder: summarization could not get under cap. As a last
-        # resort, drop all but the most recent messages with no LLM call (older
-        # context is lost rather than failing the turn), then re-check.
-        if trigger > cap and compaction.force_fold(session, comp_cfg):
-            compactions += 1
-            session.last_prompt_tokens = None
-            context = session.assemble_context()
-            est = compaction.estimate_tokens(context, tool_schemas)
-            trigger = compaction.trigger_estimate(session, context, tool_schemas)
-            print(
-                ui.telemetry(
-                    f"context: {len(context)} messages, ~{est} tokens "
-                    f"(cap {cap}) [force-fold #{compactions}]"
-                ),
-                file=sys.stderr,
-            )
-        if trigger > cap:
-            return _over_cap_giveup()
-
-        if verbose:
-            msg_lines: list[str] = []
-            for i, m in enumerate(context):
-                role_val = str(m.get("role", ""))
-                content_val = str(m.get("content", ""))
-                msg_lines.append(
-                    f"assembled context\n[{i}] {role_val}: {content_val}"
-                )
-            print("\n".join(msg_lines), file=sys.stderr)
-
-        # S3 — hard verify gate: once the H1 bounce has fired and the mutation
-        # is still unresolved, this call's answer may need a harness-added
-        # "[UNVERIFIED CHANGES] " prefix decided *after* the response is fully
-        # in hand. Streaming the raw text through on_delta as it arrives would
-        # violate the "sink receives the final text exactly once" contract (the
-        # prefix must lead, and it can't be inserted retroactively into an
-        # already-streamed prefix-less stream). So this one call is buffered
-        # (delta_cb withheld) and delivered whole — with or without the marker —
-        # once the gate decision is made below. Any iteration where the gate
-        # isn't in this pending state streams exactly as before.
-        try:
-            streamed = 0
-            gate_pending = verification_nudge_fired and needs_verification
-            chat_delta_cb = None if gate_pending else delta_cb
-            turn_report["usage"]["llm_calls"] += 1
-            response: ChatResponse = client.chat(context, tool_schemas, chat_delta_cb)
-        except OverCapError:
-            # Provider rejected on length despite the estimate — compact and
-            # retry; if summarization can't help, fall back to force_fold.
-            if compactions < max_compactions and compaction.compact(
-                session, client, window, comp_cfg
-            ):
-                compactions += 1
-            elif compaction.force_fold(session, comp_cfg):
-                compactions += 1
-            else:
-                return _over_cap_giveup()
-            # Same reasoning as the pre-flight compaction path above: the
-            # baseline this real measurement was keyed to no longer applies.
-            session.last_prompt_tokens = None
-            continue
-
-        if response.prompt_tokens is not None:
-            # S2 — calibrate the fallback estimator toward this request's real
-            # usage, then remember it (plus where this context ended) so the
-            # next pre-flight trigger check can compose real + delta instead
-            # of re-estimating the whole transcript from scratch.
-            compaction.update_calibration(session, response.prompt_tokens, est)
-            session.last_prompt_tokens = response.prompt_tokens
-            session.last_prompt_context_len = len(context)
-            print(
-                ui.telemetry(
-                    f"usage: actual prompt_tokens={response.prompt_tokens} "
-                    f"vs estimated ~{est} tokens (delta {response.prompt_tokens - est:+d}) "
-                    f"[ema {session.token_estimate_ratio:.2f}]"
-                ),
-                file=sys.stderr,
-            )
-
-        # S4 — sum usage across every LLM call this turn (None until the first
-        # real figure arrives, then a running total; stays None all turn on
-        # providers that never report usage).
-        if response.prompt_tokens is not None:
-            turn_report["usage"]["prompt_tokens"] = (
-                (turn_report["usage"]["prompt_tokens"] or 0) + response.prompt_tokens
-            )
-        if response.completion_tokens is not None:
-            turn_report["usage"]["completion_tokens"] = (
-                (turn_report["usage"]["completion_tokens"] or 0) + response.completion_tokens
-            )
-
-        # Usage stats: fold this LLM call into the session's cumulative
-        # stats.json row (run time, tool-call count, token totals).
-        session.record_llm_call(
-            response.prompt_tokens,
-            response.completion_tokens,
-            len(response.tool_calls),
-        )
+        if isinstance(outcome, str):
+            return outcome
+        response = outcome
 
         tool_calls: list[ToolCall] | None = (
             response.tool_calls if response.tool_calls else None
         )
 
+        # H5 nudge must run before append_assistant records this turn's answer
+        # (it amends the last tool result, which append_assistant would displace).
         if not response.tool_calls:
-            # H5 — graph-memory usage nudge: this turn's mutations spanned 3+
-            # distinct paths with no record_decision/record_spec call anywhere
-            # in the turn. Append to the last tool result already in the
-            # transcript (same append mechanism diagnostics_inject_summary
-            # uses). Must run BEFORE session.append_assistant below, since
-            # amend_last_tool_result only touches _messages[-1] when its role
-            # is "tool" — after append_assistant records this turn's answer,
-            # the last message would be the assistant's, not the tool result.
-            # Fires at most once per session.
-            if (
-                len(mutated_paths) >= 3
-                and not record_decision_or_spec_called
-                and not _GRAPH_MEMORY_NUDGE_FIRED.get(id(session), False)
-            ):
-                _GRAPH_MEMORY_NUDGE_FIRED[id(session)] = True
-                print(ui.telemetry("graph-memory-nudge: fired"), file=sys.stderr)
-                session.amend_last_tool_result(
-                    "\n\n[memory] This change spans several files. If a design "
-                    "decision drove it, record it with record_decision so future "
-                    "sessions inherit the reasoning."
-                )
+            _maybe_graph_memory_nudge(session, state)
 
         session.append_assistant(response.text or "", tool_calls=tool_calls)
 
         if not response.tool_calls:
-            # Empty-answer retry: the model ended the turn with no text and no
-            # tool calls — a common local-model failure mode (a bare stop token
-            # after consuming tool results) that REPL mode would silently
-            # swallow: it discards the return value and only on_delta delivers
-            # output, so an empty return leaves the user at a blank prompt with
-            # the tool calls having visibly run. Inject a synthetic user-role
-            # steer and loop once more rather than re-rolling the identical
-            # request (which risks a deterministic re-collapse). Bounded to a
-            # single retry per turn; a second empty turn is surfaced via the
-            # transparent placeholder at the return site below. Same user-role
-            # steer justification as the verification nudge (session.py has no
-            # mid-transcript system-role append; a fabricated tool-role message
-            # here would not follow a matching assistant tool_calls entry).
-            if not (response.text or "").strip() and not empty_answer_nudge_fired:
-                empty_answer_nudge_fired = True
-                print(
-                    ui.telemetry("empty-answer-nudge: fired (empty assistant turn)"),
-                    file=sys.stderr,
-                )
-                session.append_user(
-                    "You produced no answer this turn. Respond now with a concise "
-                    "summary of what you did or found, grounded in the tool results "
-                    "above. Do not call more tools unless a result is genuinely missing."
-                )
-                continue
+            # No-tool-call gate cascade: bounce (empty-answer / H1) → loop again,
+            # or produce the final answer (S3 mark / placeholder) → return it.
+            final = _finalize_answer(session, client, state, response, on_delta)
+            if final is not None:
+                return final
+            continue
 
-            # H1 — post-mutation verification nudge: the model is about to end
-            # the turn having mutated files without running anything to verify
-            # the change. Inject a synthetic user-role steer (see module docs
-            # for why: session.py has no mid-transcript system-role append, and
-            # a fabricated tool-role message here would not follow a matching
-            # assistant tool_calls entry, which strict OpenAI-compatible APIs
-            # reject) and do one more loop iteration instead of returning.
-            # Fires at most once per turn.
-            if needs_verification and not verification_nudge_fired:
-                verification_nudge_fired = True
-                print(
-                    ui.telemetry("verification-nudge: fired (unverified file mutation)"),
-                    file=sys.stderr,
-                )
-                session.append_user(
-                    "You modified files this turn but ran nothing to verify the "
-                    "change. Verify it now with verify_scratch (a throwaway "
-                    "snippet, no file pollution), run_tests, or run_command "
-                    "against a separate script — never by adding repro/test code "
-                    "to a production file or repurposing its "
-                    "`if __name__ == \"__main__\"` block. Or state explicitly in "
-                    "your answer that the change is unverified. Either way, end "
-                    "your answer with a one-line verification breakdown: what "
-                    "you checked (tests, commands, diagnostics) and what it "
-                    "showed."
-                )
-                continue
-
-            # S3 — hard verify gate: this is the SECOND final answer of the
-            # turn (the bounce above already fired once and needs_verification
-            # is still set — a run_tests/run_command/verify_scratch call never succeeded in
-            # between). Accept it, but mark it: prefix the *returned* text with
-            # a harness-side "[UNVERIFIED CHANGES] " so the caller sees the
-            # state, unless the model already declared the change unverified
-            # in its own words (case-insensitive "unverified" match). The
-            # transcript above already recorded the model's original,
-            # unprefixed text — only the return value / on_delta payload gets
-            # the marker.
-            final_text = response.text or ""
-            # S4 — record the UNPREFIXED answer before any marker is layered on;
-            # this is the single source of truth the --json envelope reads back
-            # via session.turn_report, independent of what prose-mode return
-            # value/on_delta payload below gets prefixed with.
-            turn_report["answer"] = final_text
-            if needs_verification and verification_nudge_fired:
-                turn_report["declared_unverified"] = "unverified" in final_text.lower()
-                if not turn_report["declared_unverified"]:
-                    final_text = "[UNVERIFIED CHANGES] " + final_text
-                    print(
-                        ui.telemetry(
-                            "verification-gate: unresolved after bounce — "
-                            "marking [UNVERIFIED CHANGES]"
-                        ),
-                        file=sys.stderr,
-                    )
-            turn_report["verified"] = bool(mutated_paths) and not needs_verification
-
-            # Empty-answer placeholder: if the model returned no text at all
-            # (the retry above already fired once and still came back empty),
-            # surface a transparent placeholder. Layered onto the return value
-            # / on_delta payload ONLY — the transcript (append_assistant above)
-            # and turn_report["answer"] already hold the real empty string as
-            # the source of truth. Uses the original response.text (not the
-            # possibly-prefixed final_text) so it overrides a vacuous
-            # "[UNVERIFIED CHANGES] " prefix too. REPL mode discards the return
-            # value and only on_delta delivers output, so without this the user
-            # sees the tool calls run followed by a blank prompt.
-            if not (response.text or "").strip():
-                final_text = "(no response from model)"
-                print(
-                    ui.telemetry(
-                        "empty-answer: no text after retry — surfacing placeholder"
-                    ),
-                    file=sys.stderr,
-                )
-
-            if on_delta is not None and final_text:
-                if streamed == 0:
-                    on_delta(final_text)  # non-streaming / gated fallback: deliver whole
-                on_delta("\n")
-            consolidation_maybe_extract(session, client)
-            return final_text
-
-        calls = response.tool_calls
-        # Intermediate assistant text on a tool-call iteration that did NOT
-        # stream is still worth surfacing; streamed text already reached the sink.
-        if on_delta is not None and response.text:
-            if streamed == 0:
-                on_delta(response.text)
-            on_delta("\n")
-
-        # Concurrent dispatch when the whole batch is read-only and thread-safe
-        # (see Tool.parallel_safe). Any unsafe or unknown tool in the batch
-        # forces the sequential path, preserving effect ordering.
-        parallel_results: list[ToolResult] | None = None
-        if len(calls) > 1 and all(
-            getattr(get_tool(c.name), "parallel_safe", False) for c in calls
-        ):
-            for call in calls:
-                print(
-                    ui.tool_call(f"Tool call: {call.name}({json.dumps(call.arguments)})"),
-                    file=sys.stderr,
-                )
-            with ThreadPoolExecutor(max_workers=min(8, len(calls))) as pool:
-                parallel_results = list(
-                    pool.map(lambda c: dispatch(c.name, c.arguments), calls)
-                )
-
-        for i, call in enumerate(calls):
-            # Only ever populated on the sequential path below (parallel_safe
-            # tools never mutate, so there is nothing to lint-delta there).
-            lint_suffix = ""
-            if parallel_results is not None:
-                result = parallel_results[i]
-            else:
-                print(
-                    ui.tool_call(f"Tool call: {call.name}({json.dumps(call.arguments)})"),
-                    file=sys.stderr,
-                )
-                # Snapshot before/after this specific call so a mutation event
-                # can be attributed to it (parallel_safe tools never mutate, so
-                # this tracking only needs the sequential path — see Tool.parallel_safe).
-                pre_mutation_len = len(_TURN_MUTATIONS)
-                # I2 — reactive lint-delta injection: snapshot this call's
-                # target file's lint issues BEFORE dispatch (only for the
-                # single-path write tools in _LINT_TRACKED_TOOLS; None means
-                # "nothing to compare against", so no delta is ever appended).
-                lint_pre = _lint_pre_snapshot(call, str(session.project_root))
-                # Loop-guard hard cap: refuse an identical call once it has
-                # repeated _REPEAT_CALL_CAP times this turn (verification tools
-                # exempt — a rebuild/retest cycle legitimately repeats). The
-                # count is maintained post-render by _repeat_call_check; here
-                # we read the tally of *previous* identical calls and block
-                # before dispatching, guaranteeing a stuck no-op loop ends.
-                _repeat_key = (call.name, _call_signature(call.arguments))
-                _repeat_n = seen_calls.get(_repeat_key, 0)
-                if (
-                    call.name not in _REPEAT_CAP_EXEMPT
-                    and _repeat_n >= _REPEAT_CALL_CAP
-                ):
-                    result = ToolResult.err(
-                        f"{call.name} has already been called {_repeat_n} "
-                        f"times this turn with identical arguments. Repeating "
-                        f"it makes no progress — the call is blocked. Change "
-                        f"your arguments or approach, or stop and report what "
-                        f"you have.",
-                        code="loop-guard-blocked",
-                    )
-                    print(
-                        ui.telemetry(
-                            f"loop-guard: blocked repeated {call.name} "
-                            f"(#{_repeat_n + 1} identical this turn)"
-                        ),
-                        file=sys.stderr,
-                    )
-                else:
-                    result = dispatch(call.name, call.arguments)
-                new_events = _TURN_MUTATIONS[pre_mutation_len:]
-                if new_events:
-                    any_relevant, new_paths = _scan_new_mutations(new_events)
-                    if any_relevant:
-                        needs_verification = True
-                        mutated_paths |= new_paths
-                        # S4 — captured here (correlated with this dispatched
-                        # call's own slice of _TURN_MUTATIONS), NOT by reading
-                        # the module-level list later: diagnostics_inject_summary
-                        # drains it at the end of this same loop iteration.
-                        # Deduped by path, first-tool-wins, in order of first
-                        # mutation.
-                        for _ev in new_events:
-                            if _ev.get("kind") not in ("created", "changed", "renamed"):
-                                continue
-                            _ev_path = _ev.get("path")
-                            if _ev_path and _ev_path not in _files_changed_seen:
-                                _files_changed_seen.add(_ev_path)
-                                turn_report["files_changed"].append(
-                                    {"path": _ev_path, "tool": call.name}
-                                )
-                        resolved_call_path = _lint_resolve_call_path(
-                            call, str(session.project_root)
-                        )
-                        if lint_pre is not None and resolved_call_path in new_paths:
-                            lint_suffix = _lint_delta_suffix(
-                                lint_pre, call, str(session.project_root)
-                            )
-
-            if call.name in ("run_tests", "run_command", "verify_scratch"):
-                if call.name == "run_command":
-                    detail = str(call.arguments.get("cmd", ""))
-                else:
-                    detail = str(call.arguments.get("path") or ".")
-                turn_report["verification_runs"].append(
-                    {"tool": call.name, "status": result.status, "detail": detail}
-                )
-                if result.status == "success":
-                    needs_verification = False
-            if call.name in ("record_decision", "record_spec"):
-                record_decision_or_spec_called = True
-
-            rendered = render_tool_result(call.name, result)
-            result, rendered = _guard_oversize_result(call.name, result, rendered, cap, est)
-            rendered = _loop_guard_check(call.name, rendered, seen_errors)
-            rendered = _repeat_call_check(
-                call.name, call.arguments, result, rendered, seen_calls
-            )
-            rendered, searches_without_read = _web_search_focus_check(
-                call.name, result, rendered, searches_without_read
-            )
-            if lint_suffix:
-                rendered = rendered + lint_suffix
-
-            print(ui.tool_result(rendered), file=sys.stderr)
-
-            session.append_tool_result(call.id, call.name, rendered)
-
-        diagnostics_inject_summary(session)
+        _dispatch_round(session, state, response, on_delta)

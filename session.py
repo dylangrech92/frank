@@ -24,6 +24,15 @@ from llm import ToolCall
 
 CONTEXT_PROVIDERS: List[Callable[[Any], str]] = []
 
+# Content prefix for harness steer messages (see ``Session.append_steer``).
+# Spelled out rather than a bare tag: models — small local ones especially —
+# treat anything on the user role as the human speaking unless the message
+# itself says otherwise in plain words.
+STEER_PREFIX = (
+    "[automated message from the harness, NOT from the user — do not count "
+    "this as a user request] "
+)
+
 
 def _format_json(obj: Any) -> str:
     """Pretty-print *obj* as JSON with two-space indentation and trailing newline."""
@@ -395,6 +404,27 @@ class Session:
             text: The user's message content.
         """
         self._messages.append({"role": "user", "content": text})
+        self._persist()
+
+    def append_steer(self, text: str) -> None:
+        """Append a harness-guidance steer message and persist.
+
+        A steer is harness-authored turn guidance (an empty-answer bounce, the
+        H1 verification nudge) — NOT human input. It rides the ``user`` role for
+        guaranteed OpenAI-compatibility (there is no mid-transcript system role,
+        and a fabricated tool row would not follow a matching assistant
+        tool_calls entry), but is marked two independent ways so nothing
+        mistakes it for the user: the ``STEER_PREFIX`` content prefix tells the
+        MODEL this is harness guidance, and the ``steer`` flag is the
+        machine-readable signal read by the wire-stripping boundary (llm.py) and
+        the compaction summarizer (compaction.py) so a steer is never sent as an
+        unknown field nor quoted as the user's own words.
+
+        Args:
+            text: The steer guidance content (``STEER_PREFIX`` is added here —
+                pass the message body only).
+        """
+        self._messages.append({"role": "user", "content": STEER_PREFIX + text, "steer": True})
         self._persist()
 
     def append_assistant(self, text: str, tool_calls: List[ToolCall] | None = None) -> None:

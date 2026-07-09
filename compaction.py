@@ -212,10 +212,18 @@ DEFAULT_KEEP_RECENT = 8
 
 
 def _render_messages_for_summary(messages):
-    """Flatten messages into readable text for the summarizer's input."""
+    """Flatten messages into readable text for the summarizer's input.
+
+    Harness steer messages (``steer`` flag set — see ``Session.append_steer``)
+    are relabeled ``harness`` instead of ``user`` so the summarizer never
+    attributes harness guidance to the human. This keeps the "## Task — the
+    user's overall goal(s)" section grounded in real user input; a steer's
+    ``STEER_PREFIX``-marked content stays visible under the ``harness`` label as
+    context the summarizer can weigh but not misread as a stated goal.
+    """
     lines = []
     for m in messages:
-        role = m.get("role", "")
+        role = "harness" if m.get("steer") else m.get("role", "")
         content = m.get("content", "")
         if not isinstance(content, str):
             content = json.dumps(content)

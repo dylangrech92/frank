@@ -262,6 +262,17 @@ SCENARIOS: list[dict] = [
         "inline": "compaction_tail_prune.py",
     },
     {
+        "name": "steer_channel",
+        "description": (
+            "Dispatch-level check (no LLM): append_steer persists a user-role "
+            "message with the [harness] prefix and steer flag (round-tripped "
+            "through resume); the provider payload strips the steer key; the "
+            "compaction summarizer labels the steer 'harness' not 'user'; a "
+            "plain append_user message is unaffected."
+        ),
+        "inline": "steer_channel.py",
+    },
+    {
         "name": "compaction_force_fold",
         "description": (
             "Dispatch-level check (no LLM): the overflow-ladder force_fold "

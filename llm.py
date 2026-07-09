@@ -30,6 +30,33 @@ _CONNECT_TIMEOUT_SECONDS = 10.0
 _READ_TIMEOUT_SECONDS = 600.0
 
 
+# Message keys that are internal harness annotations, never part of the
+# OpenAI chat-completions wire format. ``steer`` marks a harness-authored
+# guidance turn (see Session.append_steer); it must never reach the provider,
+# both because strict OpenAI-compatible endpoints reject unknown message fields
+# and because it is an internal flag, not data the model should see.
+_NON_WIRE_MESSAGE_KEYS = frozenset({"steer"})
+
+
+def to_wire_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Strip internal harness-only keys from *messages* for the provider payload.
+
+    The single wire boundary: ``Session.assemble_context`` may carry annotation
+    keys (currently ``steer``) that the model must never receive. Every message
+    is passed through here before it becomes the request body, so the stripping
+    lives in exactly one place rather than scattered ``.pop`` calls. A message
+    with no such key passes through by identity; only one carrying an internal
+    key is shallow-copied with that key removed.
+    """
+    cleaned: List[Dict[str, Any]] = []
+    for m in messages:
+        if _NON_WIRE_MESSAGE_KEYS.intersection(m):
+            cleaned.append({k: v for k, v in m.items() if k not in _NON_WIRE_MESSAGE_KEYS})
+        else:
+            cleaned.append(m)
+    return cleaned
+
+
 class OverCapError(Exception):
     """Raised when the provider rejects a request because the context is too long."""
 
@@ -404,7 +431,7 @@ class LLMClient:
         want_stream = on_delta is not None and self.config.stream
         body: Dict[str, Any] = {
             "model": self.config.model,
-            "messages": messages,
+            "messages": to_wire_messages(messages),
         }
         # Sampling is server-authoritative (llama.cpp launch flags carry the
         # Ornith coding preset); only override when explicitly configured.
