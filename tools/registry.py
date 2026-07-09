@@ -130,15 +130,17 @@ _registry: dict[str, "Tool"] = {}
 
 # Tools that are always in the ``tools`` array of every request regardless of the
 # active set.  ``load_tool`` is pinned so the model can always bootstrap more tools;
-# the read-only research primitives (``read_file``, ``find``, ``list_files``,
-# ``find_symbol``, ``find_references``) are pinned because they are the universal
-# first-touch tools essentially every task reaches for — live baselines show
-# read_file/find_symbol/find_references dominating the first ``load_tool`` calls.
-# Pinning them skips a ``load_tool`` round-trip apiece, which on a slow local model
-# is a full LLM call (seconds to minutes) saved per task.  Write/heavy tools stay
-# gated on purpose: the load step is deliberate friction on destructive paths.
+# the read-only research primitives (``read_file``, ``find``, ``find_files``,
+# ``list_files``, ``find_symbol``, ``find_references``) are pinned because they are
+# the universal first-touch tools essentially every task reaches for — live
+# baselines show read_file/find_symbol/find_references dominating the first
+# ``load_tool`` calls, and ``find_files`` is the filename/glob primitive a task
+# reaches for just as instinctively.  Pinning them skips a ``load_tool`` round-trip
+# apiece, which on a slow local model is a full LLM call (seconds to minutes) saved
+# per task.  Write/heavy tools stay gated on purpose: the load step is deliberate
+# friction on destructive paths.
 PINNED: frozenset[str] = frozenset(
-    {"load_tool", "read_file", "find", "list_files", "find_symbol", "find_references"}
+    {"load_tool", "read_file", "find", "find_files", "list_files", "find_symbol", "find_references"}
 )
 
 # Names the model has loaded via ``load_tool`` this session.  Single-session app,

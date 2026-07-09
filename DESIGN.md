@@ -123,7 +123,7 @@ The transcript on disk and the context sent to the model are **different**. `ses
 
 ## 5. Tool catalog
 
-~40 tools, every one a thin class delegating to a shared client. A small pinned core (`tools/registry.PINNED`: `load_tool`, `read_file`, `find`, `list_files`, `find_symbol`, `find_references`) ships in every request's tools array, so first-touch research costs no `load_tool` round-trip; every other tool is deferred behind the catalog and must be loaded with `load_tool(name)` first. Write and heavy tools stay gated on purpose — the load step is deliberate friction on destructive paths. Grouped by VS Code "area":
+~40 tools, every one a thin class delegating to a shared client. A small pinned core (`tools/registry.PINNED`: `load_tool`, `read_file`, `find`, `find_files`, `list_files`, `find_symbol`, `find_references`) ships in every request's tools array, so first-touch research costs no `load_tool` round-trip; every other tool is deferred behind the catalog and must be loaded with `load_tool(name)` first. Write and heavy tools stay gated on purpose — the load step is deliberate friction on destructive paths. Grouped by VS Code "area":
 
 **Explorer (files)**
 - `list_files(path?)` — tree listing, respects `.gitignore`
@@ -135,7 +135,8 @@ The transcript on disk and the context sent to the model are **different**. `ses
 - `create_folder(path)`
 
 **Find / replace**
-- `find(query, fuzzy?)` — ctrl+f; exact or fuzzy term search (ripgrep-backed)
+- `find(query, fuzzy?)` — ctrl+f; exact or fuzzy term search over file **contents** (ripgrep-backed)
+- `find_files(pattern, path?)` — locate files by **name**/glob (`*scheduler*`, `*.sh`, `src/**/*.ts`); case-insensitive, gitignore-aware (ripgrep `--files`)
 - `replace_one(file, old, new)` — replaces a **unique** string in one file; errors if the match is ambiguous (forces precise edits)
 - `replace_many(old, new, glob?)` — **project-wide** text replace, optionally scoped by glob
 

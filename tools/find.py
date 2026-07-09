@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -11,6 +10,7 @@ from typing import Any
 from tools.base import Tool
 from tools.result import ToolResult
 from tools._sandbox import resolve_in_root
+from tools._rg import IGNORE_GLOB, locate_rg, strip_dot_prefix
 
 
 class Find(Tool):
@@ -28,9 +28,9 @@ class Find(Tool):
     name = 'find'
     summary = 'Search file contents across the project (ripgrep).'
     description = (
-        'Searches file contents across the project using ripgrep, returning matching '
-        'lines with file and line number. For symbol names use find_symbol; for usages '
-        'of a known symbol use find_references.'
+        'Searches file CONTENTS across the project using ripgrep, returning matching '
+        'lines with file and line number. Use find_files to search by filename/glob; '
+        'find_symbol for symbol names; find_references for usages of a known symbol.'
     )
     action = 'search'
     oversize_hint = 'narrow the query or pass path to limit the scope'
@@ -108,13 +108,9 @@ class Find(Tool):
             relative_path = str(search_dir.relative_to(root))
 
         # Locate the ripgrep binary
-        rg = shutil.which('rg')
+        rg, rg_error = locate_rg()
         if rg is None:
-            return ToolResult.err(
-                'The ripgrep binary rg was not found on PATH.',
-                code='missing-engine',
-                hint='Install it with: brew install ripgrep',
-            )
+            return rg_error  # type: ignore[return-value]
 
         # Build the search pattern and rg arguments
         rg_args: list[str] = [rg, '--line-number', '--no-heading']
@@ -128,7 +124,7 @@ class Find(Tool):
             rg_args.extend(['--fixed-strings', term])
 
         # Respect .gitignore (do NOT pass --no-ignore); exclude .coding_agent
-        rg_args.extend(['--glob', '!.coding_agent'])
+        rg_args.extend(['--glob', IGNORE_GLOB])
 
         # Always append exactly one path argument: the existing relative_path when
         # the user supplied a path, otherwise the literal "." so ripgrep searches the
@@ -152,9 +148,7 @@ class Find(Tool):
 
             # Searching "." makes rg print each match path with a leading "./" prefix;
             # strip that prefix so reported paths stay clean project-root-relative paths.
-            lines = output.splitlines()
-            lines = [l[2:] if l.startswith("./") else l for l in lines]
-            output = '\n'.join(lines)
+            output = '\n'.join(strip_dot_prefix(output.splitlines()))
             match_count = len(output.splitlines())
             return ToolResult.ok(output, match_count=match_count)
 
