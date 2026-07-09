@@ -60,7 +60,7 @@ class LoadTool(Tool):
         if not registry._registry:  # auto-discover if somehow not yet done
             registry.discover()
 
-        already = name_raw in registry.PINNED or name_raw in registry._active
+        already = registry.is_loaded(name_raw)
         if name_raw in registry.PINNED:
             return ToolResult.ok(
                 f"'{name_raw}' is always available — no need to load it.",

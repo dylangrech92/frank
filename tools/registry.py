@@ -129,13 +129,31 @@ def validate_arguments(tool: Tool, arguments: dict[str, Any]) -> str | None:
 _registry: dict[str, "Tool"] = {}
 
 # Tools that are always in the ``tools`` array of every request regardless of the
-# active set.  ``load_tool`` is pinned so the model can always bootstrap more tools.
-PINNED: frozenset[str] = frozenset({"load_tool"})
+# active set.  ``load_tool`` is pinned so the model can always bootstrap more tools;
+# the read-only research primitives (``read_file``, ``find``, ``list_files``,
+# ``find_symbol``, ``find_references``) are pinned because they are the universal
+# first-touch tools essentially every task reaches for — live baselines show
+# read_file/find_symbol/find_references dominating the first ``load_tool`` calls.
+# Pinning them skips a ``load_tool`` round-trip apiece, which on a slow local model
+# is a full LLM call (seconds to minutes) saved per task.  Write/heavy tools stay
+# gated on purpose: the load step is deliberate friction on destructive paths.
+PINNED: frozenset[str] = frozenset(
+    {"load_tool", "read_file", "find", "list_files", "find_symbol", "find_references"}
+)
 
 # Names the model has loaded via ``load_tool`` this session.  Single-session app,
 # so a module-level set is the correct home (mirrors the existing module-global
 # pattern used for MANAGER / DEBUG_MANAGER).  ``schemas()`` reflects PINNED | this.
 _active: set[str] = set()
+
+
+def is_loaded(name: str) -> bool:
+    """Return True when *name* is callable now — pinned or loaded via ``load_tool``.
+
+    Single source of truth for the load gate: ``schemas()`` exposes exactly these
+    tools and ``dispatch()`` refuses to run anything else.
+    """
+    return name in PINNED or name in _active
 
 
 def _is_concrete_tool(cls: type) -> bool:
@@ -214,7 +232,7 @@ def activate(name: str) -> bool:
     """
     if not _registry:
         discover()
-    if not name or name in PINNED or name in _active or name not in _registry:
+    if not name or is_loaded(name) or name not in _registry:
         return False
     _active.add(name)
     return True
@@ -262,14 +280,15 @@ def render_catalog_block() -> str:
     before using it.
     """
     entries = catalog()
+    preloaded = ", ".join(sorted(PINNED))
     lines = [
-        "Tool catalog — only `load_tool` is loaded. Each entry is listed as "
-        "`name(params): summary`, with optional params suffixed `?`. Each tool "
-        "must be loaded with `load_tool(name)` before you can call it; once "
-        "loaded, it is immediately callable — no need to wait for the next turn.",
+        f"Tool catalog — pre-loaded tools you can call directly: {preloaded}. "
+        "Each entry below is listed as `name(params): summary`, with optional "
+        "params suffixed `?`, and must first be loaded with `load_tool(name)` "
+        "before you can call it; once loaded, it is immediately callable — no "
+        "need to wait for the next turn.",
     ]
-    for e in entries:
-        lines.append(f"- {e['name']}({e['sig']}): {e['summary']}")
+    lines.extend(f"- {e['name']}({e['sig']}): {e['summary']}" for e in entries)
     return "\n".join(lines)
 
 
@@ -337,7 +356,7 @@ def dispatch(name: str, arguments: dict[str, Any]) -> ToolResult:
     # Gate: the model must have loaded this tool (or it must be PINNED) before
     # it can be dispatched — mirrors the schemas() contract so a tool never
     # executes without the model having seen its full definition.
-    if name not in PINNED and name not in _active:
+    if not is_loaded(name):
         return ToolResult.err(
             f"tool {name!r} is not loaded",
             code="not-loaded",

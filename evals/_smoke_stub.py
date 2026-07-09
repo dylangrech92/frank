@@ -21,24 +21,6 @@ import sys
 from pathlib import Path
 
 _CANNED: dict[str, dict[str, str]] = {
-    "load_tool_gate": {
-        "stdout": (
-            "mathlib.py defines: add(a, b) - returns the sum; mean(values) - "
-            "returns the arithmetic mean, raising ValueError on empty input; "
-            "is_even(n) - returns True when n is even.\n"
-        ),
-        "stderr": (
-            "Tool call: read_file({\"path\": \"mathlib.py\"})\n"
-            "[read_file(error code=not-loaded)]\n"
-            "hint: Call load_tool(name='read_file') first; its full definition "
-            "then becomes available immediately.\n"
-            "Tool call: load_tool({\"name\": \"read_file\"})\n"
-            "[load_tool(success)]\n"
-            "Loaded 'read_file'. It is now callable.\n"
-            "Tool call: read_file({\"path\": \"mathlib.py\"})\n"
-            "[read_file(success)]\n"
-        ),
-    },
     "json_multiline": {
         "stdout": (
             'haiku.txt now contains:\nCode compiles at dawn\nSyntax trees '

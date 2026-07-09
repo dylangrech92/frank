@@ -79,27 +79,13 @@ SCENARIOS: list[dict] = [
     {
         "name": "load_tool_gate",
         "description": (
-            "read_file is rejected with code=not-loaded until load_tool "
-            "brings it into the active tool set."
+            "dispatch-level gate contract: a catalog tool is rejected with "
+            "code=not-loaded until load_tool activates it; PINNED tools are "
+            "callable immediately and load_tool on one is benign (inline — "
+            "a protocol-following model loads before calling, so the "
+            "rejection never appears on a live transcript)."
         ),
-        "turns": [
-            "Read mathlib.py and list every function it defines with a "
-            "one-line description of each.",
-        ],
-        "config": "default",
-        "setup": {"mathlib.py": MATHLIB_PY},
-        "checks": [
-            {"stream": "stderr", "kind": "regex-present", "pattern": r"code=not-loaded"},
-            {
-                "stream": "stderr",
-                "kind": "ordered",
-                "patterns": [
-                    r"code=not-loaded",
-                    r"Tool call: load_tool",
-                    r"Tool call: read_file",
-                ],
-            },
-        ],
+        "inline": "load_tool_gate.py",
     },
     {
         "name": "json_multiline",
