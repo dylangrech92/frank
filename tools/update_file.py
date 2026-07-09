@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from tools.base import Tool
 from tools.result import ToolResult
-from tools._read_registry import check_fresh, record_read
-from tools._sandbox import emit_mutation, resolve_in_root
+from tools._edit import finalize_write, freshness_gate, resolve_existing_file
 
 
 class UpdateFile(Tool):
@@ -21,7 +19,9 @@ class UpdateFile(Tool):
     name = 'update_file'
     summary = 'Overwrite an existing file with new content (full overwrite).'
     description = (
-        'Overwrites an existing file with entirely new content (full overwrite, not a patch). '
+        'Overwrites an existing file with entirely new content (full overwrite, not a patch) — '
+        'use it for a full rewrite of a small file. For a targeted change to part of a file prefer '
+        'replace_one or edit_lines; to make a brand-new file use create_file. '
         'The path must be relative to the project root.'
     )
     parameters: dict[str, Any] = {
@@ -51,45 +51,21 @@ class UpdateFile(Tool):
             when the path escapes root, the file does not exist, or the target
             is not a regular file.
         """
-        raw_path = kwargs.get('path') if isinstance(kwargs.get('path'), str) else ''
+        path_arg = kwargs.get('path')
+        raw_path = path_arg if isinstance(path_arg, str) else ''
         content = kwargs.get('content', '')
 
-        # Resolve to absolute path under project root
-        try:
-            resolved = resolve_in_root(Path.cwd(), raw_path)
-        except ValueError as exc:
-            return ToolResult.err(str(exc), code='path-escapes-root')
-
-        # Reject if the target does not exist
-        if not resolved.exists():
-            return ToolResult.err(
-                f'{raw_path} does not exist.',
-                code='not-found',
-                hint="Use create_file to create a new file.",
-            )
-
-        # Reject if the target is not a regular file
-        if not resolved.is_file():
-            return ToolResult.err(
-                f'{raw_path} is not a regular file.',
-                code='not-a-file',
-            )
+        # Resolve under root and confirm the target is an existing regular file.
+        resolved, error = resolve_existing_file(raw_path)
+        if error is not None:
+            return error
+        assert resolved is not None
 
         # Refuse to overwrite a stale or never-read view of the file --
         # another process may have changed it since this session last saw it.
-        freshness = check_fresh(resolved)
-        if freshness == 'stale':
-            return ToolResult.err(
-                f'{raw_path} changed on disk after you last read it — another process may have modified it.',
-                code='file-changed-on-disk',
-                hint='Re-read the file with read_file, then re-apply your edit against the current content.',
-            )
-        if freshness == 'unread':
-            return ToolResult.err(
-                f'{raw_path} has not been read yet in this session.',
-                code='not-read-yet',
-                hint='Read the file with read_file before editing it.',
-            )
+        stale_error = freshness_gate(resolved, raw_path)
+        if stale_error is not None:
+            return stale_error
 
         # Guard against a destructive partial-edit (TKT-1468): the model
         # sometimes calls update_file (a full overwrite) with only a code
@@ -120,12 +96,8 @@ class UpdateFile(Tool):
         # Write content as UTF-8
         resolved.write_text(content, encoding='utf-8')
 
-        # Re-stamp so this session's own write doesn't make the file look
-        # stale for its next edit.
-        record_read(resolved)
-
-        # Emit the mutation event (exactly once on success)
-        emit_mutation('changed', resolved)
+        # Re-stamp the read registry and emit exactly one mutation event.
+        finalize_write(resolved)
 
         return ToolResult.ok(
             f'File updated: {raw_path}',

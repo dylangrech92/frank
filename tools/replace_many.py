@@ -7,8 +7,8 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
-from tools._read_registry import check_fresh, record_read
-from tools._sandbox import emit_mutation
+from tools._edit import finalize_write, looks_line_numbered
+from tools._read_registry import check_fresh
 from tools.base import Tool
 from tools.result import ToolResult
 
@@ -32,7 +32,8 @@ class ReplaceMany(Tool):
         'Replaces every occurrence of a literal string across the project and reports '
         'per-file replacement counts. When a ``glob`` pattern is provided, only file names '
         'matching that glob pattern are touched; otherwise all text files in the tree are '
-        'considered.'
+        "considered. The search string must be the raw file text — do not include read_file's "
+        "display-only line-number prefixes (the '     1\\t' column)."
     )
     parameters: dict[str, Any] = {
         'type': 'object',
@@ -126,12 +127,9 @@ class ReplaceMany(Tool):
                 new_content = content.replace(search, replace, count)
                 real_file.write_text(new_content, encoding='utf-8')
 
-                # Re-stamp so this session's own write doesn't make the file
-                # look stale for its next edit.
-                record_read(real_file)
-
-                # Emit exactly one mutation event per changed file.
-                emit_mutation('changed', real_file)
+                # Re-stamp the read registry and emit exactly one mutation
+                # event per changed file.
+                finalize_write(real_file)
 
                 changed_files.append((rel_path, count))
 
@@ -143,8 +141,17 @@ class ReplaceMany(Tool):
                     code='file-changed-on-disk',
                     hint='Re-read the affected files with read_file, then re-apply the replacement.',
                 )
+            body = 'No occurrences were found.'
+            if looks_line_numbered(search):
+                # The model likely pasted read_file's numbered output into the
+                # search string; point it at the real cause.
+                body += (
+                    " Your search text includes read_file's line-number prefixes "
+                    "(the '     1\\t' column) — those are display-only. Strip them so "
+                    "the search matches the real file content."
+                )
             return ToolResult.ok(
-                'No occurrences were found.',
+                body,
                 files_changed=0,
                 total_replacements=0,
             )

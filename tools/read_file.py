@@ -11,6 +11,18 @@ from tools._read_registry import record_read
 from tools._sandbox import resolve_in_root
 
 
+def _number_lines(lines: list[str], first_lineno: int) -> str:
+    """Render *lines* cat -n style: ``     N\\t<line>`` starting at *first_lineno*.
+
+    The line number is right-aligned in a width-6 column so numbers line up, and
+    reflects the true file line number (not a page-relative index) so a paged
+    read still shows the real line numbers.
+    """
+    return '\n'.join(
+        f'{first_lineno + offset:6d}\t{line}' for offset, line in enumerate(lines)
+    )
+
+
 class ReadFile(Tool):
     """Reads a file inside the project, returning its contents with optional line range paging.
 
@@ -23,6 +35,9 @@ class ReadFile(Tool):
     summary = 'Read a file\u2019s contents with optional line-range paging.'
     description = (
         'Reads a file inside the project returning its contents with optional line range. '
+        'Output is cat -n style: every line is prefixed with its true 1-based file line number '
+        'and a tab. The line numbers are display-only \u2014 never include them in file content you '
+        'write, nor in search strings for replace_one/replace_many. '
         'The path must be relative to the project root.'
     )
     action = 'read the file'
@@ -61,7 +76,8 @@ class ReadFile(Tool):
             error when the path escapes root, is not a regular file, exceeds the
             character limit without paging, or has invalid range parameters.
         """
-        raw_path = kwargs.get('path') if isinstance(kwargs.get('path'), str) else ''
+        path_arg = kwargs.get('path')
+        raw_path = path_arg if isinstance(path_arg, str) else ''
         start_line: int | None = kwargs.get('start_line')
         end_line: int | None = kwargs.get('end_line')
 
@@ -79,7 +95,9 @@ class ReadFile(Tool):
 
         content = resolved.read_text(encoding='utf-8', errors='replace')
 
-        # Enforce size limit when no paging parameters are provided
+        # Enforce size limit when no paging parameters are provided. The cap is
+        # measured against the RAW content, not the line-numbered output built
+        # for the body below, so numbering never shrinks the effective budget.
         if start_line is None and end_line is None:
             MAX_CHARACTERS = 50000
             if len(content) > MAX_CHARACTERS:
@@ -92,10 +110,11 @@ class ReadFile(Tool):
                     hint='Use find_symbol to locate the symbol, then read_file with start_line/end_line for its range.',
                 )
 
-            # Content fits without paging — return full file
-            lines_count = len(content.splitlines())
+            # Content fits without paging — return the full file, cat -n style.
+            file_lines = content.splitlines()
+            lines_count = len(file_lines)
             record_read(resolved)
-            return ToolResult.ok(content, total_lines=lines_count)
+            return ToolResult.ok(_number_lines(file_lines, 1), total_lines=lines_count)
 
         if start_line is not None and end_line is not None:
             # Both bounds given — validate below
@@ -145,7 +164,8 @@ class ReadFile(Tool):
         # At this point we have both bounds (possibly defaulted above)
         assert start_line is not None and end_line is not None
 
-        # Range read — slice by lines and re-check size guard on result
+        # Range read — slice by lines and re-check size guard on the RAW slice
+        # (numbering is display-only, so it must not count against the cap).
         lines = content.splitlines()
         total_lines = len(lines)
         sliced = lines[(start_line - 1): end_line]  # type: ignore[index]
@@ -159,4 +179,7 @@ class ReadFile(Tool):
                     hint='Use find_symbol to locate the symbol, then read_file with a narrower start_line/end_line range.',
                 )
         record_read(resolved)
-        return ToolResult.ok(returned, total_lines=total_lines, returned_lines=len(sliced))
+        # Number from the true first line of the slice, not page-relative.
+        return ToolResult.ok(
+            _number_lines(sliced, start_line), total_lines=total_lines, returned_lines=len(sliced)
+        )

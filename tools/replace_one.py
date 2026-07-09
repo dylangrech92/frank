@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from tools.base import Tool
 from tools.result import ToolResult
-from tools._read_registry import check_fresh, record_read
-from tools._sandbox import emit_mutation, resolve_in_root
+from tools._edit import (
+    finalize_write,
+    freshness_gate,
+    looks_line_numbered,
+    resolve_existing_file,
+)
 
 
 class ReplaceOne(Tool):
@@ -24,7 +27,9 @@ class ReplaceOne(Tool):
     summary = 'Replace one unique occurrence of a literal string in a file.'
     description = (
         'Replaces exactly one occurrence of a literal string in a single file. '
-        'Refuses when the match is not unique. The path must be relative to the project root.'
+        'Refuses when the match is not unique. The search string must be the raw file text — '
+        "do not include read_file's display-only line-number prefixes (the '     1\\t' column). "
+        'The path must be relative to the project root.'
     )
     alternative = 'replace_many or update_file'
     parameters: dict[str, Any] = {
@@ -59,46 +64,22 @@ class ReplaceOne(Tool):
             when the path escapes root, the file does not exist/is not a file, or the
             match count is zero or greater than one.
         """
-        raw_path = kwargs.get('path') if isinstance(kwargs.get('path'), str) else ''
+        path_arg = kwargs.get('path')
+        raw_path = path_arg if isinstance(path_arg, str) else ''
         search = kwargs.get('search', '')
         replace = kwargs.get('replace', '')
 
-        # Resolve to absolute path under project root
-        try:
-            resolved = resolve_in_root(Path.cwd(), raw_path)
-        except ValueError as exc:
-            return ToolResult.err(str(exc), code='path-escapes-root')
-
-        # Reject if the target does not exist
-        if not resolved.exists():
-            return ToolResult.err(
-                f'{raw_path} does not exist.',
-                code='not-found',
-                hint="Use create_file to create a new file.",
-            )
-
-        # Reject if the target is not a regular file
-        if not resolved.is_file():
-            return ToolResult.err(
-                f'{raw_path} is not a regular file.',
-                code='not-a-file',
-            )
+        # Resolve under root and confirm the target is an existing regular file.
+        resolved, error = resolve_existing_file(raw_path)
+        if error is not None:
+            return error
+        assert resolved is not None
 
         # Refuse to edit against a stale or never-read view of the file --
         # another process may have changed it since this session last saw it.
-        freshness = check_fresh(resolved)
-        if freshness == 'stale':
-            return ToolResult.err(
-                f'{raw_path} changed on disk after you last read it — another process may have modified it.',
-                code='file-changed-on-disk',
-                hint='Re-read the file with read_file, then re-apply your edit against the current content.',
-            )
-        if freshness == 'unread':
-            return ToolResult.err(
-                f'{raw_path} has not been read yet in this session.',
-                code='not-read-yet',
-                hint='Read the file with read_file before editing it.',
-            )
+        stale_error = freshness_gate(resolved, raw_path)
+        if stale_error is not None:
+            return stale_error
 
         # Read the file as UTF-8
         content = resolved.read_text(encoding='utf-8')
@@ -107,10 +88,20 @@ class ReplaceOne(Tool):
         count = content.count(search)
 
         if count == 0:
+            hint = (
+                "Check the exact text with read_file. The search text must not include "
+                "read_file's display-only line-number prefixes (the '     1\\t' column)."
+            )
+            if looks_line_numbered(search):
+                hint = (
+                    "Your search text includes read_file's line-number prefixes "
+                    "(the '     1\\t' column) — those are display-only. Strip them so "
+                    "the search matches the real file content."
+                )
             return ToolResult.err(
                 f'The search string was not found in {raw_path}.',
                 code='no-match',
-                hint='Check the exact text with read_file.',
+                hint=hint,
             )
 
         if count > 1:
@@ -127,12 +118,8 @@ class ReplaceOne(Tool):
         new_content = content.replace(search, replace, 1)
         resolved.write_text(new_content, encoding='utf-8')
 
-        # Re-stamp so this session's own write doesn't make the file look
-        # stale for its next edit.
-        record_read(resolved)
-
-        # Emit the mutation event (exactly once on success)
-        emit_mutation('changed', resolved)
+        # Re-stamp the read registry and emit exactly one mutation event.
+        finalize_write(resolved)
 
         return ToolResult.ok(
             f'Replaced 1 occurrence in {raw_path}.',

@@ -127,9 +127,9 @@ The transcript on disk and the context sent to the model are **different**. `ses
 
 **Explorer (files)**
 - `list_files(path?)` — tree listing, respects `.gitignore`
-- `read_file(path, start_line?, end_line?)` — file contents, optional line range; errors with a use-the-range hint on oversized files
+- `read_file(path, start_line?, end_line?)` — file contents, optional line range; output is cat -n style (each line prefixed with its true 1-based line number and a tab — display-only, never fed back into written content or `replace_*` search strings), and numbering reflects true file lines even when paging; errors with a use-the-range hint on oversized files
 - `create_file(path, content)`
-- `update_file(path, content)` — full overwrite
+- `update_file(path, content)` — full overwrite of a small file; targeted changes should prefer `replace_one`/`edit_lines`
 - `delete_file(path)`
 - `move_file(src, dst)` — fires `workspace/willRenameFiles` so imports auto-update
 - `create_folder(path)`
@@ -139,6 +139,7 @@ The transcript on disk and the context sent to the model are **different**. `ses
 - `find_files(pattern, path?)` — locate files by **name**/glob (`*scheduler*`, `*.sh`, `src/**/*.ts`); case-insensitive, gitignore-aware (ripgrep `--files`)
 - `replace_one(file, old, new)` — replaces a **unique** string in one file; errors if the match is ambiguous (forces precise edits)
 - `replace_many(old, new, glob?)` — **project-wide** text replace, optionally scoped by glob
+- `edit_lines(path, start_line, end_line, new_text)` — replaces a **1-based inclusive line range** with `new_text` so large files change without a full rewrite; insertion is an empty range (`end_line = start_line - 1`; `start_line=1, end_line=0` inserts at the top; `start_line` one past the last line appends), and the result echoes a cat -n numbered preview of the changed region ± context; a length-changing edit skips the read-registry re-stamp so the file's next edit is refused until a fresh `read_file` (anchor-shift guard — stale line numbers can't land on the wrong lines)
 
 **Code intelligence (LSP)**
 - `go_to_definition(file, line, col)` · `go_to_implementation(...)` · `go_to_type_definition(...)`

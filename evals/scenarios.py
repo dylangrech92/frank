@@ -273,6 +273,18 @@ SCENARIOS: list[dict] = [
         "inline": "steer_channel.py",
     },
     {
+        "name": "edit_lines",
+        "description": (
+            "Dispatch-level check (no LLM): edit_lines replaces a line range, "
+            "inserts on an empty range (end=start-1) and at the top, rejects "
+            "out-of-bounds ranges with code=bad-range, honors the not-read-yet "
+            "and file-changed-on-disk gates, preserves trailing-newline "
+            "behavior, and echoes a cat -n numbered preview; read_file emits "
+            "cat -n output with TRUE line numbers under paging."
+        ),
+        "inline": "edit_lines.py",
+    },
+    {
         "name": "compaction_force_fold",
         "description": (
             "Dispatch-level check (no LLM): the overflow-ladder force_fold "
