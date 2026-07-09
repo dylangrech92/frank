@@ -43,7 +43,7 @@ coding_agent/
   agent.py           # Agent loop: LLM call → dispatch → compaction trigger → diagnostics inject
   llm.py             # OpenAI-compatible client (/v1/chat/completions) + tool-schema conversion
   embedding.py       # Local gte-modernbert-base (ONNX runtime); FTS-only fallback
-  compaction.py      # Reactive over-cap compaction (Chalie-derived prompt + trigger)
+  compaction.py      # Reactive over-cap compaction (in-flight-turn folding + usage-driven trigger)
   diagnostics.py     # Store fed by LSP publishDiagnostics; one-line summary + full dump
   lsp/
     client.py        # Generic LSP JSON-RPC-over-stdio client + server lifecycle
@@ -266,7 +266,9 @@ Chalie runs a 5-minute idle "subconscious" worker; a session-based CLI has no su
 
 ## 8. Compaction
 
-Reactive only, mirroring Chalie: a pre-flight token estimate against `cap = window − max(0.10·window, 8000)`; if a send would exceed it (or the provider returns `context_length_exceeded`), compact then retry — no periodic polling. The summarization prompt is Chalie's `ChatHistoryCompactionSystemPrompt`, re-themed for coding with fixed sections **Task / State / Files-touched / Open / Decisions / Last**. Persistence is simplified: replace everything above a watermark with a single summary message and keep the recent tail (no fork/watermark machinery). Token estimation uses `tiktoken` when available, else a `chars/4` heuristic.
+Reactive only: a pre-flight token estimate against `cap = window − max(0.10·window, 8000)`; if a send would exceed it (or the provider returns `context_length_exceeded`), compact then retry — no periodic polling. The summarization prompt is a coding-themed system prompt with fixed sections **Task / State / Files-touched / Open / Decisions / Last**. Persistence: replace everything above a watermark with a single summary message and keep the recent tail (no fork/watermark machinery). Token estimation uses `tiktoken` when available, else a `chars/4` heuristic.
+
+**Folding the in-flight turn.** The fold boundary is not limited to *completed* prior turns — it may advance *into* the current in-flight turn, folding its older tool-call trail into the running summary. This is what lets a single long turn be compacted at all: a one-shot run (one user message + a long tool trail) has no completed turn before it, so a boundary pinned to the last user message could never make progress and the run would dead-end with "Context is over the model's token budget." `_fold_boundary` (compaction.py) keeps the last `keep_recent_messages` (default 8) verbatim, grows the folded region forward only while its rendered estimate stays within the summarizer's own budget (`cap` minus the summary prompt + any prior summary), and walks the boundary back off a leading `tool` row so a tool result is never orphaned from its originating assistant tool-call. Whenever the current user message is itself folded behind the watermark, `assemble_context` re-injects it verbatim as a task anchor so the model never loses the literal original request; the summary's paraphrase is a safety net, not a replacement.
 
 **Usage-driven trigger.** Providers that report `usage.prompt_tokens` on a response give a real count — but it only measures the prompt of *that* request, and the context keeps growing after it (that response's own text, then new tool results). So the compaction gate compares against a composed signal, not the estimate alone: the session's most recent real `prompt_tokens` plus a calibrated estimate of only what was appended to the context since that request was built. When no real usage has been seen yet (or a compaction just reshaped the context, invalidating the baseline), the gate falls back to the plain estimate. Either way the estimate is scaled by an EMA (α = 0.3) of observed real-vs-estimated ratios carried on the session, so the `chars/4` fallback drifts toward the provider's real tokenizer over the life of a session instead of carrying a fixed, unverified undershoot.
 
@@ -339,7 +341,7 @@ Config is per-agent-install, not per-project: it defaults to `config.json` next 
   },
   "debug_adapters": { "python": "debugpy", "php": "php-debug", "javascript": "js-debug" },
   "test_runners": { "python": "pytest", "php": "phpunit", "javascript": "jest" },
-  "compaction": { "reserve_ratio": 0.10, "reserve_min_tokens": 8000 },
+  "compaction": { "reserve_ratio": 0.10, "reserve_min_tokens": 8000, "keep_recent_messages": 8 },
   "git": { "allow_destructive": false },
   "subagents": { "max_concurrent": 4, "timeout_s": 600 }
 }
