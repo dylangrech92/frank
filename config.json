@@ -3,15 +3,14 @@
     "base_url": "http://grck.lan:30069/v1",
     "api_key": "llama.cpp",
     "model": "ornith:35b",
-    "temperature": 0.2,
     "context_limit": 128000
   },
   "git": {
     "allow_destructive": false
   },
   "test_runners": {},
-  "compaction": {"reserve_ratio": 0.10, "reserve_min_tokens": 8000},
-  "subagents": {"max_concurrent": 4, "timeout_s": 600},
+  "compaction": {"reserve_ratio": 0.10, "reserve_min_tokens": 8000, "keep_recent_messages": 8},
+  "subagents": {"max_concurrent": 4, "timeout_s": 3600},
   "linters": {
     "python":     {"command": ["ruff", "check", "--output-format", "json"]},
     "javascript": {"command": ["eslint", "--format", "json"]},

@@ -12,7 +12,7 @@ class LLMConfig:
     base_url: str
     api_key: str
     model: str
-    temperature: float = 0.2
+    temperature: float | None = None
     max_tokens: int | None = None
     context_limit: int = 128000
     stream: bool = True

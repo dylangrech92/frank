@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
+import stats
 from llm import ToolCall
 
 
@@ -302,6 +304,16 @@ class Session:
         # envelope.
         self.turn_report: dict = {}
 
+        # Usage-stats accumulators (stats.json). Seeded from any existing row so
+        # a resumed session's totals continue rather than reset; run_time is the
+        # prior wall-clock plus this process's elapsed time since construction.
+        prior = stats.read_row(self.session_id)
+        self._stats_run_base: float = float(prior.get("run_time", 0.0)) if prior else 0.0
+        self._stats_tool_calls: int = int(prior.get("tool_calls", 0)) if prior else 0
+        self._stats_input_tokens: int = int(prior.get("input", 0)) if prior else 0
+        self._stats_output_tokens: int = int(prior.get("output", 0)) if prior else 0
+        self._stats_run_started: float = time.monotonic()
+
         self._acquire_lock()
 
     @classmethod
@@ -478,13 +490,21 @@ class Session:
         ]
 
         if self._summary:
-            result.append({
-                "role": "user",
-                "content": (
-                    "Summary of the earlier conversation "
-                    "(older turns compacted to fit context):\n\n" + self._summary
-                ),
-            })
+            content = (
+                "Summary of the earlier conversation "
+                "(older turns compacted to fit context):\n\n" + self._summary
+            )
+            # When compaction has folded the current turn's own user message into
+            # the summary (its index is now behind the watermark), re-show it
+            # verbatim so the model never loses the literal task it is working on
+            # — the summary's paraphrase is a safety net, not a replacement.
+            anchor = self._folded_task_anchor()
+            if anchor is not None:
+                content += (
+                    "\n\n---\n\nYour current task (original request, shown "
+                    "verbatim):\n\n" + anchor
+                )
+            result.append({"role": "user", "content": content})
             tail = self._messages[self._summary_covers:]
         else:
             tail = self._messages
@@ -493,6 +513,24 @@ class Session:
         return result
 
     # ------------------------------------------------------------------ private
+
+    def _folded_task_anchor(self) -> str | None:
+        """Return the current task's user text when it sits behind the watermark.
+
+        The "current task" is the most recent ``user`` message. When compaction
+        has advanced ``_summary_covers`` past it (its index < the watermark), it
+        no longer appears in the assembled tail, so ``assemble_context`` re-shows
+        it verbatim. Returns ``None`` when the latest user message is still
+        visible in the tail (nothing to re-inject).
+        """
+        last_user = -1
+        for i, m in enumerate(self._messages):
+            if m.get("role") == "user":
+                last_user = i
+        if last_user < 0 or last_user >= self._summary_covers:
+            return None
+        content = self._messages[last_user].get("content", "")
+        return content if isinstance(content, str) else str(content)
 
     def _persist(self) -> None:
         """Write YAML frontmatter followed by the JSON messages array to disk.
@@ -567,6 +605,31 @@ class Session:
                 )
 
         self._lock_path.write_text(str(os.getpid()), encoding="utf-8")
+
+    def record_llm_call(
+        self,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        tool_calls: int,
+    ) -> None:
+        """Fold one LLM call's usage into the session totals and upsert stats.json.
+
+        Called after every provider response (main agent loop and the compaction
+        summary call). Token counts are ``None`` on providers that don't report
+        usage; those contribute zero rather than corrupting the running total.
+        ``run_time`` is the resumed baseline plus this process's elapsed seconds.
+        """
+        self._stats_tool_calls += tool_calls
+        self._stats_input_tokens += prompt_tokens or 0
+        self._stats_output_tokens += completion_tokens or 0
+        run_time = self._stats_run_base + (time.monotonic() - self._stats_run_started)
+        stats.upsert(
+            self.session_id,
+            round(run_time, 3),
+            self._stats_tool_calls,
+            self._stats_input_tokens,
+            self._stats_output_tokens,
+        )
 
     def close(self) -> None:
         """Release this session's advisory lock file, if this process still owns it.

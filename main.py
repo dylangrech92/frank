@@ -180,6 +180,8 @@ SYSTEM_PROMPT = (
     "load-bearing paths, values, and excerpts in your replies so they survive.\n"
     "- Once you have what you need, stop calling tools and answer. When you change "
     "code, verify by running the relevant code or tests.\n"
+    "- Always finish your turn with a plain-text answer describing what you did or "
+    "found; never end on a tool call with no answer or an empty message.\n"
     "- If the request is ambiguous, state the assumption you are proceeding on in "
     "your answer.\n"
     "- Touch only what the task requires.\n"

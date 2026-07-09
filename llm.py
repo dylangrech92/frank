@@ -405,8 +405,11 @@ class LLMClient:
         body: Dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
-            "temperature": self.config.temperature,
         }
+        # Sampling is server-authoritative (llama.cpp launch flags carry the
+        # Ornith coding preset); only override when explicitly configured.
+        if self.config.temperature is not None:
+            body["temperature"] = self.config.temperature
 
         if want_stream:
             body["stream"] = True

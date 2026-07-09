@@ -11,7 +11,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
-from session import Session, _prune_messages  # noqa: E402
+from llm import OverCapError
+from session import Session  # noqa: E402
 
 
 def _serialize_for_estimate(
@@ -202,6 +203,14 @@ What was happening most recently, in enough detail that work can resume seamless
 Rules: keep exact file paths, function/class names, error messages, and concrete values. Drop pleasantries and repetition. Never invent anything that is not present in the conversation. Output only the six sections."""
 
 
+# How many trailing messages compaction preserves verbatim. Everything older —
+# including the older tool-call trail of the *current* in-flight turn — is
+# eligible to be folded into the summary. Keeping a recent window lets the model
+# continue coherently from what it most recently saw; the summary carries the
+# rest. Overridable via the ``compaction`` config block's ``keep_recent_messages``.
+DEFAULT_KEEP_RECENT = 8
+
+
 def _render_messages_for_summary(messages):
     """Flatten messages into readable text for the summarizer's input."""
     lines = []
@@ -220,43 +229,106 @@ def _render_messages_for_summary(messages):
     return "\n".join(lines)
 
 
-def compact(session: "Session", client, window: int, compaction_cfg=None) -> bool:
-    """Summarize the completed turns before the in-flight turn and set the watermark.
+def _fold_boundary(
+    messages: List[Dict[str, Any]],
+    summary_covers: int,
+    keep_recent: int,
+    budget: int,
+) -> int | None:
+    """Choose the fold boundary: summarize ``[summary_covers:cut]``, keep ``[cut:]``.
 
-    Finds the in-flight turn (everything from the last ``user`` message onward),
-    summarizes the pruned completed region before it (folding in any existing
-    summary), and installs the result via ``session.set_summary``. The on-disk
-    transcript is never touched.
+    Starts from "keep the last *keep_recent* messages", then folds the oldest
+    unfolded messages forward only while the region's rendered token estimate
+    stays within *budget* (so the summary call itself never overflows). The kept
+    tail must not begin on a ``tool`` message — a tool result whose originating
+    ``assistant`` tool-call was folded into the summary would be an orphan the
+    provider rejects — so the boundary is walked back off any leading tool row.
+
+    Crucially this treats the current in-flight turn's older tool-call trail as
+    foldable, which is what lets a single long turn (e.g. one-shot mode) be
+    compacted at all — the old "summarize only completed prior turns" boundary
+    was a no-op for a session with just one user message.
+
+    Args:
+        messages: The full ``session._messages`` list.
+        summary_covers: Watermark — messages before this are already summarized.
+        keep_recent: Minimum number of trailing messages to preserve verbatim.
+        budget: Token ceiling for the region handed to the summarizer.
+
+    Returns:
+        The exclusive fold boundary ``cut`` (``> summary_covers``), or ``None``
+        when no valid boundary beyond the watermark exists (cannot make progress).
+    """
+    max_cut = len(messages) - keep_recent
+    if max_cut <= summary_covers:
+        return None
+
+    total = 0
+    cut = summary_covers
+    for i in range(summary_covers, max_cut):
+        tokens = estimate_tokens([messages[i]])
+        # Always fold at least one message (a lone over-budget row cannot be
+        # split); otherwise stop once adding the next row would breach budget.
+        if total + tokens > budget and cut > summary_covers:
+            break
+        total += tokens
+        cut = i + 1
+
+    while cut > summary_covers and messages[cut].get("role") == "tool":
+        cut -= 1
+    if cut <= summary_covers:
+        return None
+    return cut
+
+
+def compact(session: "Session", client, window: int, compaction_cfg=None) -> bool:
+    """Fold older messages into a running summary and advance the watermark.
+
+    Summarizes the region ``[_summary_covers:cut]`` — where *cut* preserves a
+    recent tail and keeps the summarizer's own request within budget (see
+    ``_fold_boundary``) — folding any prior summary forward for continuity, then
+    installs the result via ``session.set_summary``. Unlike the earlier version,
+    the fold boundary may advance *into* the current in-flight turn, so a single
+    long turn can be reduced instead of dead-ending in a give-up. The on-disk
+    transcript is never touched; only the assembled view shrinks.
 
     Args:
         session: The active Session.
         client: An LLMClient used to produce the summary.
-        window: The model's context window (unused for now beyond signalling
-            intent; kept for signature stability with the caller).
-        compaction_cfg: The compaction config block (reserved for future tuning).
+        window: The model's context window — bounds the summarizer's own request.
+        compaction_cfg: The ``compaction`` config block (``keep_recent_messages``,
+            plus the shared ``reserve_ratio`` / ``reserve_min_tokens`` cap knobs).
 
     Returns:
-        True if a new summary was produced and installed; False if there was
-        nothing new to summarize beyond the current watermark (caller should
-        treat False as "cannot compact further").
+        True if a new summary was produced and installed; False if no foldable
+        region remains or the summary call made no progress (caller treats False
+        as "cannot compact further").
     """
+    cfg = compaction_cfg or {}
+    keep_recent = int(cfg.get("keep_recent_messages", DEFAULT_KEEP_RECENT))
     msgs = session._messages
 
-    cut = -1
-    for i, m in enumerate(msgs):
-        if m.get("role") == "user":
-            cut = i
+    # Reserve room for the summarizer's fixed overhead (its system prompt and any
+    # prior summary folded in) so the region we hand it cannot breach the cap.
+    cap = compute_cap(window, cfg)
+    prior = session._summary or ""
+    fixed = estimate_tokens(
+        [
+            {"role": "system", "content": COMPACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": prior},
+        ]
+    )
+    budget = max(cap - fixed, 1)
 
-    # Nothing new to fold in beyond what the watermark already covers.
-    if cut <= session._summary_covers:
+    cut = _fold_boundary(msgs, session._summary_covers, keep_recent, budget)
+    if cut is None:
         return False
 
-    region = _prune_messages(msgs[session._summary_covers:cut])
-    material = _render_messages_for_summary(region)
-    if session._summary:
+    material = _render_messages_for_summary(msgs[session._summary_covers:cut])
+    if prior:
         material = (
             "Previous summary of even earlier turns:\n"
-            + session._summary
+            + prior
             + "\n\nConversation since that summary:\n"
             + material
         )
@@ -265,7 +337,17 @@ def compact(session: "Session", client, window: int, compaction_cfg=None) -> boo
         {"role": "system", "content": COMPACTION_SYSTEM_PROMPT},
         {"role": "user", "content": material},
     ]
-    response = client.chat(request, None)
+    try:
+        response = client.chat(request, None)
+    except OverCapError:
+        # A single row larger than the whole budget can still be handed over
+        # (it cannot be split). If the provider rejects even that, compaction
+        # genuinely cannot reduce further — report no progress instead of
+        # crashing the turn with an unhandled overflow.
+        return False
+    # The compaction summary is a real (token-billed) LLM call — count it in the
+    # session's usage stats too, with zero tool calls.
+    session.record_llm_call(response.prompt_tokens, response.completion_tokens, 0)
     summary_text = (response.text or "").strip()
 
     # A blank summary (e.g. a reasoning model that emitted only hidden reasoning

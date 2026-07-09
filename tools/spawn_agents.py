@@ -23,7 +23,7 @@ from tools.result import ToolResult
 _MAX_DEPTH = 2
 
 _DEFAULT_MAX_CONCURRENT = 4
-_DEFAULT_TIMEOUT_S = 600
+_DEFAULT_TIMEOUT_S = 3600
 
 # Per-child answer cap and stderr-tail line count, kept consistent with the
 # truncation conventions used elsewhere (web_read's max_chars, run_command's

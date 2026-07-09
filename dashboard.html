@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Agent Telemetry Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2128;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --accent-2: #3fb950;
+    --warn: #d29922;
+    --danger: #f85149;
+    --in: #1f6feb;
+    --out: #238636;
+    --radius: 10px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: var(--sans); font-size: 14px; line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 28px 24px 64px; }
+
+  header.top {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 16px; flex-wrap: wrap; margin-bottom: 22px;
+  }
+  header.top h1 { font-size: 20px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  header.top .sub { color: var(--muted); font-size: 13px; margin-top: 4px; font-family: var(--mono); }
+  .badge {
+    display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 99px;
+    background: #d2992222; color: var(--warn); font-size: 11px; font-weight: 600; vertical-align: middle;
+  }
+
+  /* segmented window control */
+  .seg { display: inline-flex; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 3px; gap: 3px; }
+  .seg button {
+    appearance: none; border: none; background: transparent; color: var(--muted);
+    padding: 7px 16px; border-radius: 7px; cursor: pointer; font-size: 13px; font-family: var(--sans);
+    font-weight: 600; transition: background .15s, color .15s;
+  }
+  .seg button:hover { color: var(--text); }
+  .seg button.active { background: var(--accent); color: #0d1117; }
+
+  /* KPI cards */
+  .kpis { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 22px; }
+  .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 15px; }
+  .kpi .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .kpi .val { font-size: 22px; font-weight: 680; margin-top: 6px; font-family: var(--mono); letter-spacing: -0.02em; }
+  .kpi .sub { color: var(--muted); font-size: 11px; margin-top: 3px; font-family: var(--mono); }
+  .kpi.accent .val { color: var(--accent); }
+  .kpi.green .val { color: var(--accent-2); }
+  .kpi.warn .val { color: var(--warn); }
+
+  /* panels */
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 22px; }
+  .panel > .head { padding: 13px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .panel > .head h2 { margin: 0; font-size: 14px; font-weight: 650; }
+  .panel > .head .hint { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  .panel > .body { padding: 16px; }
+
+  /* chart */
+  .chart-wrap { position: relative; }
+  canvas { display: block; width: 100%; height: 280px; }
+  .legend { display: flex; gap: 18px; align-items: center; color: var(--muted); font-size: 12px; }
+  .legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+  .ttip {
+    position: absolute; pointer-events: none; background: #010409; border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 11px; font-size: 12px; font-family: var(--mono); color: var(--text);
+    box-shadow: 0 8px 24px rgba(0,0,0,.5); display: none; z-index: 5; white-space: nowrap;
+  }
+  .ttip .t-id { color: var(--accent); margin-bottom: 4px; }
+  .ttip .t-row { display: flex; justify-content: space-between; gap: 16px; }
+
+  /* table */
+  .table-scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th {
+    text-align: left; padding: 10px 14px; color: var(--muted); font-size: 11px;
+    text-transform: uppercase; letter-spacing: .04em; border-bottom: 1px solid var(--border);
+    cursor: pointer; user-select: none; white-space: nowrap; position: sticky; top: 0; background: var(--panel);
+  }
+  thead th:hover { color: var(--text); }
+  thead th .arr { opacity: .5; margin-left: 4px; font-size: 10px; }
+  thead th.sorted .arr { opacity: 1; color: var(--accent); }
+  tbody td { padding: 9px 14px; border-bottom: 1px solid #21262d; font-family: var(--mono); white-space: nowrap; }
+  tbody tr:hover { background: #1c2128; }
+  tbody td.num { text-align: right; }
+  tbody tr.empty-bucket { color: #6e7681; }
+  tbody tr.empty-bucket td { opacity: .55; }
+  tbody tr.totals td { background: var(--panel-2); font-weight: 700; border-top: 2px solid var(--border); border-bottom: none; }
+  tbody tr.totals td:first-child { color: var(--text); }
+
+  .empty { text-align: center; padding: 48px 16px; color: var(--muted); }
+
+  @media (max-width: 1100px) { .kpis { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 640px) { .kpis { grid-template-columns: repeat(2, 1fr); } header.top { flex-direction: column; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>Agent Telemetry Dashboard</h1>
+      <div class="sub" id="sub">Loading…</div>
+    </div>
+    <div class="seg" id="seg" role="tablist" aria-label="Time window">
+      <button data-mode="day">Day</button>
+      <button data-mode="week" class="active">Week</button>
+      <button data-mode="month">Month</button>
+    </div>
+  </header>
+
+  <div id="kpiHost" class="kpis"></div>
+
+  <div class="panel">
+    <div class="head">
+      <h2 id="chartTitle">Token consumption</h2>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--in)"></span>Input</span>
+        <span><span class="sw" style="background:var(--out)"></span>Output</span>
+        <span id="chartNote" class="hint"></span>
+      </div>
+    </div>
+    <div class="body chart-wrap">
+      <canvas id="chart"></canvas>
+      <div class="ttip" id="ttip"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Loaded as a <script src> (not fetch) so it works on file:// — browsers
+     block fetch() from file:// origins (CORS) but happily load classic script
+     subresources, exactly like a static .js/.css. The agent regenerates this
+     file next to stats.json after every run, so a browser refresh always picks
+     up the latest data with no server required. -->
+<script src="stats.js"></script>
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+
+/* window.STATS_DATA is populated by stats.js above. The EMBEDDED_RAW snapshot
+   below is only a last-resort fallback if stats.js is absent (e.g. a fresh
+   checkout before any run), so the page is never empty. */
+const EMBEDDED_RAW = [
+  {"session_id": "2026-07-07T22-31-47-52129", "run_time": 219.563, "tool_calls": 0, "input": 1645, "output": 46},
+  {"session_id": "2026-07-07T22-46-34-62978", "run_time": 453.092, "tool_calls": 8, "input": 10117, "output": 363},
+  {"session_id": "2026-07-07T23-00-57-72875", "run_time": 1140.162, "tool_calls": 15, "input": 92204, "output": 8452},
+  {"session_id": "2026-07-07T23-01-00-72898", "run_time": 990.258, "tool_calls": 19, "input": 168033, "output": 15575},
+  {"session_id": "2026-07-07T23-01-02-73035", "run_time": 32.57, "tool_calls": 0, "input": 3482, "output": 118},
+  {"session_id": "2026-07-07T23-02-54-74471", "run_time": 868.218, "tool_calls": 15, "input": 27068, "output": 684},
+  {"session_id": "2026-07-08T00-09-55-23212", "run_time": 129.066, "tool_calls": 15, "input": 101924, "output": 926},
+  {"session_id": "2026-07-08T00-09-58-23238", "run_time": 109.025, "tool_calls": 17, "input": 45343, "output": 745},
+  {"session_id": "2026-07-08T01-13-44-75897", "run_time": 62.228, "tool_calls": 20, "input": 82110, "output": 5832},
+  {"session_id": "2026-07-08T01-25-45-84252", "run_time": 377.006, "tool_calls": 37, "input": 225022, "output": 8157},
+  {"session_id": "2026-07-08T01-33-14-89463", "run_time": 65.464, "tool_calls": 24, "input": 80140, "output": 5115},
+  {"session_id": "2026-07-08T01-35-02-90738", "run_time": 138.988, "tool_calls": 41, "input": 285969, "output": 9383},
+  {"session_id": "2026-07-08T09-35-39-11069", "run_time": 2.93, "tool_calls": 0, "input": 1638, "output": 30},
+  {"session_id": "2026-07-08T09-54-24-23581", "run_time": 1078.125, "tool_calls": 55, "input": 759547, "output": 40497},
+  {"session_id": "2026-07-08T09-54-28-23629", "run_time": 2272.641, "tool_calls": 111, "input": 2971708, "output": 84479},
+  {"session_id": "2026-07-08T09-54-35-23762", "run_time": 463.342, "tool_calls": 68, "input": 990667, "output": 15413},
+  {"session_id": "2026-07-08T09-54-27-23607", "run_time": 2839.092, "tool_calls": 45, "input": 889016, "output": 112588},
+  {"session_id": "2026-07-08T10-47-30-59864", "run_time": 247.659, "tool_calls": 8, "input": 89171, "output": 8476},
+  {"session_id": "2026-07-08T10-48-25-60550", "run_time": 102.15, "tool_calls": 13, "input": 149595, "output": 2249},
+  {"session_id": "2026-07-08T10-48-25-60548", "run_time": 111.758, "tool_calls": 23, "input": 123447, "output": 2486},
+  {"session_id": "2026-07-08T10-48-25-60551", "run_time": 112.884, "tool_calls": 15, "input": 88280, "output": 2588},
+  {"session_id": "2026-07-08T10-48-25-60549", "run_time": 112.985, "tool_calls": 14, "input": 85946, "output": 2590},
+  {"session_id": "2026-07-08T10-50-07-61755", "run_time": 46.104, "tool_calls": 15, "input": 85027, "output": 3111},
+  {"session_id": "2026-07-08T11-29-00-88374", "run_time": 11.895, "tool_calls": 6, "input": 5795, "output": 575},
+  {"session_id": "2026-07-08T11-29-28-88754", "run_time": 237.812, "tool_calls": 55, "input": 950668, "output": 16924},
+  {"session_id": "2026-07-08T12-47-59-41810", "run_time": 269.291, "tool_calls": 79, "input": 1112034, "output": 18834}
+];
+
+let RAW = [];
+let MODE = "week";                 // day | week | month
+
+/* ---------- data loading ---------- */
+
+function parseSessionDate(id) {
+  const m = id.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d+)$/);
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s, frac] = m;
+  const ms = frac.padEnd(3, "0").slice(0, 3);
+  return new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s), Number(ms));
+}
+
+function normalize(rows) {
+  return rows
+    .map((r) => {
+      const start = parseSessionDate(r.session_id);
+      const input = +r.input || 0, output = +r.output || 0;
+      const run = +r.run_time || 0, tools = +r.tool_calls || 0;
+      return start ? {
+        session_id: r.session_id, start,
+        run_time: run, tool_calls: tools, input, output,
+        total_tokens: input + output,
+      } : null;
+    })
+    .filter(Boolean);
+}
+
+function ingest(rows, live) {
+  RAW = normalize(rows);
+  if (!RAW.length) { $("sub").innerHTML = "No sessions found in stats.json."; render(); return; }
+  const first = RAW.reduce((a, b) => (a.start < b.start ? a : b)).start;
+  const last = RAW.reduce((a, b) => (a.start > b.start ? a : b)).start;
+  $("sub").innerHTML =
+    `${RAW.length} sessions · ${fmtDate(first)} → ${fmtDate(last)}` +
+    (live ? "" : ` <span class="badge">snapshot</span>`);
+  render();
+}
+
+function load() {
+  const live = typeof window.STATS_DATA !== "undefined";
+  ingest(live ? window.STATS_DATA : EMBEDDED_RAW, live);
+}
+
+/* ---------- aggregation ---------- */
+
+const HOUR = 3600 * 1000, DAY = 24 * HOUR;
+
+function startOfDay(d) { return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+function floorHour(d) { return new Date(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours()); }
+function floorDay(d)  { return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+
+// Calendar-anchored windows pinned to the most recent active day, so switching
+// the filter actually changes scope: Day = that one day (hourly), Week = last
+// 7 days (daily), Month = last 30 days (daily).
+function aggregate(mode) {
+  if (!RAW.length) return { buckets: [], sessions: 0, aggLabel: "" };
+  const latest = RAW.reduce((a, b) => (a.start > b.start ? a : b)).start;
+  const latestDay = startOfDay(latest);
+  const isHour = mode === "day";
+  const aggLabel = isHour ? "hour" : "day";
+  const floor = isHour ? floorHour : floorDay;
+  const labelFn = isHour ? lblHour : lblDay;
+  const step = isHour ? HOUR : DAY;
+
+  function mk(key) {
+    return { key, label: labelFn(new Date(key)), sessions: 0, run_time: 0, tool_calls: 0, input: 0, output: 0, total_tokens: 0 };
+  }
+
+  const buckets = [];
+  if (isHour) {
+    for (let h = 0; h < 24; h++) buckets.push(mk(latestDay.getTime() + h * HOUR));
+  } else {
+    const days = mode === "week" ? 7 : 30;
+    for (let i = days - 1; i >= 0; i--) {
+      const t = new Date(latestDay);
+      t.setDate(t.getDate() - i);
+      buckets.push(mk(t.getTime()));
+    }
+  }
+
+  const winStart = buckets[0].key;
+  const winEnd = buckets[buckets.length - 1].key + step - 1;
+  const index = new Map(buckets.map((b, i) => [b.key, i]));
+
+  let inWindow = 0;
+  for (const r of RAW) {
+    const ms = r.start.getTime();
+    if (ms < winStart || ms > winEnd) continue;
+    inWindow++;
+    const bi = index.get(floor(r.start).getTime());
+    if (bi !== undefined) {
+      const b = buckets[bi];
+      b.sessions++; b.run_time += r.run_time; b.tool_calls += r.tool_calls;
+      b.input += r.input; b.output += r.output; b.total_tokens += r.total_tokens;
+    }
+  }
+  return { buckets, sessions: inWindow, aggLabel };
+}
+
+/* ---------- formatting ---------- */
+
+function fmtInt(n) { return n.toLocaleString("en-US"); }
+function fmtSecs(s) {
+  if (s < 60) return s.toFixed(1) + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m " + Math.round(s % 60) + "s";
+  return Math.floor(s / 3600) + "h " + Math.round((s % 3600) / 60) + "m";
+}
+function fmtDate(d) {
+  return d.toLocaleString("en-GB", { year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+function lblHour(d) { return d.toLocaleString("en-GB", { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }); }
+function lblDay(d)  { return d.toLocaleString("en-GB", { weekday: "short", month: "short", day: "2-digit" }); }
+function fmtCompact(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return String(Math.round(n));
+}
+
+/* ---------- KPIs ---------- */
+
+function sum(arr, k) { return arr.reduce((a, r) => a + r[k], 0); }
+
+function renderKpis(agg) {
+  const n = agg.sessions;
+  const totIn = sum(agg.buckets, "input");
+  const totOut = sum(agg.buckets, "output");
+  const totRun = sum(agg.buckets, "run_time");
+  const totTools = sum(agg.buckets, "tool_calls");
+  const peak = agg.buckets.length ? Math.max(...agg.buckets.map((b) => b.total_tokens)) : 0;
+  const activeBuckets = agg.buckets.filter((b) => b.sessions > 0).length;
+
+  const cards = [
+    { label: "Sessions", val: fmtInt(n), sub: `across ${activeBuckets} ${agg.aggLabel}${activeBuckets === 1 ? "" : "s"}`, cls: "" },
+    { label: "Input tokens", val: fmtCompact(totIn), sub: fmtInt(totIn), cls: "accent" },
+    { label: "Output tokens", val: fmtCompact(totOut), sub: fmtInt(totOut), cls: "green" },
+    { label: "Runtime", val: fmtSecs(totRun), sub: n ? fmtSecs(totRun / n) + "/sess" : "—", cls: "" },
+    { label: "Tool calls", val: fmtInt(totTools), sub: n ? (totTools / n).toFixed(1) + "/sess" : "—", cls: "warn" },
+    { label: "Total tokens", val: fmtCompact(totIn + totOut), sub: "peak " + agg.aggLabel + " " + fmtCompact(peak), cls: "" },
+  ];
+  $("kpiHost").innerHTML = cards.map((c) =>
+    `<div class="kpi ${c.cls}"><div class="label">${c.label}</div><div class="val">${c.val}</div><div class="sub">${c.sub}</div></div>`
+  ).join("");
+}
+
+/* ---------- chart ---------- */
+
+let CHART = { bars: [] };
+
+function drawChart(agg) {
+  const cv = $("chart");
+  const ctx = cv.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const buckets = agg.buckets;
+  $("chartNote").textContent = buckets.length ? `aggregated by ${agg.aggLabel}` : "";
+
+  if (!buckets.length) {
+    ctx.fillStyle = "#8b949e"; ctx.font = "13px " + MONO;
+    ctx.textAlign = "center";
+    ctx.fillText("No data", W / 2, H / 2);
+    CHART.bars = [];
+    return;
+  }
+
+  const padL = 56, padR = 14, padT = 14, padB = 40;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const maxVal = Math.max(1, ...buckets.map((b) => b.total_tokens));
+  const niceMax = niceCeil(maxVal);
+
+  // grid + y labels
+  ctx.strokeStyle = "#21262d"; ctx.fillStyle = "#8b949e";
+  ctx.font = "11px " + MONO; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  const steps = 4;
+  for (let i = 0; i <= steps; i++) {
+    const y = padT + (plotH * i) / steps;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.fillText(fmtCompact(niceMax - (niceMax * i) / steps), padL - 8, y);
+  }
+
+  // bars
+  const n = buckets.length;
+  const slot = plotW / n;
+  const bw = Math.max(2, Math.min(40, slot * 0.72));
+  const x0 = padL + slot / 2;
+  CHART.bars = [];
+  buckets.forEach((b, i) => {
+    const cx = x0 + i * slot, x = cx - bw / 2;
+    const inH = (b.input / niceMax) * plotH;
+    const outH = (b.output / niceMax) * plotH;
+    const yBase = padT + plotH;
+    ctx.fillStyle = b.sessions ? "#1f6feb" : "#1f6feb33";
+    ctx.fillRect(x, yBase - inH, bw, inH);
+    ctx.fillStyle = b.sessions ? "#238636" : "#23863633";
+    ctx.fillRect(x, yBase - inH - outH, bw, outH);
+    CHART.bars.push({ b, x, w: bw });
+  });
+
+  // sparse x-axis labels (~5 evenly spaced)
+  ctx.fillStyle = "#8b949e"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+  const labelCount = Math.min(5, n);
+  for (let j = 0; j < labelCount; j++) {
+    const idx = labelCount === 1 ? 0 : Math.round((j * (n - 1)) / (labelCount - 1));
+    ctx.fillText(buckets[idx].label, x0 + idx * slot, padT + plotH + 9);
+  }
+}
+const MONO = "ui-monospace, SFMono-Regular, Menlo, monospace";
+function niceCeil(v) {
+  if (v <= 0) return 1;
+  const exp = Math.floor(Math.log10(v));
+  const base = Math.pow(10, exp);
+  const f = v / base;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * base;
+}
+
+const ttip = $("ttip");
+$("chart").addEventListener("mousemove", (e) => {
+  const rect = e.currentTarget.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  const idx = CHART.bars.findIndex((b) => x >= b.x && x <= b.x + b.w);
+  if (idx === -1) { ttip.style.display = "none"; return; }
+  const b = CHART.bars[idx].b;
+  ttip.style.display = "block";
+  ttip.innerHTML =
+    `<div class="t-id">${b.label}</div>` +
+    `<div class="t-row"><span>Sessions</span><span>${fmtInt(b.sessions)}</span></div>` +
+    `<div class="t-row"><span>Input</span><span>${fmtInt(b.input)}</span></div>` +
+    `<div class="t-row"><span>Output</span><span>${fmtInt(b.output)}</span></div>` +
+    `<div class="t-row"><span>Tools</span><span>${fmtInt(b.tool_calls)}</span></div>` +
+    `<div class="t-row"><span>Runtime</span><span>${fmtSecs(b.run_time)}</span></div>`;
+  let tx = x + 14, ty = y + 14;
+  if (tx + ttip.offsetWidth > rect.width) tx = x - ttip.offsetWidth - 14;
+  if (ty + ttip.offsetHeight > rect.height) ty = rect.height - ttip.offsetHeight - 4;
+  ttip.style.left = tx + "px"; ttip.style.top = Math.max(4, ty) + "px";
+});
+$("chart").addEventListener("mouseleave", () => { ttip.style.display = "none"; });
+window.addEventListener("resize", () => { if (RAW.length) drawChart(aggregate(MODE)); });
+
+/* ---------- mode control ---------- */
+
+$("seg").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-mode]");
+  if (!btn) return;
+  MODE = btn.dataset.mode;
+  $("seg").querySelectorAll("button").forEach((b) => b.classList.toggle("active", b === btn));
+  render();
+});
+
+function render() {
+  const agg = aggregate(MODE);
+  const title = MODE === "day" ? "latest day" : MODE === "week" ? "last 7 days" : "last 30 days";
+  $("chartTitle").textContent = `Token consumption · ${title}`;
+  renderKpis(agg);
+  drawChart(agg);
+}
+
+load();
+</script>
+</body>
+</html>

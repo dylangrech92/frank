@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .coding_agent/
 .idea/
+stats.json
+stats.js

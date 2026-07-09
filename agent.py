@@ -556,17 +556,23 @@ def handle_user_message(
           exceeded the model limit; return that same text (turn ends without retry).
           *A later phase replaces this behaviour with compact-then-retry.*
        e. **normal success** — append_assistant(text, tool_calls), then:
-          i.  If no tool calls and files were mutated this turn with no
-              successful run_tests/run_command since → bounce once (S3 hard
-              verify gate, upgrading H1's nudge): inject a synthetic user
-              steer and loop again instead of returning. A second such
-              final answer is accepted, but the *returned* text (not the
-              transcript) is prefixed with "[UNVERIFIED CHANGES] " unless the
-              model's own text already says "unverified".
-          ii. If no tool calls (and the gate above doesn't bounce) →
-              consolidation_maybe_extract(session) + return response.text (or the
-              gate-marked variant).
-          iii. For each tool call:
+           i.  If no tool calls and the assistant produced no text at all (a
+               local-model bare-stop failure mode) → bounce once: inject a
+               synthetic user steer and loop again. A second empty turn is
+               surfaced via a transparent "(no response from model)"
+               placeholder at the return site (ii) so REPL mode never leaves
+               the user at a blank prompt.
+           ii. If no tool calls and files were mutated this turn with no
+               successful run_tests/run_command since → bounce once (S3 hard
+               verify gate, upgrading H1's nudge): inject a synthetic user
+               steer and loop again instead of returning. A second such
+               final answer is accepted, but the *returned* text (not the
+               transcript) is prefixed with "[UNVERIFIED CHANGES] " unless the
+               model's own text already says "unverified".
+           iii. If no tool calls (and the gates above don't bounce) →
+                consolidation_maybe_extract(session) + return response.text (or the
+                gate-marked / empty-placeholder variant).
+           iv. For each tool call:
               - echo to stderr the call name and arguments.
               - dispatch via registry (dispatch(name, arguments)).
               - echo rendered result to stderr via render_tool_result().
@@ -643,6 +649,14 @@ def handle_user_message(
     # once per turn via verification_nudge_fired.
     needs_verification = False
     verification_nudge_fired = False
+
+    # Per-turn (reset on every handle_user_message call) flag for the
+    # empty-answer retry: the model returned no text and no tool calls (a
+    # common local-model failure mode — a bare stop token after consuming
+    # tool results). Fires at most once per turn via
+    # empty_answer_nudge_fired; a second empty turn falls through to a
+    # transparent placeholder at the return site.
+    empty_answer_nudge_fired = False
 
     # Per-turn (reset on every handle_user_message call) state for the
     # graph-memory usage nudge (H5): every distinct path touched by a mutation
@@ -790,6 +804,14 @@ def handle_user_message(
                 (turn_report["usage"]["completion_tokens"] or 0) + response.completion_tokens
             )
 
+        # Usage stats: fold this LLM call into the session's cumulative
+        # stats.json row (run time, tool-call count, token totals).
+        session.record_llm_call(
+            response.prompt_tokens,
+            response.completion_tokens,
+            len(response.tool_calls),
+        )
+
         tool_calls: list[ToolCall] | None = (
             response.tool_calls if response.tool_calls else None
         )
@@ -820,6 +842,32 @@ def handle_user_message(
         session.append_assistant(response.text or "", tool_calls=tool_calls)
 
         if not response.tool_calls:
+            # Empty-answer retry: the model ended the turn with no text and no
+            # tool calls — a common local-model failure mode (a bare stop token
+            # after consuming tool results) that REPL mode would silently
+            # swallow: it discards the return value and only on_delta delivers
+            # output, so an empty return leaves the user at a blank prompt with
+            # the tool calls having visibly run. Inject a synthetic user-role
+            # steer and loop once more rather than re-rolling the identical
+            # request (which risks a deterministic re-collapse). Bounded to a
+            # single retry per turn; a second empty turn is surfaced via the
+            # transparent placeholder at the return site below. Same user-role
+            # steer justification as the verification nudge (session.py has no
+            # mid-transcript system-role append; a fabricated tool-role message
+            # here would not follow a matching assistant tool_calls entry).
+            if not (response.text or "").strip() and not empty_answer_nudge_fired:
+                empty_answer_nudge_fired = True
+                print(
+                    ui.telemetry("empty-answer-nudge: fired (empty assistant turn)"),
+                    file=sys.stderr,
+                )
+                session.append_user(
+                    "You produced no answer this turn. Respond now with a concise "
+                    "summary of what you did or found, grounded in the tool results "
+                    "above. Do not call more tools unless a result is genuinely missing."
+                )
+                continue
+
             # H1 — post-mutation verification nudge: the model is about to end
             # the turn having mutated files without running anything to verify
             # the change. Inject a synthetic user-role steer (see module docs
@@ -872,6 +920,25 @@ def handle_user_message(
                         file=sys.stderr,
                     )
             turn_report["verified"] = bool(mutated_paths) and not needs_verification
+
+            # Empty-answer placeholder: if the model returned no text at all
+            # (the retry above already fired once and still came back empty),
+            # surface a transparent placeholder. Layered onto the return value
+            # / on_delta payload ONLY — the transcript (append_assistant above)
+            # and turn_report["answer"] already hold the real empty string as
+            # the source of truth. Uses the original response.text (not the
+            # possibly-prefixed final_text) so it overrides a vacuous
+            # "[UNVERIFIED CHANGES] " prefix too. REPL mode discards the return
+            # value and only on_delta delivers output, so without this the user
+            # sees the tool calls run followed by a blank prompt.
+            if not (response.text or "").strip():
+                final_text = "(no response from model)"
+                print(
+                    ui.telemetry(
+                        "empty-answer: no text after retry — surfacing placeholder"
+                    ),
+                    file=sys.stderr,
+                )
 
             if on_delta is not None and final_text:
                 if streamed == 0:
