@@ -21,7 +21,9 @@ class FindSymbol(Tool):
     summary = 'Fuzzy-search symbols by name across the workspace.'
     description = (
         'Fuzzy-search symbols by name across the whole workspace (like an IDE\'s '
-        'ctrl+T). Searches all open documents in all language servers.'
+        'ctrl+T). Searches all open documents in all language servers. Prefer this '
+        'over paging through large files with read_file when you know the name you '
+        'are looking for.'
     )
     parameters: dict[str, Any] = {
         'type': 'object',

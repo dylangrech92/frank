@@ -26,7 +26,7 @@ class ReadFile(Tool):
         'The path must be relative to the project root.'
     )
     action = 'read the file'
-    oversize_hint = 'use start_line/end_line to read a smaller range'
+    oversize_hint = 'use start_line/end_line for a smaller range, or find_symbol to jump to the symbol first'
     alternative = 'list_files to check the path exists'
     parallel_safe = True  # pure filesystem read
     parameters: dict[str, Any] = {
@@ -86,9 +86,10 @@ class ReadFile(Tool):
                 lines_count = len(content.splitlines())
                 return ToolResult.err(
                     f'{raw_path} is too large ({len(content)} characters, {lines_count} '
-                    'lines). Please call read_file with start_line and end_line to page through it.',
+                    'lines). Use find_symbol to jump to the relevant symbol, then '
+                    'read_file with start_line and end_line for just that range.',
                     code='file-too-large',
-                    hint='Call read_file again with start_line and end_line to page through the file.',
+                    hint='Use find_symbol to locate the symbol, then read_file with start_line/end_line for its range.',
                 )
 
             # Content fits without paging — return full file
@@ -151,11 +152,11 @@ class ReadFile(Tool):
         returned = '\n'.join(sliced)
         MAX_CHARACTERS = 50000
         if len(returned) > MAX_CHARACTERS:
-            return ToolResult.err(
-                f'{raw_path} is too large ({len(returned)} characters for the requested line range). '
-                'Please request a narrower line range.',
-                code='file-too-large',
-                hint='Call read_file again with a narrower start_line and end_line range.',
-            )
+                return ToolResult.err(
+                    f'{raw_path} is too large ({len(returned)} characters for the requested line range). '
+                    'Use find_symbol to jump to the relevant symbol and request a narrower range.',
+                    code='file-too-large',
+                    hint='Use find_symbol to locate the symbol, then read_file with a narrower start_line/end_line range.',
+                )
         record_read(resolved)
         return ToolResult.ok(returned, total_lines=total_lines, returned_lines=len(sliced))
