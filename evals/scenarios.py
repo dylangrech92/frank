@@ -245,6 +245,26 @@ SCENARIOS: list[dict] = [
         ),
         "inline": "inline_loop_guard.py",
     },
+    {
+        "name": "repeat_call_guard",
+        "description": (
+            "Dispatch-level check (no LLM): the success-path loop-guard "
+            "steer is absent on the first identical successful call and "
+            "present on the second; errors are not double-steered; the "
+            "hard-cap constant and run_command/run_tests exemption are set."
+        ),
+        "inline": "repeat_call_guard.py",
+    },
+    {
+        "name": "verify_scratch_contract",
+        "description": (
+            "Dispatch-level check (no LLM): verify_scratch honors its full "
+            "contract with real subprocesses — pass/fail exit codes, "
+            "invalid-interpreter rejected with zero side effects, cwd is the "
+            "real project root, and the temp file never leaks."
+        ),
+        "inline": "verify_scratch_contract.py",
+    },
 ]
 
 

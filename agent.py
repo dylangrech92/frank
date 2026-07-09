@@ -340,6 +340,90 @@ def _loop_guard_check(
     return rendered + steer
 
 
+# Hard cap on identical tool calls within a single turn. A model stuck
+# re-issuing the exact same successful no-op (e.g. replace_one with search ==
+# replace) would otherwise spin forever: the success-path steer below nudges
+# first, and once this many identical (name, arguments) pairs have been
+# dispatched, the call is refused at dispatch time (see handle_user_message).
+# Verification tools (run_command / run_tests / verify_scratch) are exempt —
+# repeating an identical build/test inside an edit→verify→edit cycle is legitimate.
+_REPEAT_CALL_CAP = 3
+_REPEAT_CAP_EXEMPT = frozenset({"run_command", "run_tests", "verify_scratch"})
+
+
+def _call_signature(arguments: dict) -> str:
+    """Return a stable, hashable signature for a tool call's arguments.
+
+    JSON with sorted keys gives a deterministic string for dict arguments
+    regardless of insertion order; ``default=str`` keeps non-serialisable
+    values from blowing up. Falls back to ``str(arguments)`` on any encoding
+    error so counting never raises.
+    """
+    try:
+        return json.dumps(arguments, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(arguments)
+
+
+def _repeat_call_check(
+    name: str,
+    arguments: dict,
+    result: ToolResult,
+    rendered: str,
+    seen_calls: dict[tuple[str, str], int],
+) -> str:
+    """Append a steer suffix when the same (tool, arguments) succeeds repeatedly.
+
+    Companion to ``_loop_guard_check``: that function owns repeated identical
+    *failures* (keyed on the rendered error envelope, which a cooperative model
+    rarely produces twice — see evals/inline_loop_guard.py); this one owns
+    repeated identical *successes* — the no-op loop where a model re-issues the
+    exact same successful call (e.g. ``replace_one`` with search == replace, or
+    the same ``read_file`` twice) over and over, making no progress. Only
+    success results are steered here; errors are left to ``_loop_guard_check``
+    to avoid double-suffixing.
+
+    The count this maintains is also read pre-dispatch by the hard-cap block in
+    ``handle_user_message`` to *refuse* an identical call once it has repeated
+    ``_REPEAT_CALL_CAP`` times — a steer alone does not reliably break a
+    determined loop (the failure-path steer is known not to fire live), so the
+    cap guarantees termination.
+
+    Args:
+        name: Registered tool name.
+        arguments: The call's parsed arguments.
+        result: The dispatched ToolResult (used to skip the success steer on
+            errors, which ``_loop_guard_check`` owns).
+        rendered: The rendered result text for this call.
+        seen_calls: Per-turn counting dict keyed by ``(name, signature)``,
+            mutated in place. Incremented for *every* call (success or error)
+            so the pre-dispatch hard cap sees an accurate tally.
+
+    Returns:
+        *rendered* unchanged, or *rendered* with a ``[loop-guard]`` suffix
+        appended when this exact (name, arguments) pair has now been seen two
+        or more times this turn as a success.
+    """
+    key = (name, _call_signature(arguments))
+    seen_calls[key] = seen_calls.get(key, 0) + 1
+
+    # Errors are owned by _loop_guard_check; don't double-steer.
+    if result.status != "success":
+        return rendered
+
+    if seen_calls[key] < 2:
+        return rendered
+
+    steer = (
+        f"\n\n[loop-guard] {name} was just called with these exact arguments "
+        f"and succeeded. Repeating the identical successful call makes no "
+        f"progress. Do not re-issue it. If the result was not what you needed, "
+        f"change your arguments or approach; otherwise move on or tell the "
+        f"user you are done."
+    )
+    return rendered + steer
+
+
 # Write tools that mutate exactly the file named by their own `path` argument
 # (as opposed to e.g. `replace_many`, which can touch an unbounded, only-known-
 # after-the-fact set of paths, or `move_file`, whose mutation event fires on
@@ -563,7 +647,7 @@ def handle_user_message(
                placeholder at the return site (ii) so REPL mode never leaves
                the user at a blank prompt.
            ii. If no tool calls and files were mutated this turn with no
-               successful run_tests/run_command since → bounce once (S3 hard
+               successful run_tests/run_command/verify_scratch since → bounce once (S3 hard
                verify gate, upgrading H1's nudge): inject a synthetic user
                steer and loop again instead of returning. A second such
                final answer is accepted, but the *returned* text (not the
@@ -637,6 +721,11 @@ def handle_user_message(
     # Per-turn (reset on every handle_user_message call) tracking of rendered
     # error envelopes seen so far, for the repeated-identical-failure loop-guard.
     seen_errors: dict[tuple[str, str], int] = {}
+    # Per-turn (reset on every handle_user_message call) count of identical
+    # (tool, arguments) pairs dispatched so far, for the repeated-successful-
+    # call loop-guard: a steer (via _repeat_call_check) plus a hard dispatch
+    # cap (in the sequential dispatch branch). Keyed by (name, arg-signature).
+    seen_calls: dict[tuple[str, str], int] = {}
     # Per-turn (reset on every handle_user_message call) count of consecutive
     # successful web_search calls since the last web_read, for the reactive
     # web-search focus nudge.
@@ -644,8 +733,9 @@ def handle_user_message(
 
     # Per-turn (reset on every handle_user_message call) state for the
     # post-mutation verification nudge (H1): True once a file was created,
-    # changed, or renamed without a subsequent successful run_tests/run_command
-    # call; cleared the moment such a verification call succeeds. Fires at most
+    # changed, or renamed without a subsequent successful
+    # run_tests/run_command/verify_scratch call; cleared the moment such a
+    # verification call succeeds. Fires at most
     # once per turn via verification_nudge_fired.
     needs_verification = False
     verification_nudge_fired = False
@@ -884,17 +974,21 @@ def handle_user_message(
                 )
                 session.append_user(
                     "You modified files this turn but ran nothing to verify the "
-                    "change. Run the relevant tests or code now, or state "
-                    "explicitly in your answer that the change is unverified. "
-                    "Either way, end your answer with a one-line verification "
-                    "breakdown: what you checked (tests, commands, diagnostics) "
-                    "and what it showed."
+                    "change. Verify it now with verify_scratch (a throwaway "
+                    "snippet, no file pollution), run_tests, or run_command "
+                    "against a separate script — never by adding repro/test code "
+                    "to a production file or repurposing its "
+                    "`if __name__ == \"__main__\"` block. Or state explicitly in "
+                    "your answer that the change is unverified. Either way, end "
+                    "your answer with a one-line verification breakdown: what "
+                    "you checked (tests, commands, diagnostics) and what it "
+                    "showed."
                 )
                 continue
 
             # S3 — hard verify gate: this is the SECOND final answer of the
             # turn (the bounce above already fired once and needs_verification
-            # is still set — a run_tests/run_command call never succeeded in
+            # is still set — a run_tests/run_command/verify_scratch call never succeeded in
             # between). Accept it, but mark it: prefix the *returned* text with
             # a harness-side "[UNVERIFIED CHANGES] " so the caller sees the
             # state, unless the model already declared the change unverified
@@ -992,7 +1086,35 @@ def handle_user_message(
                 # single-path write tools in _LINT_TRACKED_TOOLS; None means
                 # "nothing to compare against", so no delta is ever appended).
                 lint_pre = _lint_pre_snapshot(call, str(session.project_root))
-                result = dispatch(call.name, call.arguments)
+                # Loop-guard hard cap: refuse an identical call once it has
+                # repeated _REPEAT_CALL_CAP times this turn (verification tools
+                # exempt — a rebuild/retest cycle legitimately repeats). The
+                # count is maintained post-render by _repeat_call_check; here
+                # we read the tally of *previous* identical calls and block
+                # before dispatching, guaranteeing a stuck no-op loop ends.
+                _repeat_key = (call.name, _call_signature(call.arguments))
+                _repeat_n = seen_calls.get(_repeat_key, 0)
+                if (
+                    call.name not in _REPEAT_CAP_EXEMPT
+                    and _repeat_n >= _REPEAT_CALL_CAP
+                ):
+                    result = ToolResult.err(
+                        f"{call.name} has already been called {_repeat_n} "
+                        f"times this turn with identical arguments. Repeating "
+                        f"it makes no progress — the call is blocked. Change "
+                        f"your arguments or approach, or stop and report what "
+                        f"you have.",
+                        code="loop-guard-blocked",
+                    )
+                    print(
+                        ui.telemetry(
+                            f"loop-guard: blocked repeated {call.name} "
+                            f"(#{_repeat_n + 1} identical this turn)"
+                        ),
+                        file=sys.stderr,
+                    )
+                else:
+                    result = dispatch(call.name, call.arguments)
                 new_events = _TURN_MUTATIONS[pre_mutation_len:]
                 if new_events:
                     any_relevant, new_paths = _scan_new_mutations(new_events)
@@ -1022,7 +1144,7 @@ def handle_user_message(
                                 lint_pre, call, str(session.project_root)
                             )
 
-            if call.name in ("run_tests", "run_command"):
+            if call.name in ("run_tests", "run_command", "verify_scratch"):
                 if call.name == "run_command":
                     detail = str(call.arguments.get("cmd", ""))
                 else:
@@ -1038,6 +1160,9 @@ def handle_user_message(
             rendered = render_tool_result(call.name, result)
             result, rendered = _guard_oversize_result(call.name, result, rendered, cap, est)
             rendered = _loop_guard_check(call.name, rendered, seen_errors)
+            rendered = _repeat_call_check(
+                call.name, call.arguments, result, rendered, seen_calls
+            )
             rendered, searches_without_read = _web_search_focus_check(
                 call.name, result, rendered, searches_without_read
             )

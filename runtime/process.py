@@ -154,11 +154,12 @@ class BackgroundProcess:
         reader: The daemon reader thread delivering lines into *output_buffer*.
     """
 
-    __slots__ = ("id", "command", "proc", "output_buffer", "lock", "reader")
+    __slots__ = ("id", "command", "proc", "pgid", "output_buffer", "lock", "reader")
 
     id: str
     command: str
     proc: Popen[str]
+    pgid: int
     output_buffer: deque[str]
     lock: threading.Lock
     reader: threading.Thread
@@ -183,6 +184,13 @@ class BackgroundProcess:
         self.id = handle_id
         self.command = command
         self.proc = proc
+        # start_new_session=True makes the child its own process-group leader,
+        # so pgid == proc.pid. Captured at spawn so stop_background can kill the
+        # group even after this shell itself has exited — which happens when the
+        # command shell-backgrounds a server with `&` and returns, orphaning the
+        # server in this process group. Re-deriving via os.getpgid(proc.pid)
+        # would raise ProcessLookupError on the dead shell and leak the orphan.
+        self.pgid = proc.pid
         self.output_buffer = deque(maxlen=buffer_maxlen)
         self.lock = threading.Lock()
         self.reader = threading.Thread(
@@ -326,16 +334,23 @@ def stop_background(handle_id: str) -> dict | None:
         return None
 
     # --- Kill the entire process group (grandchildren included) ---
+    # Use the pgid captured at spawn rather than re-deriving it via
+    # os.getpgid(handle.proc.pid): when the command shell-backgrounds a server
+    # with `&` and then exits, handle.proc.pid is already dead and os.getpgid
+    # raises ProcessLookupError, leaking the orphaned server. The recorded pgid
+    # still identifies that (possibly orphaned) process group.
     try:
-        pgid = os.getpgid(handle.proc.pid)  # type: ignore[union-attr]
-        os.killpg(pgid, 15)  # SIGTERM
+        os.killpg(handle.pgid, 15)  # SIGTERM
     except ProcessLookupError:
         pass
 
-    # Wait up to 2 s for graceful termination before escalating.
+    # Wait up to 2 s for graceful termination before escalating. Probe the
+    # whole process group (not just handle.proc, which may already be a dead
+    # shell) so an orphaned `&` server that survives SIGTERM still triggers the
+    # SIGKILL escalation.
     alive_before_sigkill = False
     for _ in range(20):
-        if handle.proc.poll() is not None:  # type: ignore[union-attr]
+        if not _group_alive(handle.pgid):
             break
         import time
 
@@ -343,12 +358,11 @@ def stop_background(handle_id: str) -> dict | None:
     else:
         alive_before_sigkill = True
 
-    if handle.proc.poll() is not None:  # type: ignore[union-attr]
+    if not _group_alive(handle.pgid):
         sigkilled = False
     else:
         try:
-            pgid = os.getpgid(handle.proc.pid)  # type: ignore[union-attr]
-            os.killpg(pgid, 9)  # SIGKILL
+            os.killpg(handle.pgid, 9)  # SIGKILL
         except ProcessLookupError:
             pass
         sigkilled = True
@@ -385,6 +399,22 @@ def stop_background(handle_id: str) -> dict | None:
         "output": output,
         "exit_code": exit_code,
     }
+
+
+def _group_alive(pgid: int) -> bool:
+    """Return True if any process remains in process group *pgid*.
+
+    Sends signal 0 (probe) to the whole group: it succeeds if at least one
+    member is alive and raises :class:`ProcessLookupError` once the group is
+    empty. Used by :func:`stop_background` to decide SIGKILL escalation against
+    the *group* rather than the (possibly already-dead) shell PID — so an
+    orphaned ``&`` server that ignores SIGTERM is still caught.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def reap_all() -> list[str]:
