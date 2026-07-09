@@ -359,3 +359,55 @@ def compact(session: "Session", client, window: int, compaction_cfg=None) -> boo
 
     session.set_summary(summary_text, cut)
     return True
+
+
+# Cliff last-resort: when ``compact`` cannot get the context under cap,
+# ``force_fold`` advances the watermark past all but the most recent
+# ``DEFAULT_FORCE_KEEP_RECENT`` messages with NO summarizer call — accepting
+# that dropping old context outright is the lesser evil than failing the turn.
+# Smaller than ``DEFAULT_KEEP_RECENT`` so it frees space the normal fold (which
+# keeps 8) could not, and the only path that rescues a session with a few very
+# large messages where ``compact`` returns False immediately (nothing foldable
+# at keep_recent=8). Overridable via the ``compaction`` block's
+# ``force_keep_recent_messages``.
+DEFAULT_FORCE_KEEP_RECENT = 2
+
+# Summary seeded only when force_fold runs with no prior summary, so
+# ``assemble_context``'s tail-slice (keyed on a truthy ``_summary``) engages.
+_FORCE_FOLD_MARKER = (
+    "Earlier turns were dropped to fit the context window — compaction could "
+    "not summarize them down further. Re-read any files you still need."
+)
+
+
+def force_fold(session: "Session", compaction_cfg=None) -> bool:
+    """Last-resort free eviction: drop all but the most recent messages, no LLM.
+
+    Advances ``session``'s summary watermark past everything older than the last
+    ``force_keep_recent_messages`` (default 2) messages, with no summarizer
+    call. Used when ``compact`` cannot get the assembled context under cap: the
+    older context is lost outright (no summary covers it) rather than failing
+    the whole turn — the lesser evil at the cliff. This is the only path that
+    rescues a session with a few very large messages, where ``compact`` returns
+    False immediately (nothing foldable at ``keep_recent``=8). Reuses
+    ``_fold_boundary`` so the kept tail never begins on an orphaned ``tool`` row.
+
+    Args:
+        session: The active Session.
+        compaction_cfg: The ``compaction`` config block
+            (``force_keep_recent_messages``).
+
+    Returns:
+        True if the watermark advanced; False if nothing remained to fold
+        (already at or below the force-keep tail), so the caller gives up.
+    """
+    cfg = compaction_cfg or {}
+    keep_recent = int(cfg.get("force_keep_recent_messages", DEFAULT_FORCE_KEEP_RECENT))
+    msgs = session._messages
+    # No summarizer call, so no input budget — fold as far as _fold_boundary
+    # allows (it still walks the boundary back off an orphaning tool row).
+    cut = _fold_boundary(msgs, session._summary_covers, keep_recent, float("inf"))
+    if cut is None:
+        return False
+    session.set_summary(session._summary or _FORCE_FOLD_MARKER, cut)
+    return True

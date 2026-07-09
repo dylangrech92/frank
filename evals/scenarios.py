@@ -275,6 +275,17 @@ SCENARIOS: list[dict] = [
         ),
         "inline": "compaction_tail_prune.py",
     },
+    {
+        "name": "compaction_force_fold",
+        "description": (
+            "Dispatch-level check (no LLM): the overflow-ladder force_fold "
+            "advances the watermark past all but the most recent messages with "
+            "no summarizer call — seeds a marker when no summary exists, "
+            "preserves an existing one, walks the boundary off an orphaning "
+            "tool row, and refuses when nothing remains to fold."
+        ),
+        "inline": "compaction_force_fold.py",
+    },
 ]
 
 

@@ -717,6 +717,10 @@ def handle_user_message(
     comp_cfg = compaction_cfg or {}
     cap = compaction.compute_cap(window, comp_cfg)
     max_compactions = 5
+    # Thrash guard: bail out of the summarizer loop after this many consecutive
+    # compactions that failed to reduce the context at all (further calls won't
+    # converge) and fall through to the force_fold last resort.
+    max_non_shrink = 2
     compactions = 0
     # Per-turn (reset on every handle_user_message call) tracking of rendered
     # error envelopes seen so far, for the repeated-identical-failure loop-guard.
@@ -806,11 +810,14 @@ def handle_user_message(
                 ),
                 file=sys.stderr,
             )
+        non_shrink_streak = 0
         while trigger > cap:
             if compactions >= max_compactions or not compaction.compact(
                 session, client, window, comp_cfg
             ):
-                return _over_cap_giveup()
+                # Summarization exhausted (budget or nothing foldable) — break
+                # to the force_fold last resort rather than dead-ending.
+                break
             compactions += 1
             # Compaction reshaped the assembled context (summary spliced in),
             # so the prior real-usage baseline's index no longer lines up —
@@ -818,6 +825,7 @@ def handle_user_message(
             session.last_prompt_tokens = None
             context = session.assemble_context()
             est = compaction.estimate_tokens(context, tool_schemas)
+            prev_trigger = trigger
             trigger = compaction.trigger_estimate(session, context, tool_schemas)
             print(
                 ui.telemetry(
@@ -826,6 +834,34 @@ def handle_user_message(
                 ),
                 file=sys.stderr,
             )
+            # Thrash guard: stop paying for summarizer calls that aren't
+            # reducing the context. Two consecutive no-reduction compactions
+            # mean further calls won't converge — fall through to force_fold.
+            if trigger >= prev_trigger:
+                non_shrink_streak += 1
+                if non_shrink_streak >= max_non_shrink:
+                    break
+            else:
+                non_shrink_streak = 0
+
+        # Overflow ladder: summarization could not get under cap. As a last
+        # resort, drop all but the most recent messages with no LLM call (older
+        # context is lost rather than failing the turn), then re-check.
+        if trigger > cap and compaction.force_fold(session, comp_cfg):
+            compactions += 1
+            session.last_prompt_tokens = None
+            context = session.assemble_context()
+            est = compaction.estimate_tokens(context, tool_schemas)
+            trigger = compaction.trigger_estimate(session, context, tool_schemas)
+            print(
+                ui.telemetry(
+                    f"context: {len(context)} messages, ~{est} tokens "
+                    f"(cap {cap}) [force-fold #{compactions}]"
+                ),
+                file=sys.stderr,
+            )
+        if trigger > cap:
+            return _over_cap_giveup()
 
         if verbose:
             msg_lines: list[str] = []
@@ -854,12 +890,16 @@ def handle_user_message(
             turn_report["usage"]["llm_calls"] += 1
             response: ChatResponse = client.chat(context, tool_schemas, chat_delta_cb)
         except OverCapError:
-            # Provider rejected on length despite the estimate — compact and retry.
-            if compactions >= max_compactions or not compaction.compact(
+            # Provider rejected on length despite the estimate — compact and
+            # retry; if summarization can't help, fall back to force_fold.
+            if compactions < max_compactions and compaction.compact(
                 session, client, window, comp_cfg
             ):
+                compactions += 1
+            elif compaction.force_fold(session, comp_cfg):
+                compactions += 1
+            else:
                 return _over_cap_giveup()
-            compactions += 1
             # Same reasoning as the pre-flight compaction path above: the
             # baseline this real measurement was keyed to no longer applies.
             session.last_prompt_tokens = None
