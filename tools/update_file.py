@@ -91,6 +91,32 @@ class UpdateFile(Tool):
                 hint='Read the file with read_file before editing it.',
             )
 
+        # Guard against a destructive partial-edit (TKT-1468): the model
+        # sometimes calls update_file (a full overwrite) with only a code
+        # SNIPPET when it means to make a small edit, silently destroying a
+        # large working file (observed: an 11.5 KB game.js overwritten with a
+        # 226-byte fragment to "fix" a lint hint). Refuse when the new content
+        # is a tiny fraction of a substantial existing file and steer to the
+        # targeted-edit tools. The threshold is deliberately conservative
+        # (<5% of a >=4 KB file) so legitimate rewrites are unaffected; an
+        # intentional full shortening can still use delete_file + create_file.
+        try:
+            existing_size = resolved.stat().st_size
+        except OSError:
+            existing_size = 0
+        new_size = len(content.encode('utf-8'))
+        if existing_size >= 4000 and new_size * 20 < existing_size:
+            return ToolResult.err(
+                f'{raw_path}: refusing to overwrite a {existing_size}-byte file '
+                f'with {new_size} bytes — this looks like a partial edit (a '
+                f'snippet), not a full rewrite, and would destroy the existing '
+                f'content. Use replace_one / replace_many for a targeted edit, '
+                f'or delete_file + create_file if you genuinely mean to replace '
+                f'the whole file.',
+                code='destructive-partial-overwrite',
+                hint='Use replace_one / replace_many for small edits.',
+            )
+
         # Write content as UTF-8
         resolved.write_text(content, encoding='utf-8')
 
