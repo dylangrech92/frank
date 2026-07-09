@@ -341,7 +341,11 @@ def stop_background(handle_id: str) -> dict | None:
     # still identifies that (possibly orphaned) process group.
     try:
         os.killpg(handle.pgid, 15)  # SIGTERM
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
+        # ProcessLookupError: group already gone. PermissionError: the pgid was
+        # recycled to an unrelated process after our member exited (common when
+        # a background command failed fast and its PID was reused) — not our
+        # group anymore, nothing to signal.
         pass
 
     # Wait up to 2 s for graceful termination before escalating. Probe the
@@ -363,7 +367,7 @@ def stop_background(handle_id: str) -> dict | None:
     else:
         try:
             os.killpg(handle.pgid, 9)  # SIGKILL
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         sigkilled = True
 
@@ -412,7 +416,10 @@ def _group_alive(pgid: int) -> bool:
     """
     try:
         os.killpg(pgid, 0)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
+        # ProcessLookupError: the group is empty (all members gone).
+        # PermissionError: the pgid was recycled to an unrelated process after
+        # our member exited — treat as "not our group, nothing left to kill".
         return False
     return True
 
@@ -429,6 +436,11 @@ def reap_all() -> list[str]:
     """
     handled = sorted(_background_handles)
     for _handle_id in handled:
-        # StopBackground will remove itself from the dict.
-        stop_background(_handle_id)
+        # Never let one handle's teardown abort the rest of shutdown — a handle
+        # whose process already exited (e.g. a fast-failing background command)
+        # must not prevent the remaining live processes from being reaped.
+        try:
+            stop_background(_handle_id)
+        except Exception:
+            _background_handles.pop(_handle_id, None)
     return handled
