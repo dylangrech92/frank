@@ -177,6 +177,12 @@ def _prune_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     tool calls are dropped, and any ``tool_calls`` field is stripped from kept
     messages so no dangling tool-call ids remain.
 
+    When the slice has no ``user`` message at all — the post-compaction tail,
+    whose originating user request sits behind the watermark and is re-injected
+    as the task anchor by ``assemble_context`` — the entire slice is treated as
+    completed prior turns, so tool scaffolding does not survive the compaction
+    boundary.
+
     The input list is never mutated; kept messages are shallow-copied when a
     field must be stripped.
     """
@@ -188,12 +194,19 @@ def _prune_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if m.get("role") == "user":
             last_user = i
 
-    # No user message yet: treat the whole thing as in-flight.
+    # No user message here: after a fold that advanced past the originating
+    # user request, the user sits behind the watermark (re-injected as the task
+    # anchor by assemble_context), so there is no in-flight turn to carve out.
+    # Collapse the whole slice like completed prior turns; returning it
+    # unchanged would let tool scaffolding survive the compaction boundary. A
+    # user arriving after compaction lands in the tail and takes the
+    # else-branch, so its in-flight turn is still carved out and kept verbatim.
     if last_user < 0:
-        return list(messages)
-
-    completed = messages[:last_user]
-    in_flight = messages[last_user:]
+        completed = messages
+        in_flight: List[Dict[str, Any]] = []
+    else:
+        completed = messages[:last_user]
+        in_flight = messages[last_user:]
 
     pruned: List[Dict[str, Any]] = []
     for m in completed:

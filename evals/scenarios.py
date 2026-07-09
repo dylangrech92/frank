@@ -265,6 +265,16 @@ SCENARIOS: list[dict] = [
         ),
         "inline": "verify_scratch_contract.py",
     },
+    {
+        "name": "compaction_tail_prune",
+        "description": (
+            "Dispatch-level check (no LLM): after compaction folds past the "
+            "last user message, the assembled tail carries no tool results or "
+            "tool_calls; a new post-compaction user turn still keeps its "
+            "in-flight tool scaffolding verbatim."
+        ),
+        "inline": "compaction_tail_prune.py",
+    },
 ]
 
 
