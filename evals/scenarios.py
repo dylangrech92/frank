@@ -272,6 +272,19 @@ SCENARIOS: list[dict] = [
         "inline": "loop_guard_escalation.py",
     },
     {
+        "name": "repro_steer",
+        "description": (
+            "End-to-end check (stub LLM, no network): the first relevant file "
+            "mutation of a turn that has run nothing to observe the problem gets "
+            "a fold-surviving reproduce-before-edit steer (user role, "
+            "STEER_PREFIX) plus a 'repro-steer: fired' telemetry line, fired once "
+            "per turn; a prior FAILING run_command suppresses it (exit-status-"
+            "agnostic, since verification_runs records every run); and a second "
+            "edit in the same turn does not append a second steer."
+        ),
+        "inline": "repro_steer.py",
+    },
+    {
         "name": "compaction_force_fold",
         "description": (
             "Dispatch-level check (no LLM): the overflow-ladder force_fold "

@@ -385,6 +385,21 @@ _BLOCKED_ROUND_STEER = (
     "action, or give your final answer now."
 )
 
+# E13 fold-surviving reproduce-before-edit steer, same wire-safety and plain-
+# language rules as _BLOCKED_ROUND_STEER (append_steer prepends STEER_PREFIX, so
+# this is the body only — no duplicate "not from the user" preamble). Fires on
+# the first relevant file mutation of a turn that has run nothing to observe the
+# problem, steering observed-output-first debugging over assumption-driven edits.
+_REPRO_BEFORE_EDIT_STEER = (
+    "The edit you just made was applied successfully and is already in the files. "
+    "Do not re-check whether the original request still applies — it does, and "
+    "your edit is part of it. Before editing anything else, run the relevant "
+    "command with run_command and read its actual output: for a reported bug, "
+    "crash, or wrong output that means reproducing the failure; otherwise it "
+    "means running the code to confirm your change. Base any further edits on "
+    "that observed output, not on assumption."
+)
+
 
 def _call_signature(arguments: dict) -> str:
     """Return a stable, hashable signature for a tool call's arguments.
@@ -688,6 +703,11 @@ class _TurnState:
     # moment such a call succeeds. The nudge fires at most once per turn.
     needs_verification: bool = False
     verification_nudge_fired: bool = False
+    # E13 reproduce-before-edit steer: True once the first relevant file mutation
+    # of the turn landed with zero verification runs recorded so far. Fires the
+    # fold-surviving steer at most once per turn (see _dispatch_sequential_call /
+    # _dispatch_round).
+    repro_steer_fired: bool = False
     # Empty-answer bounce: the model returned no text and no tool calls (a
     # local-model bare-stop failure mode). Fires at most once per turn; a second
     # empty turn falls through to a transparent placeholder at the return site.
@@ -1067,6 +1087,23 @@ def _dispatch_sequential_call(
         if any_relevant:
             state.needs_verification = True
             state.mutated_paths |= new_paths
+            # E13 — reproduce-before-edit steer: this call mutated a file but
+            # nothing has been run to observe the problem yet this turn.
+            # turn_report["verification_runs"] records every run_command/
+            # run_tests/verify_scratch call regardless of exit status, so a
+            # nonzero-exit crash repro correctly counts as "already ran
+            # something" and suppresses this. Fired once per turn; the steer
+            # itself is appended after the round's tool results in
+            # _dispatch_round (never between a tool_calls row and its results).
+            if not state.repro_steer_fired and not state.turn_report["verification_runs"]:
+                state.repro_steer_fired = True
+                print(
+                    ui.telemetry(
+                        "repro-steer: fired (mutation before any verification "
+                        "run this turn)"
+                    ),
+                    file=sys.stderr,
+                )
             # S4 — captured here (correlated with this dispatched call's own slice
             # of _TURN_MUTATIONS), NOT by reading the module-level list later:
             # diagnostics_inject_summary drains it at the end of the dispatch
@@ -1106,12 +1143,14 @@ def _dispatch_round(
     repeat-call / web-search-focus steers, reactive lint-delta suffix), appends
     each to the transcript, then injects the LSP diagnostics summary.
 
-    E8: when this round refused at least one call at the hard cap but has not yet
-    hit the escalation cap, a fold-surviving steer is appended AFTER all tool
-    results (never between an assistant tool_calls message and its results, which
-    would break the OpenAI wire protocol). The steer rides the user role so it
-    survives a compaction fold even when the block error and tool result behind
-    it are dropped — the model's only remaining feedback that it is stuck.
+    Two fold-surviving steers may be appended AFTER all tool results (never
+    between an assistant tool_calls message and its results, which would break
+    the OpenAI wire protocol), each riding the user role so it survives a
+    compaction fold. E8: when this round refused at least one call at the hard cap
+    but has not yet hit the escalation cap — the model's only remaining feedback
+    that it is stuck. E13: when this round produced the turn's first relevant file
+    mutation with zero verification runs so far — steering the model to reproduce
+    the reported problem before it keeps editing on assumption.
     """
     calls = response.tool_calls
     # Intermediate assistant text on a tool-call iteration that did NOT stream
@@ -1142,6 +1181,10 @@ def _dispatch_round(
         state.blocked_streak = 0
 
     blocked_this_round = False
+    # E13 — snapshot the one-shot repro flag before the loop so the post-round
+    # block can tell whether THIS round is the one that flipped it (and so should
+    # append the steer). A no-op on every later round once it has fired.
+    repro_fired_before = state.repro_steer_fired
     for i, call in enumerate(calls):
         # Only ever populated on the sequential path (parallel_safe tools never
         # mutate, so there is nothing to lint-delta there).
@@ -1189,14 +1232,22 @@ def _dispatch_round(
 
     diagnostics_inject_summary(session)
 
-    # E8 fold-surviving steer: this round refused a call at the hard cap but the
-    # streak has not yet reached the escalation cap (which handle_user_message
-    # enforces after this returns). Emit once per blocked round, AFTER every tool
-    # result above — the cap bounds this at ~2 steers per turn. Appended here
-    # (post diagnostics_inject_summary) so its user row lands after the last tool
-    # message, never between an assistant tool_calls entry and its results.
+    # Fold-surviving post-round steers (E8, E13): both ride the user role — which
+    # _prune_messages keeps across a compaction fold — and are appended HERE,
+    # after every tool result and diagnostics_inject_summary, so their user row
+    # lands after the last tool message and never between an assistant tool_calls
+    # entry and its results (which would break the OpenAI wire protocol). Each is
+    # driven by a flag settled during the loop above and fires at most once here.
+    #
+    # E8: this round refused a call at the hard cap but the streak has not yet
+    # reached the escalation cap (which handle_user_message enforces after this
+    # returns) — bounded at ~2 steers per turn.
     if blocked_this_round and 0 < state.blocked_streak < _BLOCKED_STREAK_CAP:
         session.append_steer(_BLOCKED_ROUND_STEER.format(n=_REPEAT_CALL_CAP))
+    # E13: the turn's first relevant file mutation just landed with zero
+    # verification runs so far — steer the model to reproduce before editing on.
+    if state.repro_steer_fired and not repro_fired_before:
+        session.append_steer(_REPRO_BEFORE_EDIT_STEER)
 
 
 def _finalize_answer(
