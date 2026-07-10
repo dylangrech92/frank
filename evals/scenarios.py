@@ -373,6 +373,21 @@ SCENARIOS: list[dict] = [
         "inline": "consolidation_ops.py",
     },
     {
+        "name": "llm_wall_clock",
+        "description": (
+            "Dispatch-level check (no LLM, no network): the streaming path's "
+            "whole-call wall-clock ceiling. Driving _read_sse_response directly, "
+            "a source that trickles SSE lines forever under a tiny ceiling raises "
+            "the distinct ResponseCeilingError within ceiling + 1s and its message "
+            "reports the discarded work (elapsed seconds + accumulated content); a "
+            "normal stream (usage chunk + [DONE]) still parses unchanged (text "
+            "joined, tool-call fragments merged, tokens captured); and driving "
+            "chat() end-to-end, a breach raises after exactly one request issue — "
+            "it never retries."
+        ),
+        "inline": "llm_wall_clock.py",
+    },
+    {
         "name": "verify_tool_wiring",
         "description": (
             "End-to-end check (stub LLM, no network): when the reproduce-before-"

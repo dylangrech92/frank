@@ -16,18 +16,39 @@ from typing import Any, Callable, Dict, List
 
 # One retry, ~1s backoff, on 5xx and connection-level errors (F5). Never
 # retried: 4xx responses, and anything past the point a 2xx response has
-# started streaming deltas to on_delta (see LLMClient._request_with_retry).
+# started streaming deltas to on_delta — which includes a wall-clock ceiling
+# breach, raised only after the stream is already underway (see
+# LLMClient._request_with_retry and _read_sse_response).
 _MAX_ATTEMPTS = 2
 _RETRY_BACKOFF_SECONDS = 1.0
 
-# Without an explicit timeout, requests blocks forever — one half-dead
-# keep-alive connection (or a request the server accepted and then dropped)
-# hangs the whole agent with an ESTABLISHED-but-silent socket. The read
-# timeout is per-read-gap, not whole-response: an SSE stream only trips it
-# when the server goes silent mid-generation longer than this, so it must
-# cover the silent prompt-processing phase of a large local-model prompt.
+# Three independent timeouts bound a single chat call, each guarding a distinct
+# failure mode; without them requests blocks forever on a silent socket.
+#
+#   * connect (_CONNECT_TIMEOUT_SECONDS) — cap on establishing the TCP/TLS
+#     connection. Without it a half-dead keep-alive connection (or a request the
+#     server accepted and then dropped) hangs the whole agent on an
+#     ESTABLISHED-but-silent socket.
+#
+#   * per-read-gap (_READ_TIMEOUT_SECONDS) — requests' read timeout is the max
+#     silence BETWEEN reads, not the whole response. On the NON-streaming path
+#     nothing arrives until generation finishes, so the gap equals the entire
+#     generation and this one value already bounds the whole call — no separate
+#     ceiling is needed there. It must also cover the silent prompt-processing
+#     phase of a large local-model prompt, so it is set generously.
+#
+#   * whole-call wall clock (_WALL_CLOCK_CEILING_SECONDS) — the per-read-gap
+#     timeout does NOT bound the STREAMING path: an SSE stream that keeps
+#     trickling chunks resets the gap timer on every line, so a pathologically
+#     slow-but-alive generation can run for the model's whole context window
+#     before it ever ends. This ceiling is a hard deadline on the total elapsed
+#     time of one streaming attempt, anchored when that attempt's request is
+#     issued and checked once per SSE line; on breach the attempt is abandoned
+#     (ResponseCeilingError, never retried). It is a generous backstop, not a
+#     latency target — a legitimately slow local model must never trip it.
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _READ_TIMEOUT_SECONDS = 600.0
+_WALL_CLOCK_CEILING_SECONDS = 1800.0
 
 
 # Message keys that are internal harness annotations, never part of the
@@ -59,6 +80,19 @@ def to_wire_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 class OverCapError(Exception):
     """Raised when the provider rejects a request because the context is too long."""
+
+    pass
+
+
+class ResponseCeilingError(Exception):
+    """Raised when a streaming response exceeds the whole-call wall-clock ceiling.
+
+    The message reports how much work is being thrown away — elapsed seconds,
+    accumulated assistant-text characters, and the count of accumulated
+    tool-call fragments — so the caller can see the size of the abandoned
+    generation. Never retried: it is raised only after a 2xx stream has already
+    started forwarding deltas to ``on_delta`` (see LLMClient._request_with_retry).
+    """
 
     pass
 
@@ -222,7 +256,9 @@ def _tool_call_from_dict(raw: Dict[str, Any]) -> ToolCall:
     return ToolCall(id=raw["id"], name=name, arguments=arguments)
 
 
-def _read_sse_response(resp: Any, on_delta: Callable[[str], None]) -> ChatResponse:
+def _read_sse_response(
+    resp: Any, on_delta: Callable[[str], None], request_started: float
+) -> ChatResponse:
     """Consume a ``text/event-stream`` chat-completions response into a ChatResponse.
 
     Iterates ``data:`` lines until ``[DONE]``, forwarding every assistant-text
@@ -236,23 +272,47 @@ def _read_sse_response(resp: Any, on_delta: Callable[[str], None]) -> ChatRespon
     an empty ``choices`` list — checking it before the empty-choices bail-out
     is what actually captures it (F6).
 
+    A whole-call wall-clock ceiling bounds the stream: *request_started* is the
+    ``time.monotonic()`` anchor from when this attempt's request was issued, and
+    once per line the total elapsed time is compared against
+    ``_WALL_CLOCK_CEILING_SECONDS`` (read once at entry, so an eval can
+    monkeypatch the module constant to a tiny value). On breach a
+    ``ResponseCeilingError`` is raised — this happens mid-stream, well after the
+    2xx that started it, so the retry loop in ``_request_with_retry`` can never
+    re-issue it.
+
     Args:
         resp: An iterable yielding raw bytes (or str) lines, one SSE line each
             (the open ``urlopen`` response object, or ``Response.iter_lines()``
             from ``requests``).
         on_delta: Called with each non-empty ``delta.content`` fragment.
+        request_started: ``time.monotonic()`` captured when this attempt's
+            request was issued; the wall-clock deadline is measured from it.
 
     Returns:
         A ``ChatResponse`` identical in shape to the non-streaming parse, with
         ``prompt_tokens``/``completion_tokens`` populated when the stream
         carried a ``usage`` chunk.
+
+    Raises:
+        ResponseCeilingError: When total elapsed time crosses
+            ``_WALL_CLOCK_CEILING_SECONDS`` while the stream is still trickling.
     """
     text_parts: list[str] = []
     calls_by_index: dict[int, dict[str, Any]] = {}
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    ceiling = _WALL_CLOCK_CEILING_SECONDS
 
     for raw_line in resp:
+        elapsed = time.monotonic() - request_started
+        if elapsed >= ceiling:
+            raise ResponseCeilingError(
+                f"streaming response exceeded the {ceiling:.0f}s whole-call "
+                f"wall-clock ceiling after {elapsed:.1f}s; abandoning "
+                f"{sum(len(p) for p in text_parts)} accumulated assistant-text "
+                f"character(s) and {len(calls_by_index)} tool-call fragment(s)"
+            )
         raw_text = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
         line = raw_text.strip()
         if not line.startswith("data:"):
@@ -341,15 +401,18 @@ class LLMClient:
         body: Dict[str, Any],
         headers: Dict[str, str],
         stream: bool,
-    ) -> requests.Response:
+    ) -> tuple[requests.Response, float]:
         """POST *body* to *url*, retrying once on 5xx / connection-level errors.
 
         Only the connect-and-status-check phase is ever retried: a 2xx
         response is returned immediately, before its body (or SSE stream) is
         consumed, so a retry here never re-sends a request whose deltas were
         already forwarded to ``on_delta`` (that consumption happens later, in
-        ``chat()``/``_read_sse_response``, outside this method). 4xx
-        responses are never retried — only 5xx and connection-level failures
+        ``chat()``/``_read_sse_response``, outside this method). This is also
+        why a ``ResponseCeilingError`` never triggers a retry: it is raised
+        while ``_read_sse_response`` drains an already-returned 2xx stream, past
+        every ``return`` in this loop. 4xx responses are never retried — only
+        5xx and connection-level failures
         (``requests.exceptions.ConnectionError``/``Timeout``) are (F5).
 
         Args:
@@ -360,8 +423,13 @@ class LLMClient:
                 body is not eagerly buffered.
 
         Returns:
-            The ``requests.Response`` for a status code below 500 (the caller
-            still checks for 4xx and raises the appropriate error contract).
+            ``(response, request_started)`` — the ``requests.Response`` for a
+            status code below 500 (the caller still checks for 4xx and raises
+            the appropriate error contract), paired with the
+            ``time.monotonic()`` anchor from when that returned attempt's POST
+            was issued, so the streaming path can measure its wall-clock ceiling
+            from the request that actually produced this response (each retry
+            attempt is anchored independently).
 
         Raises:
             RuntimeError: On a 5xx or connection-level failure that persists
@@ -370,6 +438,7 @@ class LLMClient:
         last_exc: Exception | None = None
         for attempt in range(_MAX_ATTEMPTS):
             is_last_attempt = attempt == _MAX_ATTEMPTS - 1
+            request_started = time.monotonic()
             try:
                 resp = self._session.post(
                     url,
@@ -393,7 +462,7 @@ class LLMClient:
                 body_text = resp.text
                 raise RuntimeError(f"HTTP {resp.status_code}: {body_text}")
 
-            return resp
+            return resp, request_started
 
         # Unreachable: the loop above always either returns or raises.
         raise RuntimeError(f"request failed after retry: {last_exc}")
@@ -425,6 +494,8 @@ class LLMClient:
     Raises:
         OverCapError: When the provider returns HTTP 400 with a body mentioning
             *context_length_exceeded* or *maximum context length*.
+        ResponseCeilingError: When a streaming response keeps trickling past the
+            whole-call wall-clock ceiling (streaming path only; not retried).
         RuntimeError: For all other non-2xx responses, including the HTTP status
             and response body text.
     """
@@ -462,7 +533,7 @@ class LLMClient:
             "Authorization": f"Bearer {self.config.api_key}",
         }
 
-        resp = self._request_with_retry(url, body, headers, want_stream)
+        resp, request_started = self._request_with_retry(url, body, headers, want_stream)
 
         if resp.status_code >= 400:
             body_text = resp.text
@@ -476,7 +547,7 @@ class LLMClient:
 
         content_type = resp.headers.get("Content-Type", "")
         if on_delta is not None and want_stream and content_type.startswith("text/event-stream"):
-            return _read_sse_response(resp.iter_lines(), on_delta)
+            return _read_sse_response(resp.iter_lines(), on_delta, request_started)
 
         data = resp.json()
 
