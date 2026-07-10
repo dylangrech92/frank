@@ -1150,11 +1150,17 @@ _GIVEUP_RUNS_CAP = 5
 def _turn_verified(state: "_TurnState") -> bool | None:
     """Single source of truth for ``turn_report["verified"]``.
 
-    Tri-state, so a consumer can tell an unverified edit from a turn that never
-    touched code:
+    Tri-state, so a consumer can tell an unverified edit from a turn that left no
+    net change to verify:
 
-    * ``None`` — the turn mutated no file, so there was nothing to verify (e.g.
-      a read-only research turn). Neither pass nor fail applies.
+    * ``None`` — no net change is known to exist, so there is nothing to verify:
+      either the turn mutated no file (e.g. a read-only research turn), or it
+      mutated files but every ``files_changed`` entry is flagged ``reverted`` (an
+      edit-then-revert or a create-then-delete that left the tree byte-identical
+      to its start). Neither pass nor fail applies. An entry whose revert cannot
+      be known — the ``reverted`` flag is absent, meaning a genuine change OR an
+      unknown pre-image (a ``run_command``-first mutation) — is NOT a known no-op,
+      so it keeps the ``True``/``False`` verdict below rather than cascading here.
     * ``True`` — the turn mutated a file AND the verification gate is clear (a
       ``run_tests``/``run_command``/``verify_scratch`` call PASSED after the last
       mutation, clearing ``needs_verification`` — a run that merely completed but
@@ -1162,13 +1168,18 @@ def _turn_verified(state: "_TurnState") -> bool | None:
     * ``False`` — the turn mutated a file but the gate is still open (no passing
       run after the last mutation).
 
+    Reads the ``reverted`` annotations, so ``_annotate_reverted_files`` must have
+    run first — ``_stamp_turn_outcome`` enforces that order at every exit path.
     Shared verbatim by ``_finalize_answer`` and both early-exit give-up paths so
     the flag means the same thing however the turn ended — a give-up envelope no
-    longer under-reports verified work, and a no-op turn no longer masquerades as
-    an unverified edit.
+    longer under-reports verified work, and a net no-op turn no longer
+    masquerades as an unverified edit.
     """
     if not state.mutated_paths:
         return None
+    changed = state.turn_report["files_changed"]
+    if changed and all(entry.get("reverted") is True for entry in changed):
+        return None  # every mutation verifiably reverted — a known net no-op
     return not state.needs_verification
 
 
@@ -1213,6 +1224,22 @@ def _annotate_reverted_files(state: "_TurnState") -> None:
                 entry["reverted"] = True
         except OSError:
             continue  # unreadable now — cannot confirm a revert, leave absent
+
+
+def _stamp_turn_outcome(state: "_TurnState") -> None:
+    """Annotate net-change state, then stamp ``verified`` — in that order.
+
+    Every turn-exit path (the normal finalize and both give-up paths) must
+    annotate ``files_changed`` reverts (``_annotate_reverted_files``) BEFORE
+    computing ``verified`` (``_turn_verified``), because a turn whose every
+    mutation was verifiably reverted is a known net no-op that reports
+    ``verified`` as ``None`` — a verdict that reads the ``reverted`` flags this
+    annotation writes. Folding the two calls into one function shared by every
+    exit path makes that ordering contract structural, so it cannot silently
+    break at a single call site.
+    """
+    _annotate_reverted_files(state)
+    state.turn_report["verified"] = _turn_verified(state)
 
 
 def _synthesize_giveup_answer(reason: str, retry_hint: str, state: "_TurnState") -> str:
@@ -1283,13 +1310,13 @@ def _finalize_giveup(
     reaching ``_finalize_answer``. They fold their common tail here: synthesize a
     truthful answer from ``turn_report`` (no extra LLM call), record it as the
     turn's final answer across transcript + ``turn_report`` + ``on_delta``, and
-    stamp ``turn_report["verified"]`` with the one shared formula (``_turn_verified``).
+    annotate net-change state then stamp ``turn_report["verified"]`` with the one
+    shared formula (``_stamp_turn_outcome``).
     """
     msg = _synthesize_giveup_answer(reason, retry_hint, state)
     session.append_assistant(msg)
     state.turn_report["answer"] = msg
-    _annotate_reverted_files(state)
-    state.turn_report["verified"] = _turn_verified(state)
+    _stamp_turn_outcome(state)
     if on_delta is not None:
         on_delta(msg + "\n")
     return msg
@@ -2062,12 +2089,10 @@ def _finalize_answer(
                 ),
                 file=sys.stderr,
             )
-    # Net-change annotation + one shared formula for verified, both stamped at
-    # this single turn-exit choke point (shared with the give-up paths via
-    # _annotate_reverted_files / _turn_verified) so every exit reports the same
-    # truth.
-    _annotate_reverted_files(state)
-    state.turn_report["verified"] = _turn_verified(state)
+    # Net-change annotation + one shared formula for verified, both stamped in
+    # order at this single turn-exit choke point via _stamp_turn_outcome (shared
+    # with the give-up paths) so every exit reports the same truth the same way.
+    _stamp_turn_outcome(state)
 
     # Empty-answer placeholder: if the model returned no text at all (the retry
     # above already fired once and still came back empty), surface a transparent
