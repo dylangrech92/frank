@@ -1201,7 +1201,6 @@ def _dispatch_round(
 
 def _finalize_answer(
     session: Session,
-    client: LLMClient,
     state: "_TurnState",
     response: ChatResponse,
     on_delta: Callable[[str], None] | None,
@@ -1211,12 +1210,14 @@ def _finalize_answer(
     In order: bounce once on an empty answer (empty-answer nudge), bounce once
     on an unverified file mutation (H1 verification nudge), then — on the second
     pass through — mark the S3 verify gate, surface an empty-answer placeholder,
-    deliver the answer through on_delta, and consolidate.
+    and deliver the answer through on_delta.
 
     Returns the final answer string (terminal — the caller returns it), or
     ``None`` when a nudge bounced (the caller loops again). ``append_assistant``
     for this response has already run in ``handle_user_message`` before this
-    call, so the transcript holds the model's original, unprefixed text.
+    call, so the transcript holds the model's original, unprefixed text. The
+    end-of-turn consolidation hook is NOT fired here — ``handle_user_message``
+    owns it as the single choke point across every turn-exit path.
     """
     text = response.text or ""
 
@@ -1310,7 +1311,6 @@ def _finalize_answer(
         if state.streamed == 0:
             on_delta(final_text)  # non-streaming / gated fallback: deliver whole
         on_delta("\n")
-    consolidation_maybe_extract(session, client)
     return final_text
 
 
@@ -1331,36 +1331,35 @@ def handle_user_message(
     The loop follows this contract exactly:
 
     1. **setup** — append_user(text), orientation_maybe_seed(session).
-    2. **loop** (while True):
-       a. assemble_context() from session.
-       b. verbose → print full assembled context to stderr prefixed by "assembled context".
-       c. client.chat(context, schemas()) inside try … except OverCapError.
-       d. **OverCapError path** — append_assistant with a message saying the context
-          exceeded the model limit; return that same text (turn ends without retry).
-          *A later phase replaces this behaviour with compact-then-retry.*
-       e. **normal success** — append_assistant(text, tool_calls), then:
-           i.  If no tool calls and the assistant produced no text at all (a
-               local-model bare-stop failure mode) → bounce once: inject a
-               harness steer (session.append_steer) and loop again. A second empty turn is
-               surfaced via a transparent "(no response from model)"
-               placeholder at the return site (ii) so REPL mode never leaves
-               the user at a blank prompt.
-           ii. If no tool calls and files were mutated this turn with no
-               successful run_tests/run_command/verify_scratch since → bounce once (S3 hard
-               verify gate, upgrading H1's nudge): inject a harness steer
-               (session.append_steer) and loop again instead of returning. A second such
-               final answer is accepted, but the *returned* text (not the
-               transcript) is prefixed with "[UNVERIFIED CHANGES] " unless the
-               model's own text already says "unverified".
-           iii. If no tool calls (and the gates above don't bounce) →
-                consolidation_maybe_extract(session) + return response.text (or the
-                gate-marked / empty-placeholder variant).
-           iv. For each tool call:
-              - echo to stderr the call name and arguments.
-              - dispatch via registry (dispatch(name, arguments)).
-              - echo rendered result to stderr via render_tool_result().
-              - store append_tool_result(call.id, call.name, rendered_result).
-          iv. After all calls -> diagnostics_inject_summary(session); continue loop.
+    2. **loop** (while True): assemble + chat + dispatch, until one of the three
+       turn-exit paths below settles ``answer`` and breaks. Each exit path has
+       already appended its final assistant text to the transcript and recorded
+       ``turn_report["answer"]`` before it breaks:
+       a. **over-cap exit** — ``_run_llm_with_compaction`` returns a string when
+          the compaction ladder cannot get the context under cap (or the
+          provider keeps rejecting on length). That give-up message is the
+          answer; the turn ends without retry.
+       b. **normal finalize exit** — a no-tool-call response clears the
+          empty-answer / H1 gate cascade in ``_finalize_answer``, which returns
+          the final text (optionally "[UNVERIFIED CHANGES] "-marked or the
+          "(no response from model)" placeholder). A bounced gate returns
+          ``None`` and the loop continues instead.
+       c. **blocked-loop escalation exit** — after ``_dispatch_round`` leaves
+          ``state.blocked_streak >= _BLOCKED_STREAK_CAP`` (the model kept
+          re-issuing a hard-cap-blocked call), ``_blocked_loop_giveup``
+          force-finalizes the turn with a plain-text give-up answer.
+    3. **single choke point** — after the loop breaks, the end-of-turn
+       consolidation hook (``consolidation_maybe_extract``) fires exactly once,
+       on EVERY exit path, so a turn force-finalized by (a)/(c) is mined into
+       durable memory just like a normally-finalized (b) turn. It runs after the
+       final answer / give-up message is settled and appended, so the transcript
+       tail it snapshots includes it.
+
+    Per no-tool-call round the assistant text is appended (append_assistant),
+    the H5 graph-memory nudge may fire, and the gate cascade runs; per tool-call
+    round each call is echoed to stderr, dispatched via the registry, its
+    rendered result stored, then diagnostics_inject_summary(session) runs before
+    the loop continues.
 
     Args:
         text: User message string to begin the turn with.
@@ -1423,6 +1422,11 @@ def handle_user_message(
 
     delta_cb = _sink if on_delta is not None else None
 
+    # Every turn-exit path assigns ``answer`` and breaks to the single choke
+    # point below (the end-of-turn consolidation hook), so the turn is mined into
+    # memory exactly once regardless of which path finalized it. See this
+    # function's docstring for the three exit paths.
+    answer: str
     while True:
         # Recomputed every iteration so a mid-turn load_tool call is reflected in
         # the very next client.chat — a stale pre-loop snapshot would otherwise
@@ -1430,12 +1434,15 @@ def handle_user_message(
         tool_schemas = schemas()
 
         # Compaction ladder + one chat call (with OverCapError retry). Returns
-        # the give-up string when compaction is exhausted; the caller returns it.
+        # the give-up string when compaction is exhausted.
         outcome = _run_llm_with_compaction(
             session, client, state, tool_schemas, delta_cb, verbose, on_delta
         )
         if isinstance(outcome, str):
-            return outcome
+            # Over-cap exit: the give-up message is already in the transcript /
+            # turn_report / on_delta.
+            answer = outcome
+            break
         response = outcome
 
         tool_calls: list[ToolCall] | None = (
@@ -1451,10 +1458,11 @@ def handle_user_message(
 
         if not response.tool_calls:
             # No-tool-call gate cascade: bounce (empty-answer / H1) → loop again,
-            # or produce the final answer (S3 mark / placeholder) → return it.
-            final = _finalize_answer(session, client, state, response, on_delta)
+            # or produce the final answer (S3 mark / placeholder) → break to exit.
+            final = _finalize_answer(session, state, response, on_delta)
             if final is not None:
-                return final
+                answer = final
+                break
             continue
 
         _dispatch_round(session, state, response, on_delta)
@@ -1465,4 +1473,13 @@ def handle_user_message(
         # so force-finalize the turn instead of looping unbounded (observed live:
         # the same call blocked hundreds of times until an external timeout).
         if state.blocked_streak >= _BLOCKED_STREAK_CAP:
-            return _blocked_loop_giveup(session, state, on_delta)
+            answer = _blocked_loop_giveup(session, state, on_delta)
+            break
+
+    # Single choke point (E11): mine this settled turn — its diff plus the
+    # transcript tail, now including the final answer / give-up message — into
+    # durable memory exactly once, on every exit path (normal finalize,
+    # blocked-loop escalation, over-cap). Force-finalized turns did real work
+    # too, so they must be consolidated, not silently dropped.
+    consolidation_maybe_extract(session, client)
+    return answer

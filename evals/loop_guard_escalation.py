@@ -15,13 +15,18 @@ E8 adds two things this script exercises against the *real* production hot path
        the total number of stub chat calls stays within
        ``_REPEAT_CALL_CAP + _BLOCKED_STREAK_CAP + 2``, that at least one
        fold-surviving steer row (user role, STEER_PREFIX / steer flag) was
-       emitted this turn, and that ``turn_report["answer"]`` equals the returned
-       give-up text.
+       emitted this turn, that ``turn_report["answer"]`` equals the returned
+       give-up text, and (E11) that the end-of-turn consolidation hook fired
+       exactly once even on this force-finalized path — so the real work the
+       turn did is mined into memory rather than silently dropped.
 
     B. Reset — a real dispatch between blocked calls clears the streak, so a run
        that blocks twice, then dispatches a genuinely different call, then ends
        with a plain answer terminates NORMALLY (the model's own final text), never
-       via the escalation give-up.
+       via the escalation give-up. Also asserts (E11) the consolidation hook
+       fires exactly once on this normal finalize path — guarding against a
+       double-enqueue after the hook moved out of ``_finalize_answer`` into the
+       single choke point.
 
     C. Fold-survival — a message slice with no plain user row but a steer user-row
        ahead of assistant(tool_calls)+tool scaffolding, run through
@@ -57,15 +62,33 @@ def check_escalation() -> list[str]:
     original_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix="loop-guard-escalation-")
     os.chdir(tmp)
+    original_consolidate = agent.consolidation_maybe_extract
+    consolidate_calls: list[tuple] = []
     try:
         session = Session(tmp, "test-model", "You are a test agent.")
         # A single always-identical read-only call (list_files is PINNED and not
         # in _REPEAT_CAP_EXEMPT, so it is subject to the hard cap).
         client = _StubClient([_same_call_response("list_files", {"path": "."})])
 
+        # E11 — record the end-of-turn consolidation hook at the module seam
+        # (it is called unconditionally; MEMORY_ENABLED only gates its body), so
+        # the check is independent of memory config and does not touch memory.
+        # This is a force-finalized turn: it must still reach the hook exactly
+        # once, proving the escalation give-up path routes through the choke
+        # point rather than returning without consolidating the work it did.
+        agent.consolidation_maybe_extract = (
+            lambda *a, **kw: consolidate_calls.append((a, kw))
+        )
+
         answer = agent.handle_user_message(
             "list the files", session, client, on_delta=None  # pyright: ignore[reportArgumentType]
         )
+
+        if len(consolidate_calls) != 1:
+            failures.append(
+                f"consolidation hook fired {len(consolidate_calls)} times on the "
+                f"force-finalized turn, expected exactly 1"
+            )
 
         if not isinstance(answer, str) or not answer.strip():
             failures.append(f"turn did not return a non-empty string, got {answer!r}")
@@ -97,6 +120,7 @@ def check_escalation() -> list[str]:
                 f"does not equal the returned answer {answer!r}"
             )
     finally:
+        agent.consolidation_maybe_extract = original_consolidate
         os.chdir(original_cwd)
 
     return failures
@@ -113,9 +137,18 @@ def check_reset_no_premature_escalation() -> list[str]:
     original_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix="loop-guard-reset-")
     os.chdir(tmp)
+    original_consolidate = agent.consolidation_maybe_extract
+    consolidate_calls: list[tuple] = []
     # A second valid list_files target so a genuinely DIFFERENT call can dispatch.
     (Path(tmp) / "sub").mkdir()
     try:
+        # E11 — a normal (non-escalated) turn must fire the consolidation hook
+        # exactly once too: the restructure removed the inner call from
+        # _finalize_answer and moved it to the single choke point, so this guards
+        # against a double-enqueue regression on the normal finalize path.
+        agent.consolidation_maybe_extract = (
+            lambda *a, **kw: consolidate_calls.append((a, kw))
+        )
         session = Session(tmp, "test-model", "You are a test agent.")
         block_a = _same_call_response("list_files", {"path": "."})
         dispatch_b = _same_call_response("list_files", {"path": "sub"})
@@ -138,7 +171,15 @@ def check_reset_no_premature_escalation() -> list[str]:
                 f"expected the model's own final answer {final_text!r}, got "
                 f"{answer!r} (escalation fired prematurely or the reset failed)"
             )
+
+        if len(consolidate_calls) != 1:
+            failures.append(
+                f"consolidation hook fired {len(consolidate_calls)} times on the "
+                f"normal finalize turn, expected exactly 1 (double-enqueue "
+                f"regression?)"
+            )
     finally:
+        agent.consolidation_maybe_extract = original_consolidate
         os.chdir(original_cwd)
 
     return failures
