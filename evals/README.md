@@ -61,7 +61,14 @@ Scenarios are declared in `evals/scenarios.py` as plain dicts appended to
     (relative to the temp project dir) with at least N non-blank lines.
 
 A scenario can instead set `inline: '<script>.py'` (a script under `evals/`)
-to run a dispatch-level check with no LLM involved at all — the script is
-run directly and must exit `0` to pass. This is how loop-guard steering is
-covered, since a cooperative model will not reliably repeat an identical
-failing call twice in a live session.
+to run a deterministic check with no network involved at all — the script is
+run directly and must exit `0` to pass. Two flavours:
+
+- **Dispatch-level** checks poke a single subsystem directly (no LLM at all).
+  This is how loop-guard steering is covered, since a cooperative model will
+  not reliably repeat an identical failing call twice in a live session.
+- **End-to-end** checks drive the real turn loop (`agent.handle_user_message`)
+  with a scripted stub LLM (see `evals/_stub.py`), so a whole guarantee is
+  exercised offline and deterministically. This is how the escalation ladder
+  and the compaction ladder are covered — a live model's verbosity (and thus
+  whether compaction even triggers) is far too variable to gate on.

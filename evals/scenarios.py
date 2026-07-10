@@ -64,17 +64,6 @@ def is_even(n):
     return n % 2 == 0
 '''
 
-NOTES_MD = """# Notes
-
-Scratch notes fixture for the compaction-coherence eval scenario. Not load
-bearing content — just needs to exist so the model has a second file to
-read and discuss during the verbose-analysis turns.
-
-- Project convention: prefer small, well-documented helper functions.
-- Remember to keep functions pure where possible.
-"""
-
-
 SCENARIOS: list[dict] = [
     {
         "name": "load_tool_gate",
@@ -153,32 +142,18 @@ SCENARIOS: list[dict] = [
         ],
     },
     {
-        "name": "compaction_coherence",
+        "name": "compaction_e2e",
         "description": (
-            "Mid-session compaction fires under a tight context limit and "
-            "the model still recalls facts from before the compaction."
+            "End-to-end check (stub LLM, no network): the deterministic "
+            "replacement for the old live compaction scenario. Under a tiny "
+            "context_limit the compaction ladder fires on every run — it splices "
+            "a digest back under the cap, re-injects the original request as the "
+            "task anchor, prunes tool scaffolding past the fold, and completes "
+            "the turn; and when the summarizer cannot shrink, the overflow "
+            "force_fold engages instead of hanging. Model-recall quality is "
+            "intentionally out of scope (a model property, not a harness one)."
         ),
-        "turns": [
-            "Give me a verbose analysis (600+ words) of mathlib.py: "
-            "explain every function's purpose, edge cases, and how you "
-            "would test it.",
-            "Give me a verbose analysis (600+ words) of notes.md: explain "
-            "every point it makes and how it should shape how we write "
-            "code in this project.",
-            "Without reading any files again, from memory alone: what was "
-            "the ORIGINAL first request I gave you this session, which "
-            "files have you read, and what does the mean() function do "
-            "when given an empty list?",
-        ],
-        "config": {
-            "llm": {"context_limit": 4500},
-            "compaction": {"reserve_ratio": 0.1, "reserve_min_tokens": 500},
-        },
-        "setup": {"mathlib.py": MATHLIB_PY, "notes.md": NOTES_MD},
-        "checks": [
-            {"stream": "stderr", "kind": "regex-present", "pattern": r"post-compaction #"},
-            {"stream": "stdout", "kind": "regex-present", "pattern": r"ValueError"},
-        ],
+        "inline": "compaction_e2e.py",
     },
     {
         "name": "scope_decline",

@@ -55,17 +55,6 @@ _CANNED: dict[str, dict[str, str]] = {
             "[read_file(success)]\n"
         ),
     },
-    "compaction_coherence": {
-        "stdout": (
-            "Your original first request was a 600+ word analysis of "
-            "mathlib.py. I have read mathlib.py and notes.md this session. "
-            "mean() raises ValueError when given an empty list.\n"
-        ),
-        "stderr": (
-            "context: 12 messages, ~4800 tokens (cap 4050)\n"
-            "context: 6 messages, ~2100 tokens (cap 4050) [post-compaction #1]\n"
-        ),
-    },
     "scope_decline": {
         "stdout": (
             "I'm a software engineering agent scoped to this codebase/project, "

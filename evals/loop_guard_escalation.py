@@ -43,72 +43,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-
-class _StubConfig:
-    """Minimal stand-in for LLMConfig — only context_limit is read by the loop.
-
-    A large limit keeps compaction dormant so the run exercises the loop-guard
-    ladder in isolation, never the summarizer.
-    """
-
-    def __init__(self, context_limit: int = 200_000) -> None:
-        self.context_limit = context_limit
-
-
-class _StubClient:
-    """LLMClient-compatible stub that scripts a fixed sequence of chat responses.
-
-    ``script`` is a list of callables, one per expected chat call, each returning
-    the ``ChatResponse`` for that round; the last entry is reused once the script
-    is exhausted (so a single trailing final-answer response covers any surplus).
-    A hard self-cap raises after ``max_calls`` chats so a regression that fails to
-    escalate fails fast here instead of hanging.
-    """
-
-    def __init__(self, script, max_calls: int = 30) -> None:
-        self.config = _StubConfig()
-        self._script = script
-        self.calls = 0
-        self._max_calls = max_calls
-
-    def chat(self, messages, tools=None, on_delta=None):
-        if self.calls >= self._max_calls:
-            raise RuntimeError(
-                f"stub chat exceeded its {self._max_calls}-call self-cap — the "
-                f"turn never terminated (escalation ladder likely broken)"
-            )
-        idx = min(self.calls, len(self._script) - 1)
-        self.calls += 1
-        return self._script[idx]()
-
-
-def _same_call_response(name: str, arguments: dict):
-    """Return a factory that yields a ChatResponse re-issuing one identical call.
-
-    Each call gets a fresh id (the wire protocol pairs a tool result to its
-    call id) but the same name+arguments, so the repeat-call cap counts them as
-    identical and the loop-guard eventually blocks them.
-    """
-    from llm import ChatResponse, ToolCall
-
-    counter = {"n": 0}
-
-    def factory():
-        counter["n"] += 1
-        tc = ToolCall(id=f"call-{counter['n']}", name=name, arguments=dict(arguments))
-        return ChatResponse(text="", tool_calls=[tc])
-
-    return factory
-
-
-def _final_answer_response(text: str):
-    """Return a factory that yields a no-tool-call ChatResponse (turn ends)."""
-    from llm import ChatResponse
-
-    def factory():
-        return ChatResponse(text=text, tool_calls=[])
-
-    return factory
+from evals._stub import _final_answer_response, _same_call_response, _StubClient
 
 
 def check_escalation() -> list[str]:
