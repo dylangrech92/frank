@@ -1,8 +1,9 @@
-"""E13 reproduce-before-edit steer check, end-to-end through the real turn loop.
+"""Reproduce-before-edit steer check, end-to-end through the real turn loop.
 
 The H1 verification nudge only fires when the model tries to END a turn, so a run
 that edits, re-edits, and never reaches the end-of-turn gate is never steered
-toward observed-output-first debugging. E13 closes that gap upstream: the first
+toward observed-output-first debugging. The reproduce-before-edit steer closes
+that gap upstream: the first
 relevant file mutation of a turn that has run nothing to observe the problem gets
 a fold-surviving steer, once per turn, appended after the round's tool results.
 This script drives that against the *real* production hot path

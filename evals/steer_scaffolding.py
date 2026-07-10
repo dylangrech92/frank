@@ -1,4 +1,4 @@
-"""E15 in-turn steers must not collapse the turn's own scaffolding.
+"""In-turn steers must not collapse the turn's own scaffolding.
 
 ``_prune_messages`` shapes the sent view: it keeps the in-flight turn verbatim and
 collapses every completed prior turn to ``[user, final answer]``. The in-flight

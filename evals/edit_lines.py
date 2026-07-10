@@ -1,6 +1,6 @@
 """Dispatch-level check of the edit_lines tool and read_file numbering (no LLM).
 
-E3 gives the model a line-anchored edit path so it stops rewriting whole files
+The edit_lines tool gives the model a line-anchored edit path so it stops rewriting whole files
 with update_file. This script drives that surface directly, in a throwaway temp
 project, and asserts its load-bearing properties without any live LLM:
 

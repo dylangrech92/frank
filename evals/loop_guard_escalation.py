@@ -1,11 +1,11 @@
-"""E8 loop-guard escalation check, end-to-end through the real turn loop.
+"""Loop-guard escalation check, end-to-end through the real turn loop.
 
 The repeat-call hard cap refuses an identical tool call once it has run
 ``_REPEAT_CALL_CAP`` times this turn, but a determined model can keep re-issuing
 the blocked call — each round a full LLM round-trip that dispatches nothing —
 until an external timeout. Worse, when compaction folds the block error and the
 tool result out of context, the model loses even the feedback that it is stuck.
-E8 adds two things this script exercises against the *real* production hot path
+The escalation ladder adds two things this script exercises against the *real* production hot path
 (``agent.handle_user_message`` with a stub LLM client, no network):
 
     A. Escalation — after ``_BLOCKED_STREAK_CAP`` consecutive blocked calls with
@@ -16,7 +16,7 @@ E8 adds two things this script exercises against the *real* production hot path
        ``_REPEAT_CALL_CAP + _BLOCKED_STREAK_CAP + 2``, that at least one
        fold-surviving steer row (user role, STEER_PREFIX / steer flag) was
        emitted this turn, that ``turn_report["answer"]`` equals the returned
-       give-up text, and (E11) that the end-of-turn consolidation hook fired
+       give-up text, and that the end-of-turn consolidation hook fired
        exactly once even on this force-finalized path — so the real work the
        turn did is mined into memory rather than silently dropped.
 
@@ -32,7 +32,7 @@ E8 adds two things this script exercises against the *real* production hot path
     B. Reset — a real dispatch between blocked calls clears the streak, so a run
        that blocks twice, then dispatches a genuinely different call, then ends
        with a plain answer terminates NORMALLY (the model's own final text), never
-       via the escalation give-up. Also asserts (E11) the consolidation hook
+       via the escalation give-up. Also asserts the consolidation hook
        fires exactly once on this normal finalize path — guarding against a
        double-enqueue after the hook moved out of ``_finalize_answer`` into the
        single choke point.
@@ -79,7 +79,7 @@ def check_escalation() -> list[str]:
         # in _REPEAT_CAP_EXEMPT, so it is subject to the hard cap).
         client = _StubClient([_same_call_response("list_files", {"path": "."})])
 
-        # E11 — record the end-of-turn consolidation hook at the module seam
+        # Record the end-of-turn consolidation hook at the module seam
         # (it is called unconditionally; MEMORY_ENABLED only gates its body), so
         # the check is independent of memory config and does not touch memory.
         # This is a force-finalized turn: it must still reach the hook exactly
@@ -139,7 +139,7 @@ def _drive_giveup(tmp_prefix: str, prefix_script: list):
     """Drive one force-finalized turn and return ``(answer, session)``.
 
     Runs *prefix_script* (real create_file/run_command calls that leave facts in
-    turn_report), then spirals into an identical blocked call until the E8
+    turn_report), then spirals into an identical blocked call until the
     escalation give-up force-finalizes the turn. Consolidation is stubbed to a
     no-op so the check never touches memory. chdir's into a throwaway temp dir
     (create_file / list_files resolve against cwd) and restores cwd afterward.
@@ -337,7 +337,7 @@ def check_reset_no_premature_escalation() -> list[str]:
     # A second valid list_files target so a genuinely DIFFERENT call can dispatch.
     (Path(tmp) / "sub").mkdir()
     try:
-        # E11 — a normal (non-escalated) turn must fire the consolidation hook
+        # A normal (non-escalated) turn must fire the consolidation hook
         # exactly once too: the restructure removed the inner call from
         # _finalize_answer and moved it to the single choke point, so this guards
         # against a double-enqueue regression on the normal finalize path.

@@ -1,11 +1,11 @@
-"""E16 verify-tool wiring check, end-to-end through the real turn loop.
+"""Verify-tool wiring check, end-to-end through the real turn loop.
 
 Two harness steers tell the model to verify its edits by name — the reproduce-
 before-edit steer names ``run_command``; the H1 verification nudge names
 ``verify_scratch`` / ``run_tests`` / ``run_command``. Those tools are catalog-
 gated: they only enter the request's tools array once activated via ``load_tool``.
 Before this change a steer fired without activating them, demanding a tool the
-model could not call. E16 wires the two fire sites to ``agent._activate_
+model could not call. The wiring connects the two fire sites to ``agent._activate_
 verification_tools()`` so the very next round's ``schemas()`` carries the tools.
 
 This script drives the *real* production hot path (``agent.handle_user_message``

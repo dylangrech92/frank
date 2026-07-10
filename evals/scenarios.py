@@ -282,7 +282,7 @@ SCENARIOS: list[dict] = [
             "identical blocked call is force-finalized by the harness after "
             "_BLOCKED_STREAK_CAP consecutive blocks (with a fold-surviving steer "
             "emitted first); the give-up envelope is synthesized truthfully from "
-            "turn_report (E14) — naming applied files + verification runs, never "
+            "turn_report — naming applied files + verification runs, never "
             "claiming work is 'unavailable', and stamping verified with the same "
             "formula as a normal finalize; a real dispatch between blocks resets "
             "the streak so escalation never fires prematurely; and a blocked-round "

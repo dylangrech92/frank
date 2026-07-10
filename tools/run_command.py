@@ -16,6 +16,12 @@ from tools.result import ToolResult
 # is abandoned (no snapshot, no diff) once the walk crosses this many files.
 _MAX_SNAPSHOT_FILES = 20000
 
+# Upper bound on paths named per kind in the mutation note appended to a
+# foreground result. A command that writes hundreds of files (e.g. a generator
+# script) must not bloat the render, so extra paths collapse to a "+N more"
+# tail.
+_MAX_RENDERED_PATHS = 5
+
 
 def _snapshot_tree(root: Path) -> dict[str, tuple[int, int]] | None:
     """Record ``{abs_path: (st_mtime_ns, st_size)}`` for every file under *root*.
@@ -69,28 +75,109 @@ def _format_streams(stdout_text: str, stderr_text: str) -> str:
     return f'--- stdout ---\n{stdout_text}'
 
 
-def _publish_snapshot_diff(
+def _diff_snapshots(
     before: dict[str, tuple[int, int]],
     after: dict[str, tuple[int, int]],
-) -> None:
-    """Emit a mutation event for every file that a command created/changed/deleted.
+) -> tuple[list[str], list[str], list[str]]:
+    """Classify the difference between two tree snapshots.
 
-    A path present only afterwards is ``created``, present only before is
-    ``deleted``, and present in both with a different ``(mtime_ns, size)`` is
-    ``changed``. Paths are already absolute (from :func:`os.walk`), matching how
-    the edit tools publish resolved paths. ``emit_mutation`` is called directly
-    (not wrapped) so subscriber errors surface exactly as they do for the other
-    publishers.
+    A path present only in *after* is created, present only in *before* is
+    deleted, and present in both with a different ``(mtime_ns, size)`` is
+    changed. Each list is sorted so the classification is deterministic
+    regardless of dict iteration order.
+
+    Returns:
+        ``(created, deleted, changed)`` — three sorted lists of absolute paths.
     """
     before_paths = set(before)
     after_paths = set(after)
-    for path in after_paths - before_paths:
+    created = sorted(after_paths - before_paths)
+    deleted = sorted(before_paths - after_paths)
+    changed = sorted(p for p in before_paths & after_paths if before[p] != after[p])
+    return created, deleted, changed
+
+
+def _publish_snapshot_diff(
+    before: dict[str, tuple[int, int]],
+    after: dict[str, tuple[int, int]],
+) -> tuple[list[str], list[str], list[str]]:
+    """Emit a mutation event for every file that a command created/changed/deleted.
+
+    Classification is delegated to :func:`_diff_snapshots`; this publishes one
+    event per path in the order class created, deleted, changed. Paths are
+    already absolute (from :func:`os.walk`), matching how the edit tools publish
+    resolved paths. ``emit_mutation`` is called directly (not wrapped) so
+    subscriber errors surface exactly as they do for the other publishers.
+
+    Returns:
+        The ``(created, deleted, changed)`` classification, so the caller can
+        render the same fact it just published without recomputing it.
+    """
+    created, deleted, changed = _diff_snapshots(before, after)
+    for path in created:
         emit_mutation('created', path)
-    for path in before_paths - after_paths:
+    for path in deleted:
         emit_mutation('deleted', path)
-    for path in before_paths & after_paths:
-        if before[path] != after[path]:
-            emit_mutation('changed', path)
+    for path in changed:
+        emit_mutation('changed', path)
+    return created, deleted, changed
+
+
+def _render_mutation_line(
+    root: Path,
+    created: list[str],
+    deleted: list[str],
+    changed: list[str],
+) -> str:
+    """Build the one-line world-fact note naming files a command touched.
+
+    Paths arrive absolute (from the snapshot walk) and are rendered relative to
+    *root* so the note reads in project terms. Each kind names at most
+    :data:`_MAX_RENDERED_PATHS` paths, then a ``+N more`` tail, so a script that
+    writes many files cannot bloat the result. Empty kinds are omitted, and an
+    all-empty diff yields the empty string so the caller can test truthiness.
+
+    The note states the world fact only — which files changed — with no
+    directive or conditional advice attached.
+    """
+    segments = [
+        seg for seg in (
+            _format_kind('created', _relativize(created, root)),
+            _format_kind('changed', _relativize(changed, root)),
+            _format_kind('deleted', _relativize(deleted, root)),
+        )
+        if seg is not None
+    ]
+    if not segments:
+        return ''
+    return f"(this command modified project files — {'; '.join(segments)})"
+
+
+def _relativize(paths: list[str], root: Path) -> list[str]:
+    """Render each absolute path in *paths* relative to *root*.
+
+    A path that cannot be expressed relative to *root* (e.g. a different drive)
+    is kept as-is rather than dropped, so nothing silently vanishes from the note.
+    """
+    rel: list[str] = []
+    for path in paths:
+        try:
+            rel.append(os.path.relpath(path, root))
+        except ValueError:
+            rel.append(path)
+    return rel
+
+
+def _format_kind(label: str, paths: list[str]) -> str | None:
+    """Format one ``label: p1, p2, +N more`` segment, or ``None`` when empty."""
+    if not paths:
+        return None
+    shown = paths[:_MAX_RENDERED_PATHS]
+    joined = ', '.join(shown)
+    extra = len(paths) - len(shown)
+    if extra > 0:
+        joined += f', +{extra} more'
+    return f'{label}: {joined}'
 
 
 class RunCommand(Tool):
@@ -108,8 +195,10 @@ class RunCommand(Tool):
     that writes to disk) publishes mutation events through the shared bus by
     snapshotting the project tree before and after the run and diffing it, so
     the per-turn files_changed accounting, the reactive lint delta, and the
-    verify gate all arm even when the edit did not go through an edit tool.
-    Background commands do not publish mutation events.
+    verify gate all arm even when the edit did not go through an edit tool. That
+    same diff is also named in the foreground result body, so the model sees
+    which files a command touched at the moment it happens. Background commands
+    do not publish mutation events.
     """
 
     name = 'run_command'
@@ -119,7 +208,9 @@ class RunCommand(Tool):
         'the result; set background=true to run it in the background and poll '
         'later. Commands always run with the project root as the working '
         'directory, so a cd into the project is never needed. A deny-list '
-        'blocks certain hazardous commands before they are executed.'
+        'blocks certain hazardous commands before they are executed. When a '
+        'command creates, changes, or deletes project files, the result names '
+        'the affected files.'
     )
     action = 'run the command'
     oversize_hint = 'pipe the output through head/tail or redirect it to a file and read a slice'
@@ -197,14 +288,19 @@ class RunCommand(Tool):
         # Publish snapshot-diff mutation events once, regardless of how the
         # command ended (success, nonzero exit, or timeout) — files may be
         # mutated on any of those paths. A failed/aborted snapshot degrades to
-        # no events rather than crashing the command result.
+        # no events (and an empty mutation line) rather than crashing the
+        # command result.
+        mutation_line = ''
         if before is not None:
             after = _snapshot_tree(root)
             if after is not None:
-                _publish_snapshot_diff(before, after)
+                created, deleted, changed = _publish_snapshot_diff(before, after)
+                mutation_line = _render_mutation_line(root, created, deleted, changed)
 
         if result['timed_out']:
             body = _format_streams(str(result['stdout']), str(result.get('stderr', '')))
+            if mutation_line:
+                body += f'\n{mutation_line}'
             return ToolResult.err(
                 f'Command was killed after {timeout} seconds.\n\n{body}',
                 code='timeout',
@@ -212,6 +308,11 @@ class RunCommand(Tool):
             )
 
         output = _format_streams(str(result['stdout']), str(result.get('stderr', '')))
+        # Name the files this command touched (fact only) before the nonzero-exit
+        # grounding line, so the render reads streams, then mutation, then
+        # grounding.
+        if mutation_line:
+            output += f'\n{mutation_line}'
 
         exit_code = result['exit_code']
         # A nonzero exit is otherwise only visible as a trailing meta line while
