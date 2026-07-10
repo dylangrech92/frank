@@ -20,6 +20,14 @@ E8 adds two things this script exercises against the *real* production hot path
        exactly once even on this force-finalized path — so the real work the
        turn did is mined into memory rather than silently dropped.
 
+    A2. Truthful give-up envelope (E14) — the force-finalized answer is
+       synthesized from ``turn_report`` (no extra LLM call), not a static string.
+       A turn that mutated a file and ran a successful ``run_command`` yields an
+       answer that names the file and the run, never says "unavailable", and
+       stamps ``verified == True``; a mutation with no verification run keeps the
+       cut-short caveat and ``verified == False``; and a turn that did no work
+       stays close to the plain give-up with no "Work already applied" section.
+
     B. Reset — a real dispatch between blocked calls clears the streak, so a run
        that blocks twice, then dispatches a genuinely different call, then ends
        with a plain answer terminates NORMALLY (the model's own final text), never
@@ -123,6 +131,142 @@ def check_escalation() -> list[str]:
         agent.consolidation_maybe_extract = original_consolidate
         os.chdir(original_cwd)
 
+    return failures
+
+
+def _drive_giveup(tmp_prefix: str, prefix_script: list):
+    """Drive one force-finalized turn and return ``(answer, session)``.
+
+    Runs *prefix_script* (real create_file/run_command calls that leave facts in
+    turn_report), then spirals into an identical blocked call until the E8
+    escalation give-up force-finalizes the turn. Consolidation is stubbed to a
+    no-op so the check never touches memory. chdir's into a throwaway temp dir
+    (create_file / list_files resolve against cwd) and restores cwd afterward.
+    """
+    import agent
+    from session import Session
+    from tools import registry
+
+    # create_file / run_command are catalog tools (not PINNED), so dispatch would
+    # reject them not-loaded — activate them exactly as a real session would after
+    # a load_tool call, so the prefix genuinely mutates and verifies.
+    registry.activate("create_file")
+    registry.activate("run_command")
+
+    original_cwd = os.getcwd()
+    tmp = tempfile.mkdtemp(prefix=tmp_prefix)
+    os.chdir(tmp)
+    original_consolidate = agent.consolidation_maybe_extract
+    try:
+        agent.consolidation_maybe_extract = lambda *a, **kw: None
+        session = Session(tmp, "test-model", "You are a test agent.")
+        # The trailing always-identical read-only call eventually blocks at the
+        # hard cap and escalates; the stub reuses it for every surplus round.
+        script = list(prefix_script) + [_same_call_response("list_files", {"path": "."})]
+        client = _StubClient(script)
+        answer = agent.handle_user_message(
+            "do the multi-file work", session, client, on_delta=None  # pyright: ignore[reportArgumentType]
+        )
+        return answer, session
+    finally:
+        agent.consolidation_maybe_extract = original_consolidate
+        os.chdir(original_cwd)
+
+
+def check_giveup_verified_work() -> list[str]:
+    """E14 (a). Force-finalize after a mutation + successful run_command.
+
+    The synthesized give-up answer must name the mutated file and the verification
+    run, must NOT claim the report is 'unavailable', and turn_report['verified']
+    must be True (real work landed and was verified before the stall).
+    """
+    failures: list[str] = []
+    prefix = [
+        _same_call_response("create_file", {"path": "feature.py", "content": "x = 1\n"}),
+        _same_call_response("run_command", {"cmd": "python3 -c \"print('ok')\""}),
+    ]
+    answer, session = _drive_giveup("giveup-verified-", prefix)
+    report = session.turn_report
+
+    files = report["files_changed"]
+    if not files:
+        failures.append("no files_changed recorded despite a create_file mutation")
+    else:
+        path = files[0]["path"]
+        if path not in answer:
+            failures.append(
+                f"give-up answer does not name the mutated file path {path!r}: {answer!r}"
+            )
+    if "work already applied" not in answer.lower():
+        failures.append(f"give-up answer omits the work-applied marker: {answer!r}")
+    if "unavailable" in answer.lower():
+        failures.append(f"give-up answer still claims work is 'unavailable': {answer!r}")
+    if "run_command" not in answer:
+        failures.append(f"give-up answer omits the verification run: {answer!r}")
+    if report["verified"] is not True:
+        failures.append(
+            f"turn_report['verified']={report['verified']!r}, expected True "
+            f"(mutation + successful run_command)"
+        )
+    if answer != report.get("answer"):
+        failures.append("turn_report['answer'] does not equal the returned answer")
+    return failures
+
+
+def check_giveup_unverified_work() -> list[str]:
+    """E14 (b). Force-finalize after a mutation with NO verification run.
+
+    The answer must still name the file and carry the cut-short caveat, but
+    turn_report['verified'] must be False (nothing ran to verify the change).
+    """
+    failures: list[str] = []
+    prefix = [
+        _same_call_response("create_file", {"path": "widget.py", "content": "y = 2\n"}),
+    ]
+    answer, session = _drive_giveup("giveup-unverified-", prefix)
+    report = session.turn_report
+
+    files = report["files_changed"]
+    if not files:
+        failures.append("no files_changed recorded despite a create_file mutation")
+    else:
+        path = files[0]["path"]
+        if path not in answer:
+            failures.append(
+                f"give-up answer does not name the mutated file path {path!r}: {answer!r}"
+            )
+    if "review the applied changes before retrying" not in answer.lower():
+        failures.append(f"give-up answer omits the cut-short caveat: {answer!r}")
+    if report["verified"] is not False:
+        failures.append(
+            f"turn_report['verified']={report['verified']!r}, expected False "
+            f"(mutation with no verification run)"
+        )
+    return failures
+
+
+def check_giveup_no_work() -> list[str]:
+    """E14 (c). Force-finalize a turn that did no work at all.
+
+    With no mutation and no run, the answer stays close to the plain give-up (no
+    'Work already applied' section) and verified is False.
+    """
+    failures: list[str] = []
+    answer, session = _drive_giveup("giveup-nowork-", [])
+    report = session.turn_report
+
+    if "work already applied" in answer.lower():
+        failures.append(
+            f"give-up answer claims work applied on a no-work turn: {answer!r}"
+        )
+    low = answer.lower()
+    if not ("harness" in low or "repeated" in low or "blocked" in low):
+        failures.append(f"give-up answer names no harness/blocked cause: {answer!r}")
+    if report["verified"] is not False:
+        failures.append(
+            f"turn_report['verified']={report['verified']!r}, expected False "
+            f"(no work this turn)"
+        )
     return failures
 
 
@@ -237,6 +381,9 @@ def main() -> int:
     all_failures: list[str] = []
     for label, fn in (
         ("escalation", check_escalation),
+        ("giveup-verified-work", check_giveup_verified_work),
+        ("giveup-unverified-work", check_giveup_unverified_work),
+        ("giveup-no-work", check_giveup_no_work),
         ("reset", check_reset_no_premature_escalation),
         ("fold-survival", check_fold_survival),
     ):
@@ -251,8 +398,9 @@ def main() -> int:
     if all_failures:
         return 1
     print(
-        "PASS: escalation force-finalizes a blocked loop; a dispatch resets the "
-        "streak; the blocked-round steer survives _prune_messages"
+        "PASS: escalation force-finalizes a blocked loop with a truthful give-up "
+        "envelope (files + runs + verified stamped from turn_report); a dispatch "
+        "resets the streak; the blocked-round steer survives _prune_messages"
     )
     return 0
 

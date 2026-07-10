@@ -739,23 +739,119 @@ class _TurnState:
     blocked_streak: int = 0
 
 
+# E14 — how many files / verification runs a synthesized give-up answer lists
+# before collapsing the tail into a "+N more" count, so a huge turn cannot bloat
+# the envelope.
+_GIVEUP_FILES_CAP = 10
+_GIVEUP_RUNS_CAP = 5
+
+
+def _turn_verified(state: "_TurnState") -> bool:
+    """Single source of truth for ``turn_report["verified"]`` (E14).
+
+    A turn counts as verified iff it actually mutated a file this turn AND no
+    unresolved verification gate remains (a ``run_tests``/``run_command``/
+    ``verify_scratch`` call succeeded after the last mutation, clearing
+    ``needs_verification``). Shared verbatim by ``_finalize_answer`` and both
+    early-exit give-up paths so the flag means the same thing however the turn
+    ended — a give-up envelope no longer under-reports verified work.
+    """
+    return bool(state.mutated_paths) and not state.needs_verification
+
+
+def _synthesize_giveup_answer(reason: str, retry_hint: str, state: "_TurnState") -> str:
+    """Build a truthful give-up answer from the facts already in ``turn_report``.
+
+    E14 — the two early-exit give-up paths used to emit a static string claiming
+    "a report of what was accomplished is unavailable", which is false whenever
+    the turn had already applied edits and verified them on disk. ``turn_report``
+    already holds those facts (``files_changed`` + ``verification_runs``), so this
+    synthesizes an honest envelope from them with no extra LLM call. *reason* is
+    the leading sentence naming why the harness ended the turn; *retry_hint* is
+    the path-appropriate advice used only when the turn did no work at all.
+    """
+    files = state.turn_report["files_changed"]
+    runs = state.turn_report["verification_runs"]
+
+    if not files and not runs:
+        # No mutations and no runs — nothing to report beyond the plain give-up,
+        # staying close to each path's original terminal message.
+        return f"{reason} No files were changed and nothing was run this turn — {retry_hint}"
+
+    parts = [reason, "Work already applied this turn."]
+
+    if files:
+        seen: list[str] = []
+        for entry in files:
+            path = entry.get("path")
+            if path and path not in seen:
+                seen.append(path)
+        shown = seen[:_GIVEUP_FILES_CAP]
+        seg = "Files changed: " + ", ".join(shown)
+        extra = len(seen) - len(shown)
+        if extra > 0:
+            seg += f" (+{extra} more)"
+        parts.append(seg + ".")
+
+    if runs:
+        shown_runs = runs[:_GIVEUP_RUNS_CAP]
+        rendered = [
+            f"{r.get('tool')} {str(r.get('detail', ''))!r} ({r.get('status')})"
+            for r in shown_runs
+        ]
+        seg = "Verification runs: " + "; ".join(rendered)
+        extra = len(runs) - len(shown_runs)
+        if extra > 0:
+            seg += f" (+{extra} more)"
+        parts.append(seg + ".")
+
+    parts.append(
+        "The turn was cut short, so parts of the request may be incomplete — "
+        "review the applied changes before retrying."
+    )
+    return " ".join(parts)
+
+
+def _finalize_giveup(
+    session: Session,
+    state: "_TurnState",
+    reason: str,
+    retry_hint: str,
+    on_delta: Callable[[str], None] | None,
+) -> str:
+    """Shared tail for the two early-exit give-up paths (E14).
+
+    Both ``_over_cap_giveup`` and ``_blocked_loop_giveup`` end a turn without
+    reaching ``_finalize_answer``. They fold their common tail here: synthesize a
+    truthful answer from ``turn_report`` (no extra LLM call), record it as the
+    turn's final answer across transcript + ``turn_report`` + ``on_delta``, and
+    stamp ``turn_report["verified"]`` with the one shared formula (``_turn_verified``).
+    """
+    msg = _synthesize_giveup_answer(reason, retry_hint, state)
+    session.append_assistant(msg)
+    state.turn_report["answer"] = msg
+    state.turn_report["verified"] = _turn_verified(state)
+    if on_delta is not None:
+        on_delta(msg + "\n")
+    return msg
+
+
 def _over_cap_giveup(
     session: Session, state: "_TurnState", on_delta: Callable[[str], None] | None
 ) -> str:
     """Terminal give-up when compaction cannot get the context under cap.
 
-    Records a plain-text explanation as the turn's final answer (transcript,
-    turn_report, and on_delta payload) and returns it verbatim.
+    Records a truthful synthesized answer (E14) as the turn's final answer
+    (transcript, ``turn_report``, and on_delta payload), stamps ``verified``, and
+    returns it verbatim.
     """
-    msg = (
-        "Context is over the model's token budget and compaction could not "
-        "reduce it further. Start a new session or shorten the request."
+    reason = (
+        "This turn was ended by the harness: the context went over the model's "
+        "token budget and compaction could not reduce it further."
     )
-    session.append_assistant(msg)
-    state.turn_report["answer"] = msg
-    if on_delta is not None:
-        on_delta(msg + "\n")
-    return msg
+    return _finalize_giveup(
+        session, state, reason, "start a new session or shorten the request.", on_delta
+    )
 
 
 def _blocked_loop_giveup(
@@ -767,18 +863,11 @@ def _blocked_loop_giveup(
     refused ``_BLOCKED_STREAK_CAP`` identical calls in a row with no dispatch in
     between (the model ignored both the block error and the fold-surviving steer),
     further chat rounds only burn a full LLM round-trip per blocked call. This
-    ends the turn instead — mirroring ``_over_cap_giveup``: records a plain-text
-    explanation as the turn's final answer (transcript, ``turn_report``, and
-    on_delta payload) and returns it verbatim.
+    ends the turn instead — mirroring ``_over_cap_giveup``: records a truthful
+    synthesized answer (E14) as the turn's final answer (transcript,
+    ``turn_report``, and on_delta payload), stamps ``verified``, and returns it
+    verbatim.
     """
-    msg = (
-        f"This turn was ended by the harness: the same tool call was repeated "
-        f"and blocked {state.blocked_streak} times in a row with no progress. A "
-        f"report of what was accomplished is unavailable — rephrase or split the "
-        f"request and try again."
-    )
-    session.append_assistant(msg)
-    state.turn_report["answer"] = msg
     print(
         ui.telemetry(
             f"loop-guard: escalated — turn force-finalized after "
@@ -786,9 +875,13 @@ def _blocked_loop_giveup(
         ),
         file=sys.stderr,
     )
-    if on_delta is not None:
-        on_delta(msg + "\n")
-    return msg
+    reason = (
+        f"This turn was ended by the harness: the same tool call was repeated "
+        f"and blocked {state.blocked_streak} times in a row with no progress."
+    )
+    return _finalize_giveup(
+        session, state, reason, "rephrase or split the request and try again.", on_delta
+    )
 
 
 def _record_llm_usage(
@@ -1342,7 +1435,8 @@ def _finalize_answer(
                 ),
                 file=sys.stderr,
             )
-    state.turn_report["verified"] = bool(state.mutated_paths) and not state.needs_verification
+    # E14 — one shared formula for verified across every turn-exit path.
+    state.turn_report["verified"] = _turn_verified(state)
 
     # Empty-answer placeholder: if the model returned no text at all (the retry
     # above already fired once and still came back empty), surface a transparent
