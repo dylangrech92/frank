@@ -285,6 +285,18 @@ SCENARIOS: list[dict] = [
         "inline": "edit_lines.py",
     },
     {
+        "name": "loop_guard_escalation",
+        "description": (
+            "End-to-end check (stub LLM, no network): a model that re-issues an "
+            "identical blocked call is force-finalized by the harness after "
+            "_BLOCKED_STREAK_CAP consecutive blocks (with a fold-surviving steer "
+            "emitted first); a real dispatch between blocks resets the streak so "
+            "escalation never fires prematurely; and a blocked-round steer "
+            "survives _prune_messages while the tool scaffolding before it drops."
+        ),
+        "inline": "loop_guard_escalation.py",
+    },
+    {
         "name": "compaction_force_fold",
         "description": (
             "Dispatch-level check (no LLM): the overflow-ladder force_fold "

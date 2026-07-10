@@ -20,7 +20,6 @@ guidance from real human input.
 
 import json
 import sys
-import time
 import compaction
 import ui
 
@@ -363,6 +362,29 @@ def _loop_guard_check(
 _REPEAT_CALL_CAP = 3
 _REPEAT_CAP_EXEMPT = frozenset({"run_command", "run_tests", "verify_scratch"})
 
+# E8 escalation ladder above the hard cap. Once the cap starts refusing an
+# identical call, a determined model can re-issue it every round — each a full
+# LLM round-trip that dispatches nothing. Worse, when compaction drops the block
+# error and the tool result from context, the model loses even the feedback that
+# it is stuck (only a fold-surviving steer on the user row remains). After this
+# many consecutive blocked calls with no dispatch in between, the turn is
+# force-finalized (see _blocked_loop_giveup / handle_user_message).
+_BLOCKED_STREAK_CAP = 3
+
+# Fold-surviving steer for a blocked round, worded plainly (small local models
+# treat bracketed tags as noise) and spelling out that it is an automated
+# harness message, NOT the user's — append_steer already prepends STEER_PREFIX,
+# so this is the body only. It rides the user role, which _prune_messages keeps
+# across a compaction boundary, so the feedback survives even when the block
+# error and tool result behind it are folded away.
+_BLOCKED_ROUND_STEER = (
+    "The last tool call was blocked because it has already run {n} times this "
+    "turn with identical arguments. If you were re-issuing it because the earlier "
+    "result is no longer visible, that result was removed from context to save "
+    "space — do not repeat the call. Use what you already know, take a different "
+    "action, or give your final answer now."
+)
+
 
 def _call_signature(arguments: dict) -> str:
     """Return a stable, hashable signature for a tool call's arguments.
@@ -687,6 +709,14 @@ class _TurnState:
     seen_calls: dict[tuple[str, str], int] = field(default_factory=dict)
     # Every distinct path mutated this turn (H1/H5 tracking).
     mutated_paths: set[str] = field(default_factory=set)
+    # E8 loop-guard escalation: consecutive tool calls refused by the repeat-call
+    # hard cap, counted regardless of key (alternating between two blocked calls
+    # is just as stuck). Incremented on every hard-cap block, reset to 0 the
+    # moment any call actually dispatches (sequential or a parallel-safe batch) —
+    # a real dispatch proves progress. When it reaches ``_BLOCKED_STREAK_CAP`` the
+    # turn is force-finalized instead of looping the same blocked call forever
+    # (see handle_user_message / _blocked_loop_giveup).
+    blocked_streak: int = 0
 
 
 def _over_cap_giveup(
@@ -703,6 +733,39 @@ def _over_cap_giveup(
     )
     session.append_assistant(msg)
     state.turn_report["answer"] = msg
+    if on_delta is not None:
+        on_delta(msg + "\n")
+    return msg
+
+
+def _blocked_loop_giveup(
+    session: Session, state: "_TurnState", on_delta: Callable[[str], None] | None
+) -> str:
+    """Terminal give-up when the same tool call is blocked in a tight loop.
+
+    The escalation ladder above the repeat-call hard cap: once the harness has
+    refused ``_BLOCKED_STREAK_CAP`` identical calls in a row with no dispatch in
+    between (the model ignored both the block error and the fold-surviving steer),
+    further chat rounds only burn a full LLM round-trip per blocked call. This
+    ends the turn instead — mirroring ``_over_cap_giveup``: records a plain-text
+    explanation as the turn's final answer (transcript, ``turn_report``, and
+    on_delta payload) and returns it verbatim.
+    """
+    msg = (
+        f"This turn was ended by the harness: the same tool call was repeated "
+        f"and blocked {state.blocked_streak} times in a row with no progress. A "
+        f"report of what was accomplished is unavailable — rephrase or split the "
+        f"request and try again."
+    )
+    session.append_assistant(msg)
+    state.turn_report["answer"] = msg
+    print(
+        ui.telemetry(
+            f"loop-guard: escalated — turn force-finalized after "
+            f"{state.blocked_streak} consecutive blocked calls"
+        ),
+        file=sys.stderr,
+    )
     if on_delta is not None:
         on_delta(msg + "\n")
     return msg
@@ -934,6 +997,99 @@ def _maybe_graph_memory_nudge(session: Session, state: "_TurnState") -> None:
         )
 
 
+def _dispatch_sequential_call(
+    session: Session,
+    state: "_TurnState",
+    call: ToolCall,
+) -> tuple[ToolResult, str]:
+    """Dispatch one tool call on the sequential path, applying the per-call guards.
+
+    Echoes the call to stderr, snapshots the mutation log and the target file's
+    lint state before dispatch, applies the loop-guard hard cap, then attributes
+    any mutation events this specific call produced (H1/S3 verification tracking,
+    S4 files_changed accounting, and the I2 reactive lint-delta).
+
+    The hard cap refuses an identical call once it has repeated
+    ``_REPEAT_CALL_CAP`` times this turn (verification tools exempt — a
+    rebuild/retest cycle legitimately repeats). The count is maintained
+    post-render by ``_repeat_call_check``; here we read the tally of *previous*
+    identical calls and block before dispatching, guaranteeing a stuck no-op loop
+    ends. E8: a block increments ``state.blocked_streak`` (feeding the escalation
+    ladder in handle_user_message), while any real dispatch resets it to 0 —
+    consecutive blocks with no dispatch in between are the stuck signal.
+
+    Returns ``(result, lint_suffix)`` — the dispatched (or blocked) ToolResult
+    and the reactive lint-delta suffix (empty unless a single-path write tool
+    introduced a lint regression). The caller runs the shared rendered-result
+    pipeline on the pair.
+    """
+    lint_suffix = ""
+    print(
+        ui.tool_call(f"Tool call: {call.name}({json.dumps(call.arguments)})"),
+        file=sys.stderr,
+    )
+    # Snapshot before/after this specific call so a mutation event can be
+    # attributed to it (parallel_safe tools never mutate, so this tracking only
+    # needs the sequential path — see Tool.parallel_safe).
+    pre_mutation_len = len(_TURN_MUTATIONS)
+    # I2 — reactive lint-delta injection: snapshot this call's target file's lint
+    # issues BEFORE dispatch (only for the single-path write tools in
+    # _LINT_TRACKED_TOOLS; None means "nothing to compare against", so no delta is
+    # ever appended).
+    lint_pre = _lint_pre_snapshot(call, str(session.project_root))
+    _repeat_key = (call.name, _call_signature(call.arguments))
+    _repeat_n = state.seen_calls.get(_repeat_key, 0)
+    if call.name not in _REPEAT_CAP_EXEMPT and _repeat_n >= _REPEAT_CALL_CAP:
+        result: ToolResult = ToolResult.err(
+            f"{call.name} has already been called {_repeat_n} "
+            f"times this turn with identical arguments. Repeating "
+            f"it makes no progress — the call is blocked. Change "
+            f"your arguments or approach, or stop and report what "
+            f"you have.",
+            code="loop-guard-blocked",
+        )
+        state.blocked_streak += 1
+        print(
+            ui.telemetry(
+                f"loop-guard: blocked repeated {call.name} "
+                f"(#{_repeat_n + 1} identical this turn)"
+            ),
+            file=sys.stderr,
+        )
+    else:
+        result = dispatch(call.name, call.arguments)
+        # A call that actually ran proves progress — clear the consecutive-block
+        # streak so a later block starts counting from zero again.
+        state.blocked_streak = 0
+    new_events = _TURN_MUTATIONS[pre_mutation_len:]
+    if new_events:
+        any_relevant, new_paths = _scan_new_mutations(new_events)
+        if any_relevant:
+            state.needs_verification = True
+            state.mutated_paths |= new_paths
+            # S4 — captured here (correlated with this dispatched call's own slice
+            # of _TURN_MUTATIONS), NOT by reading the module-level list later:
+            # diagnostics_inject_summary drains it at the end of the dispatch
+            # round. Deduped by path, first-tool-wins, in order of first mutation.
+            for _ev in new_events:
+                if _ev.get("kind") not in ("created", "changed", "renamed"):
+                    continue
+                _ev_path = _ev.get("path")
+                if _ev_path and _ev_path not in state.files_changed_seen:
+                    state.files_changed_seen.add(_ev_path)
+                    state.turn_report["files_changed"].append(
+                        {"path": _ev_path, "tool": call.name}
+                    )
+            resolved_call_path = _lint_resolve_call_path(
+                call, str(session.project_root)
+            )
+            if lint_pre is not None and resolved_call_path in new_paths:
+                lint_suffix = _lint_delta_suffix(
+                    lint_pre, call, str(session.project_root)
+                )
+    return result, lint_suffix
+
+
 def _dispatch_round(
     session: Session,
     state: "_TurnState",
@@ -943,11 +1099,19 @@ def _dispatch_round(
     """Dispatch this response's tool calls and record their results.
 
     Streams any intermediate assistant text once, dispatches the batch
-    (concurrently when every call is parallel_safe, else sequentially with the
-    per-call guards: loop-guard hard cap, oversize-result guard, loop-guard /
-    repeat-call / web-search-focus steers, reactive lint-delta, and H1/H5/S4
-    mutation tracking), appends each rendered result to the transcript, then
-    injects the LSP diagnostics summary.
+    (concurrently when every call is parallel_safe, else sequentially via
+    ``_dispatch_sequential_call`` with the per-call guards: loop-guard hard cap,
+    reactive lint-delta, and H1/H5/S4 mutation tracking), runs the shared
+    rendered-result pipeline on each result (oversize-result guard, loop-guard /
+    repeat-call / web-search-focus steers, reactive lint-delta suffix), appends
+    each to the transcript, then injects the LSP diagnostics summary.
+
+    E8: when this round refused at least one call at the hard cap but has not yet
+    hit the escalation cap, a fold-surviving steer is appended AFTER all tool
+    results (never between an assistant tool_calls message and its results, which
+    would break the OpenAI wire protocol). The steer rides the user role so it
+    survives a compaction fold even when the block error and tool result behind
+    it are dropped — the model's only remaining feedback that it is stuck.
     """
     calls = response.tool_calls
     # Intermediate assistant text on a tool-call iteration that did NOT stream
@@ -973,83 +1137,21 @@ def _dispatch_round(
             parallel_results = list(
                 pool.map(lambda c: dispatch(c.name, c.arguments), calls)
             )
+        # A completed parallel-safe batch never blocks and is real progress —
+        # clear any pending consecutive-block streak (E8), same as a dispatch.
+        state.blocked_streak = 0
 
+    blocked_this_round = False
     for i, call in enumerate(calls):
-        # Only ever populated on the sequential path below (parallel_safe tools
-        # never mutate, so there is nothing to lint-delta there).
-        lint_suffix = ""
+        # Only ever populated on the sequential path (parallel_safe tools never
+        # mutate, so there is nothing to lint-delta there).
         if parallel_results is not None:
             result = parallel_results[i]
+            lint_suffix = ""
         else:
-            print(
-                ui.tool_call(f"Tool call: {call.name}({json.dumps(call.arguments)})"),
-                file=sys.stderr,
-            )
-            # Snapshot before/after this specific call so a mutation event can
-            # be attributed to it (parallel_safe tools never mutate, so this
-            # tracking only needs the sequential path — see Tool.parallel_safe).
-            pre_mutation_len = len(_TURN_MUTATIONS)
-            # I2 — reactive lint-delta injection: snapshot this call's target
-            # file's lint issues BEFORE dispatch (only for the single-path write
-            # tools in _LINT_TRACKED_TOOLS; None means "nothing to compare
-            # against", so no delta is ever appended).
-            lint_pre = _lint_pre_snapshot(call, str(session.project_root))
-            # Loop-guard hard cap: refuse an identical call once it has repeated
-            # _REPEAT_CALL_CAP times this turn (verification tools exempt — a
-            # rebuild/retest cycle legitimately repeats). The count is maintained
-            # post-render by _repeat_call_check; here we read the tally of
-            # *previous* identical calls and block before dispatching,
-            # guaranteeing a stuck no-op loop ends.
-            _repeat_key = (call.name, _call_signature(call.arguments))
-            _repeat_n = state.seen_calls.get(_repeat_key, 0)
-            if (
-                call.name not in _REPEAT_CAP_EXEMPT
-                and _repeat_n >= _REPEAT_CALL_CAP
-            ):
-                result = ToolResult.err(
-                    f"{call.name} has already been called {_repeat_n} "
-                    f"times this turn with identical arguments. Repeating "
-                    f"it makes no progress — the call is blocked. Change "
-                    f"your arguments or approach, or stop and report what "
-                    f"you have.",
-                    code="loop-guard-blocked",
-                )
-                print(
-                    ui.telemetry(
-                        f"loop-guard: blocked repeated {call.name} "
-                        f"(#{_repeat_n + 1} identical this turn)"
-                    ),
-                    file=sys.stderr,
-                )
-            else:
-                result = dispatch(call.name, call.arguments)
-            new_events = _TURN_MUTATIONS[pre_mutation_len:]
-            if new_events:
-                any_relevant, new_paths = _scan_new_mutations(new_events)
-                if any_relevant:
-                    state.needs_verification = True
-                    state.mutated_paths |= new_paths
-                    # S4 — captured here (correlated with this dispatched call's
-                    # own slice of _TURN_MUTATIONS), NOT by reading the
-                    # module-level list later: diagnostics_inject_summary drains
-                    # it at the end of this same loop iteration. Deduped by path,
-                    # first-tool-wins, in order of first mutation.
-                    for _ev in new_events:
-                        if _ev.get("kind") not in ("created", "changed", "renamed"):
-                            continue
-                        _ev_path = _ev.get("path")
-                        if _ev_path and _ev_path not in state.files_changed_seen:
-                            state.files_changed_seen.add(_ev_path)
-                            state.turn_report["files_changed"].append(
-                                {"path": _ev_path, "tool": call.name}
-                            )
-                    resolved_call_path = _lint_resolve_call_path(
-                        call, str(session.project_root)
-                    )
-                    if lint_pre is not None and resolved_call_path in new_paths:
-                        lint_suffix = _lint_delta_suffix(
-                            lint_pre, call, str(session.project_root)
-                        )
+            result, lint_suffix = _dispatch_sequential_call(session, state, call)
+        if result.code == "loop-guard-blocked":
+            blocked_this_round = True
 
         if call.name in ("run_tests", "run_command", "verify_scratch"):
             if call.name == "run_command":
@@ -1083,6 +1185,15 @@ def _dispatch_round(
         session.append_tool_result(call.id, call.name, rendered)
 
     diagnostics_inject_summary(session)
+
+    # E8 fold-surviving steer: this round refused a call at the hard cap but the
+    # streak has not yet reached the escalation cap (which handle_user_message
+    # enforces after this returns). Emit once per blocked round, AFTER every tool
+    # result above — the cap bounds this at ~2 steers per turn. Appended here
+    # (post diagnostics_inject_summary) so its user row lands after the last tool
+    # message, never between an assistant tool_calls entry and its results.
+    if blocked_this_round and 0 < state.blocked_streak < _BLOCKED_STREAK_CAP:
+        session.append_steer(_BLOCKED_ROUND_STEER.format(n=_REPEAT_CALL_CAP))
 
 
 def _finalize_answer(
@@ -1268,7 +1379,9 @@ def handle_user_message(
 
     Returns:
         The final assistant text string — either a normal turn response, a
-        consolidation pass-through, the over-cap sentinel message, or a
+        consolidation pass-through, the over-cap sentinel message, the
+        blocked-loop give-up message (the escalation ladder force-finalizing a
+        turn stuck at ``_BLOCKED_STREAK_CAP`` consecutive hard-cap blocks), or a
         turn response prefixed with "[UNVERIFIED CHANGES] " when the S3 hard
         verify gate bounced once and the follow-up answer still neither
         verified the mutation nor declared it unverified.
@@ -1342,3 +1455,11 @@ def handle_user_message(
             continue
 
         _dispatch_round(session, state, response, on_delta)
+
+        # E8 escalation ladder: the model has re-issued a call the hard cap keeps
+        # refusing, ignoring both the block error and the fold-surviving steer.
+        # Every further round is a wasted LLM round-trip that dispatches nothing,
+        # so force-finalize the turn instead of looping unbounded (observed live:
+        # the same call blocked hundreds of times until an external timeout).
+        if state.blocked_streak >= _BLOCKED_STREAK_CAP:
+            return _blocked_loop_giveup(session, state, on_delta)
