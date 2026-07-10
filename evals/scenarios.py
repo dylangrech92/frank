@@ -288,6 +288,21 @@ SCENARIOS: list[dict] = [
         "inline": "repro_steer.py",
     },
     {
+        "name": "steer_scaffolding",
+        "description": (
+            "End-to-end + dispatch-level check (stub LLM, no network): a "
+            "mid-turn harness steer never moves the in-flight-turn boundary in "
+            "the sent view. Through the real turn loop, an unverified edit's "
+            "reproduce-before-edit steer leaves the first round's assistant "
+            "tool_calls row and its tool result intact (the steer sits AFTER "
+            "them); driving _prune_messages directly, an in-turn steer keeps "
+            "every row while a completed turn still collapses to [user, final "
+            "answer]; and a post-compaction tail with no real user folds its "
+            "tool scaffolding while the steer row rides through."
+        ),
+        "inline": "steer_scaffolding.py",
+    },
+    {
         "name": "compaction_force_fold",
         "description": (
             "Dispatch-level check (no LLM): the overflow-ladder force_fold "
