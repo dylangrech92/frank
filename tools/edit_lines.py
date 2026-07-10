@@ -18,9 +18,10 @@ class EditLines(Tool):
 
     A line-anchored alternative to a full-file overwrite: the caller names the
     line range to replace instead of restating the whole file.  Insertion is
-    expressed as an empty range (``end_line = start_line - 1``).  The path must
-    be relative to the project root and the file must have been read this
-    session; only regular files can be edited.
+    expressed as an empty range (``end_line = start_line - 1``); deletion is
+    expressed by passing an empty ``new_text`` for the range to remove.  The
+    path must be relative to the project root and the file must have been read
+    this session; only regular files can be edited.
     """
 
     name = 'edit_lines'
@@ -30,7 +31,8 @@ class EditLines(Tool):
         'To INSERT text before an existing line N without deleting anything, set start_line=N '
         'and end_line=N-1 (an empty range replaces zero lines); to insert at the very top set '
         'start_line=1 and end_line=0; to append at the end set start_line to one past the last '
-        'line and end_line to the last line. new_text may span multiple lines and need not carry '
+        'line and end_line to the last line. To DELETE lines start_line..end_line, pass an empty '
+        'string as new_text. new_text may span multiple lines and need not carry '
         "a trailing newline. Do not include read_file's display-only line-number prefixes in "
         'new_text. The path must be relative to the project root; read the file first. After '
         'an edit that changes the line count, line numbers below it shift — re-read the file '
@@ -57,7 +59,10 @@ class EditLines(Tool):
             },
             'new_text': {
                 'type': 'string',
-                'description': 'Text to write in place of the replaced range.',
+                'description': (
+                    'Text to write in place of the replaced range. Pass an empty string '
+                    'to delete the replaced range.'
+                ),
             },
         },
         'required': ['path', 'start_line', 'end_line', 'new_text'],
@@ -83,7 +88,8 @@ class EditLines(Tool):
         raw_path = path_arg if isinstance(path_arg, str) else ''
         start_line = kwargs.get('start_line')
         end_line = kwargs.get('end_line')
-        new_text = kwargs.get('new_text', '') if isinstance(kwargs.get('new_text'), str) else ''
+        raw_new_text = kwargs.get('new_text')
+        new_text = raw_new_text if isinstance(raw_new_text, str) else ''
 
         # Resolve under root and confirm the target is an existing regular file.
         resolved, error = resolve_existing_file(raw_path)
@@ -161,11 +167,18 @@ class EditLines(Tool):
             emit_mutation('changed', resolved)
 
         preview = self._preview(new_content.splitlines(), start_line, len(inserted))
-        if end_line >= start_line:
-            action_desc = f'replaced lines {start_line}-{end_line}'
+        if end_line >= start_line and not inserted:
+            body = f'edit_lines: deleted lines {start_line}-{end_line} in {raw_path}.'
+        elif end_line >= start_line:
+            body = (
+                f'edit_lines: replaced lines {start_line}-{end_line} in {raw_path} '
+                f'({len(inserted)} line(s) written).'
+            )
         else:
-            action_desc = f'inserted at line {start_line}'
-        body = f'edit_lines: {action_desc} in {raw_path} ({len(inserted)} line(s) written).'
+            body = (
+                f'edit_lines: inserted at line {start_line} in {raw_path} '
+                f'({len(inserted)} line(s) written).'
+            )
         if line_delta != 0:
             body += (
                 f' Line numbers below line {start_line} have shifted by '

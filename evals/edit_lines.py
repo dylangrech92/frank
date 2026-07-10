@@ -168,6 +168,44 @@ def _run_checks(dispatch, root: Path, check) -> None:  # type: ignore[no-untyped
         f'no-trailing-newline file gained/lost a newline: {(root / "nonl.py").read_text(encoding="utf-8")!r}',
     )
 
+    # ---- (h) deletion: empty new_text removes the named range. --------------
+    (root / 'del.py').write_text('keep1\ndrop1\ndrop2\nkeep2\n', encoding='utf-8')
+    dispatch('read_file', {'path': 'del.py'})
+    res = dispatch('edit_lines', {'path': 'del.py', 'start_line': 2, 'end_line': 3, 'new_text': ''})
+    check(res.status == 'success', f'deletion failed: {res.body!r}')
+    check(
+        (root / 'del.py').read_text(encoding='utf-8') == 'keep1\nkeep2\n',
+        f'deletion produced wrong content: {(root / "del.py").read_text(encoding="utf-8")!r}',
+    )
+    # Trailing newline is preserved across the deletion.
+    check(
+        (root / 'del.py').read_text(encoding='utf-8').endswith('\n'),
+        'deletion dropped the trailing newline',
+    )
+    # Body reads as a deletion (not "replaced") and warns of the negative shift.
+    check(
+        'deleted lines 2-3' in str(res.body),
+        f'deletion body must say "deleted lines 2-3": {res.body!r}',
+    )
+    check(
+        'replaced lines' not in str(res.body),
+        f'deletion body must not claim a replacement: {res.body!r}',
+    )
+    check(
+        'shifted by -2' in str(res.body),
+        f'deletion body must warn about the negative line shift: {res.body!r}',
+    )
+
+    # The tool's own description must advertise empty-new_text deletion so the
+    # model can discover the affordance without guessing.
+    from tools.edit_lines import EditLines
+
+    check(
+        'To DELETE lines start_line..end_line, pass an empty string as new_text.'
+        in EditLines.description,
+        f'EditLines.description does not advertise empty-new_text deletion: {EditLines.description!r}',
+    )
+
     # ---- (g) anchor-shift guard: a length-changing edit must NOT re-stamp ---
     # the read registry, so a second line-anchored edit against the now-shifted
     # numbering is refused until the model re-reads; a same-length edit keeps
