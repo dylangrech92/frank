@@ -294,6 +294,18 @@ SCENARIOS: list[dict] = [
         "inline": "record_graph.py",
     },
     {
+        "name": "find_dead_code_contract",
+        "description": (
+            "Dispatch-level check (no LLM): find_dead_code flags a genuinely "
+            "unused Python function via vulture (path:line + % confidence, "
+            "count >= 1, adapter='vulture'); a clean file reports count == 0; a "
+            "nonexistent path errors code='not-found'; and a directory with only "
+            "a non-Python file errors code='no-adapter'. Skips if vulture is "
+            "absent from PATH."
+        ),
+        "inline": "find_dead_code_contract.py",
+    },
+    {
         "name": "consolidation_ops",
         "description": (
             "Dispatch-level check (no LLM): consolidation's op-apply seam "
