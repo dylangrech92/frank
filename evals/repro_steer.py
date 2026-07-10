@@ -22,6 +22,21 @@ b. Suppressed after a run — a scripted model that calls run_command FIRST (wit
 c. One-shot — a second file edit in scenario (a)'s same turn does not append a
    second steer; exactly one repro steer row exists after the turn.
 
+d. No-failure-observed fires — a bug-report task whose only runs this turn PASSED
+   gets the no-failure-observed steer on its first edit (once, user role, with
+   telemetry) and NOT the reproduce-before-edit steer (a run was recorded).
+
+e. No-failure-observed suppressed by a failing run — a recorded nonzero-exit run
+   means a failure WAS observed, so neither first-mutation steer fires.
+
+f. No-failure-observed scoped to bug reports — a pure feature task (no bug-report
+   lexicon) never gets the no-failure-observed steer.
+
+g. Gate honesty — a mutation followed by ONLY a nonzero-exit run_command leaves
+   ``turn_report['verified']`` False (a failing run does not clear the verify
+   gate); a passing run flips it True. The failing run is still recorded, marked
+   ``passed=False``.
+
 Exits 0 on success, prints ``FAIL: <reason>`` to stderr and exits 1 otherwise.
 Runs with the repo root on ``sys.path`` (evals/run.py inserts it before exec'ing
 this file); it chdir's into its own throwaway temp project dir (create_file and
@@ -128,6 +143,16 @@ def check_fires_and_one_shot() -> list[str]:
                 f"expected the 'repro-steer: fired' telemetry line exactly once, "
                 f"stderr had {stderr.count('repro-steer: fired')}"
             )
+        # Mutual exclusion: zero runs is the reproduce-before-edit steer's
+        # territory, so the no-failure-observed steer must NOT also fire even
+        # though the task ("fix the wrong output") reads as a bug report.
+        nf_rows = _steer_rows(session, agent._NO_FAILURE_OBSERVED_STEER)
+        if nf_rows:
+            failures.append(
+                f"no-failure-observed steer fired {len(nf_rows)} time(s) on a "
+                f"zero-runs turn — it must defer to the reproduce-before-edit "
+                f"steer (mutual exclusion broken)"
+            )
     finally:
         agent.MEMORY_ENABLED = original_memory
         os.chdir(original_cwd)
@@ -191,11 +216,213 @@ def check_suppressed_after_run() -> list[str]:
     return failures
 
 
+def _drive_turn(task: str, script: list, tmp_prefix: str):
+    """Drive one scripted turn through the real turn loop; return (session, stderr).
+
+    Activates the catalog tools the scripts use, isolates cwd + memory, and
+    captures stderr so the caller can assert on both transcript rows and
+    telemetry. Restores cwd/memory afterward. Touches no repo files.
+    """
+    import agent
+    import tools.registry as registry
+    from evals._stub import _StubClient
+    from session import Session
+
+    registry.activate("create_file")
+    registry.activate("run_command")
+
+    original_cwd = os.getcwd()
+    original_memory = agent.MEMORY_ENABLED
+    tmp = tempfile.mkdtemp(prefix=tmp_prefix)
+    os.chdir(tmp)
+    agent.MEMORY_ENABLED = False
+    try:
+        session = Session(tmp, "test-model", "You are a test agent.")
+        client = _StubClient(script)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            agent.handle_user_message(
+                task, session, client, on_delta=None  # pyright: ignore[reportArgumentType]
+            )
+        return session, buf.getvalue()
+    finally:
+        agent.MEMORY_ENABLED = original_memory
+        os.chdir(original_cwd)
+
+
+def check_no_failure_steer_fires() -> list[str]:
+    """d. A passing run then a bug-report edit fires the no-failure-observed steer.
+
+    A task that reports a failure, a run_command that PASSES (exit 0), then a file
+    edit: the reported failure was never observed, so the first mutation must
+    append the no-failure-observed steer exactly once, riding the user role, with
+    the telemetry line — and must NOT fire the reproduce-before-edit steer (a run
+    was recorded, so the zero-runs steer's precondition is not met).
+    """
+    import agent
+
+    script = [
+        _tool_call_response("run_command", {"cmd": "exit 0"}),
+        _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
+        _final_answer_response("Applied a defensive fix."),
+    ]
+    session, stderr = _drive_turn(
+        "list --category food crashes with a KeyError; reproduce and fix",
+        script,
+        "repro-steer-nofail-",
+    )
+
+    failures: list[str] = []
+    nf_rows = _steer_rows(session, agent._NO_FAILURE_OBSERVED_STEER)
+    if len(nf_rows) != 1:
+        failures.append(
+            f"expected exactly 1 no-failure-observed steer row after a passing "
+            f"run then a bug-report edit, found {len(nf_rows)}"
+        )
+    if stderr.count("no-failure-steer: fired") != 1:
+        failures.append(
+            f"expected the 'no-failure-steer: fired' telemetry line exactly "
+            f"once, stderr had {stderr.count('no-failure-steer: fired')}"
+        )
+    repro_rows = _steer_rows(session, agent._REPRO_BEFORE_EDIT_STEER)
+    if repro_rows:
+        failures.append(
+            f"reproduce-before-edit steer fired {len(repro_rows)} time(s) despite "
+            f"a recorded run this turn (should defer to no-failure-observed)"
+        )
+    return failures
+
+
+def check_no_failure_suppressed_on_failing_run() -> list[str]:
+    """e. A recorded FAILING run suppresses the no-failure-observed steer.
+
+    A bug-report task, a run_command that FAILS (nonzero exit), then an edit: a
+    failure WAS observed this turn, so neither the no-failure-observed steer nor
+    the reproduce-before-edit steer may fire.
+    """
+    import agent
+
+    script = [
+        _tool_call_response("run_command", {"cmd": "exit 7"}),
+        _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
+        _final_answer_response("Reproduced then edited."),
+    ]
+    session, stderr = _drive_turn(
+        "the list command crashes with a KeyError; fix it",
+        script,
+        "repro-steer-nofail-failrun-",
+    )
+
+    failures: list[str] = []
+    nf_rows = _steer_rows(session, agent._NO_FAILURE_OBSERVED_STEER)
+    if nf_rows:
+        failures.append(
+            f"no-failure-observed steer fired {len(nf_rows)} time(s) despite a "
+            f"FAILING run this turn (a failure was observed — must suppress)"
+        )
+    if "no-failure-steer: fired" in stderr:
+        failures.append(
+            "'no-failure-steer: fired' telemetry appeared despite a failing run"
+        )
+    return failures
+
+
+def check_no_failure_suppressed_without_lexicon() -> list[str]:
+    """f. A non-bug-report task never fires the no-failure-observed steer.
+
+    A pure feature task (no bug-report lexicon), a passing run, then an edit: the
+    no-failure-observed steer must NOT fire — it is scoped to reported failures.
+    """
+    import agent
+
+    script = [
+        _tool_call_response("run_command", {"cmd": "exit 0"}),
+        _tool_call_response("create_file", {"path": "feature.py", "content": "x = 1\n"}),
+        _final_answer_response("Added the feature."),
+    ]
+    session, stderr = _drive_turn(
+        "add a --json flag to the list subcommand",
+        script,
+        "repro-steer-nofail-nolex-",
+    )
+
+    failures: list[str] = []
+    nf_rows = _steer_rows(session, agent._NO_FAILURE_OBSERVED_STEER)
+    if nf_rows:
+        failures.append(
+            f"no-failure-observed steer fired {len(nf_rows)} time(s) on a task "
+            f"with no bug-report lexicon (must stay out of feature work)"
+        )
+    if "no-failure-steer: fired" in stderr:
+        failures.append(
+            "'no-failure-steer: fired' telemetry appeared on a non-bug-report task"
+        )
+    return failures
+
+
+def check_gate_honesty() -> list[str]:
+    """g. The verify gate/flag key on a PASSING run, not a merely-completed one.
+
+    A mutation followed by ONLY a nonzero-exit run_command leaves the turn's
+    verified flag False (the gate stayed open — a failing run is not
+    verification); the same mutation followed by a passing run flips it True.
+    ``turn_report['verified']`` is ``_turn_verified`` applied to the end-of-turn
+    state, so it is the observable proof of the gate's honesty.
+    """
+    failures: list[str] = []
+
+    fail_script = [
+        _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
+        _tool_call_response("run_command", {"cmd": "exit 7"}),
+        _final_answer_response("Edited; the check failed."),
+    ]
+    fail_session, _ = _drive_turn(
+        "fix the crash in the list command", fail_script, "repro-steer-gate-fail-"
+    )
+    if fail_session.turn_report["verified"] is not False:
+        failures.append(
+            f"mutation + only a FAILING run: verified="
+            f"{fail_session.turn_report['verified']!r}, expected False "
+            f"(a nonzero-exit run must not clear the verify gate)"
+        )
+
+    pass_script = [
+        _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
+        _tool_call_response("run_command", {"cmd": "exit 0"}),
+        _final_answer_response("Edited and verified."),
+    ]
+    pass_session, _ = _drive_turn(
+        "fix the crash in the list command", pass_script, "repro-steer-gate-pass-"
+    )
+    if pass_session.turn_report["verified"] is not True:
+        failures.append(
+            f"mutation + a PASSING run: verified="
+            f"{pass_session.turn_report['verified']!r}, expected True"
+        )
+
+    # The failing run is still RECORDED (status/detail unchanged) but marked
+    # passed=False, so the give-up/report facts stay truthful.
+    runs = fail_session.turn_report["verification_runs"]
+    fail_runs = [r for r in runs if r["tool"] == "run_command"]
+    if not fail_runs:
+        failures.append("failing run_command produced no verification_runs entry")
+    elif fail_runs[0].get("passed") is not False:
+        failures.append(
+            f"failing run_command recorded passed={fail_runs[0].get('passed')!r}, "
+            f"expected False"
+        )
+    return failures
+
+
 def main() -> int:
     all_failures: list[str] = []
     for label, fn in (
         ("fires-and-one-shot", check_fires_and_one_shot),
         ("suppressed-after-run", check_suppressed_after_run),
+        ("no-failure-fires", check_no_failure_steer_fires),
+        ("no-failure-suppressed-failing-run", check_no_failure_suppressed_on_failing_run),
+        ("no-failure-suppressed-no-lexicon", check_no_failure_suppressed_without_lexicon),
+        ("gate-honesty", check_gate_honesty),
     ):
         try:
             failures = fn()
@@ -209,7 +436,10 @@ def main() -> int:
         return 1
     print(
         "PASS: an unverified edit steers reproduce-before-edit once; a prior "
-        "(failing) run_command suppresses it; a second edit does not double-steer"
+        "(failing) run_command suppresses it; a second edit does not double-steer; "
+        "a passing run then a bug-report edit steers no-failure-observed once "
+        "(suppressed by a failing run or a non-bug task, mutually exclusive with "
+        "reproduce-before-edit); and the verify gate keys on a PASSING run"
     )
     return 0
 

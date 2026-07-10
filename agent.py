@@ -387,6 +387,46 @@ def _activate_verification_tools() -> None:
     for name in _VERIFICATION_TOOLS:
         activate(name)
 
+
+def _verification_run_passed(name: str, result: ToolResult) -> bool:
+    """True only when a verification run genuinely passed — not merely completed.
+
+    ``run_command`` and ``run_tests`` both return ``ToolResult.ok`` even when the
+    underlying work failed: a nonzero process exit or a failing test count is
+    carried as *metadata*, not as an error status. So ``result.status ==
+    'success'`` alone cannot tell a green run from a red one. This inspects the
+    tool-specific meta so pass/fail is first-class:
+
+    * ``run_command`` — passed iff the process exited 0 (``exit_code`` in
+      ``(0, None)``; ``None`` covers a run with no captured code).
+    * ``run_tests`` — passed iff zero tests failed (``failed == 0``).
+    * ``verify_scratch`` — status alone suffices: its nonzero-exit path already
+      returns an error result, so a success result is a genuine pass.
+
+    Any error-status result is a fail regardless of tool.
+    """
+    if result.status != "success":
+        return False
+    if name == "run_command":
+        return result.meta.get("exit_code", 0) in (0, None)
+    if name == "run_tests":
+        return result.meta.get("failed", 0) == 0
+    # verify_scratch (and any future verification tool): a success status is a
+    # genuine pass because the failure path already returns an error result.
+    return True
+
+
+def _is_bug_report(message: str) -> bool:
+    """True when the user's request reads as a bug report (case-insensitive).
+
+    A plain substring match against ``_BUG_REPORT_LEXICON``. Keeps the
+    no-failure-observed steer out of pure feature work — it only makes sense to
+    warn "you are fixing a failure you never saw fail" when the request actually
+    claims a failure.
+    """
+    low = message.lower()
+    return any(term in low for term in _BUG_REPORT_LEXICON)
+
 # Escalation ladder above the hard cap. Once the cap starts refusing an
 # identical call, a determined model can re-issue it every round — each a full
 # LLM round-trip that dispatches nothing. Worse, when compaction drops the block
@@ -424,6 +464,44 @@ _REPRO_BEFORE_EDIT_STEER = (
     "means running the code to confirm your change. Base any further edits on "
     "that observed output, not on assumption. The run_command tool is loaded "
     "into your toolset now — call it directly."
+)
+
+# Fold-surviving no-failure-observed steer, same wire-safety and plain-language
+# rules as the steers above (append_steer prepends STEER_PREFIX, so this is the
+# body only). Fires on the turn's first relevant file mutation when the task
+# reports a failure but every command and test run so far this turn has passed —
+# i.e. the model is starting to "fix" a failure it has never actually seen fail.
+# Mutually exclusive with the reproduce-before-edit steer above (that one owns
+# the zero-runs case; this one owns the runs-all-passed case).
+_NO_FAILURE_OBSERVED_STEER = (
+    "The edit you just made was applied successfully and is already in the files. "
+    "Do not re-check whether the original request still applies — it does. The "
+    "task reports a failure, but every command and test run this turn has passed: "
+    "the reported failure has never been observed on this project as it stands. "
+    "Do not fix code you have not seen fail, and do not modify files or data to "
+    "force a failure — a failure you manufacture is not the reported failure. Run "
+    "the reported failing command on the project exactly as it is; if it passes, "
+    "revert your edit and state in your final answer that the reported problem "
+    "could not be reproduced."
+)
+
+# Word/phrase lexicon (case-insensitive substring) that marks a user request as a
+# bug report rather than a pure feature task. Gates the no-failure-observed steer:
+# warning "you are fixing a failure you never saw fail" only makes sense when the
+# request actually claims a failure.
+_BUG_REPORT_LEXICON = (
+    "crash",
+    "error",
+    "exception",
+    "traceback",
+    "bug",
+    "broken",
+    "fails",
+    "failing",
+    "failure",
+    "regression",
+    "wrong output",
+    "incorrect",
 )
 
 # Success-path loop-guard suffix, APPENDED to the full re-rendered result of a
@@ -911,9 +989,13 @@ class _TurnState:
     # before each call), so the return path knows whether the answer already
     # reached the sink or must be delivered whole (non-streaming/gated fallback).
     streamed: int = 0
+    # The turn's original user message, kept for the bug-report lexicon check the
+    # no-failure-observed steer gates on. Set once at turn start.
+    user_message: str = ""
     # H1/S3 verify gate: True once a file was created/changed/renamed with no
-    # subsequent successful run_tests/run_command/verify_scratch; cleared the
-    # moment such a call succeeds. The nudge fires at most once per turn.
+    # subsequent PASSING run_tests/run_command/verify_scratch; cleared the moment
+    # such a call passes (a run that merely completed but exited nonzero / left a
+    # failing test does NOT clear it). The nudge fires at most once per turn.
     needs_verification: bool = False
     verification_nudge_fired: bool = False
     # Reproduce-before-edit steer: True once the first relevant file mutation
@@ -921,6 +1003,13 @@ class _TurnState:
     # fold-surviving steer at most once per turn (see _dispatch_sequential_call /
     # _dispatch_round).
     repro_steer_fired: bool = False
+    # No-failure-observed steer: True once the turn's first relevant file mutation
+    # landed while >= 1 verification run had been recorded AND every one passed,
+    # on a task whose original request reads as a bug report. Mutually exclusive
+    # with repro_steer_fired (that owns the zero-runs case). Fires the fold-
+    # surviving steer at most once per turn (see _dispatch_sequential_call /
+    # _dispatch_round).
+    no_failure_steer_fired: bool = False
     # Empty-answer bounce: the model returned no text and no tool calls (a
     # local-model bare-stop failure mode). Fires at most once per turn; a second
     # empty turn falls through to a transparent placeholder at the return site.
@@ -987,8 +1076,9 @@ def _turn_verified(state: "_TurnState") -> bool | None:
     * ``None`` — the turn mutated no file, so there was nothing to verify (e.g.
       a read-only research turn). Neither pass nor fail applies.
     * ``True`` — the turn mutated a file AND the verification gate is clear (a
-      ``run_tests``/``run_command``/``verify_scratch`` call succeeded after the
-      last mutation, clearing ``needs_verification``).
+      ``run_tests``/``run_command``/``verify_scratch`` call PASSED after the last
+      mutation, clearing ``needs_verification`` — a run that merely completed but
+      exited nonzero or left a failing test does not count).
     * ``False`` — the turn mutated a file but the gate is still open (no passing
       run after the last mutation).
 
@@ -1008,8 +1098,9 @@ def _synthesize_giveup_answer(reason: str, retry_hint: str, state: "_TurnState")
     The two early-exit give-up paths used to emit a static string claiming
     "a report of what was accomplished is unavailable", which is false whenever
     the turn had already applied edits and verified them on disk. ``turn_report``
-    already holds those facts (``files_changed`` + ``verification_runs``), so this
-    synthesizes an honest envelope from them with no extra LLM call. *reason* is
+    already holds those facts (``files_changed`` + ``verification_runs``, each run
+    with whether it passed), so this synthesizes an honest envelope from them with
+    no extra LLM call. *reason* is
     the leading sentence naming why the harness ended the turn; *retry_hint* is
     the path-appropriate advice used only when the turn did no work at all.
     """
@@ -1039,7 +1130,8 @@ def _synthesize_giveup_answer(reason: str, retry_hint: str, state: "_TurnState")
     if runs:
         shown_runs = runs[:_GIVEUP_RUNS_CAP]
         rendered = [
-            f"{r.get('tool')} {str(r.get('detail', ''))!r} ({r.get('status')})"
+            f"{r.get('tool')} {str(r.get('detail', ''))!r} "
+            f"({'passed' if r.get('passed') else 'failed'})"
             for r in shown_runs
         ]
         seg = "Verification runs: " + "; ".join(rendered)
@@ -1353,6 +1445,82 @@ def _maybe_graph_memory_nudge(session: Session, state: "_TurnState") -> None:
         )
 
 
+def _maybe_arm_first_mutation_steer(state: "_TurnState") -> None:
+    """Arm at most one first-mutation verify steer for the turn.
+
+    Called the moment the turn's FIRST relevant file mutation lands. The two
+    steers are mutually exclusive and cover disjoint situations:
+
+    * zero verification runs recorded so far -> reproduce-before-edit (observe
+      the problem before editing on assumption);
+    * >= 1 run recorded AND every one passed, on a task whose original request
+      reads as a bug report -> no-failure-observed (the model is starting to
+      "fix" a failure it has never seen fail).
+
+    A run that failed at least once means a failure WAS observed this turn, so
+    neither steer arms. Each flag is one-shot; both load the verification tools
+    the steer names so the tool is callable in the very next round.
+    """
+    runs = state.turn_report["verification_runs"]
+    if not runs:
+        if not state.repro_steer_fired:
+            state.repro_steer_fired = True
+            _activate_verification_tools()
+            print(
+                ui.telemetry(
+                    "repro-steer: fired (mutation before any verification "
+                    "run this turn)"
+                ),
+                file=sys.stderr,
+            )
+        return
+    if (
+        not state.no_failure_steer_fired
+        and all(r["passed"] for r in runs)
+        and _is_bug_report(state.user_message)
+    ):
+        state.no_failure_steer_fired = True
+        _activate_verification_tools()
+        print(
+            ui.telemetry(
+                "no-failure-steer: fired (edit on a reported failure that has "
+                "not been observed this turn)"
+            ),
+            file=sys.stderr,
+        )
+
+
+def _record_verification_run(
+    state: "_TurnState", call: ToolCall, result: ToolResult
+) -> None:
+    """Record one verification run and update the pass-based verify gate.
+
+    Appends a ``verification_runs`` entry — ``tool``/``status``/``detail`` (kept
+    verbatim; evals assert on them) plus a first-class ``passed`` bool from
+    ``_verification_run_passed`` — and clears ``needs_verification`` ONLY when the
+    run passed. A run that merely completed but failed (a nonzero ``run_command``
+    exit, a failing ``run_tests`` count, a ``verify_scratch`` snippet error) no
+    longer counts as verification: the gate stays open so a later ``verified:
+    true`` cannot be stamped off a run that never went green, and the model gets
+    no false signal that the change is confirmed.
+    """
+    if call.name == "run_command":
+        detail = str(call.arguments.get("cmd", ""))
+    else:
+        detail = str(call.arguments.get("path") or ".")
+    passed = _verification_run_passed(call.name, result)
+    state.turn_report["verification_runs"].append(
+        {
+            "tool": call.name,
+            "status": result.status,
+            "detail": detail,
+            "passed": passed,
+        }
+    )
+    if passed:
+        state.needs_verification = False
+
+
 def _dispatch_sequential_call(
     session: Session,
     state: "_TurnState",
@@ -1421,29 +1589,17 @@ def _dispatch_sequential_call(
     if new_events:
         any_relevant, new_paths = _scan_new_mutations(new_events)
         if any_relevant:
+            # The turn's FIRST relevant mutation is detected before the paths are
+            # recorded below — both first-mutation verify steers arm at exactly
+            # this moment, keyed on what had (or had not) been run to observe the
+            # problem yet. The steers themselves are appended after the round's
+            # tool results in _dispatch_round (never between a tool_calls row and
+            # its results).
+            first_mutation = not state.mutated_paths
             state.needs_verification = True
             state.mutated_paths |= new_paths
-            # Reproduce-before-edit steer: this call mutated a file but
-            # nothing has been run to observe the problem yet this turn.
-            # turn_report["verification_runs"] records every run_command/
-            # run_tests/verify_scratch call regardless of exit status, so a
-            # nonzero-exit crash repro correctly counts as "already ran
-            # something" and suppresses this. Fired once per turn; the steer
-            # itself is appended after the round's tool results in
-            # _dispatch_round (never between a tool_calls row and its results).
-            if not state.repro_steer_fired and not state.turn_report["verification_runs"]:
-                state.repro_steer_fired = True
-                # Load the verification tools the steer names so the very next
-                # round's schemas() carries them — the steer tells the model to
-                # call run_command, so run_command must be callable.
-                _activate_verification_tools()
-                print(
-                    ui.telemetry(
-                        "repro-steer: fired (mutation before any verification "
-                        "run this turn)"
-                    ),
-                    file=sys.stderr,
-                )
+            if first_mutation:
+                _maybe_arm_first_mutation_steer(state)
             # S4 — captured here (correlated with this dispatched call's own slice
             # of _TURN_MUTATIONS), NOT by reading the module-level list later:
             # diagnostics_inject_summary drains it at the end of the dispatch
@@ -1527,10 +1683,11 @@ def _dispatch_round(
         state.blocked_streak = 0
 
     blocked_this_round = False
-    # Snapshot the one-shot repro flag before the loop so the post-round
-    # block can tell whether THIS round is the one that flipped it (and so should
-    # append the steer). A no-op on every later round once it has fired.
+    # Snapshot the one-shot first-mutation steer flags before the loop so the
+    # post-round block can tell whether THIS round is the one that flipped each
+    # (and so should append that steer). A no-op on every later round once fired.
     repro_fired_before = state.repro_steer_fired
+    no_failure_fired_before = state.no_failure_steer_fired
     for i, call in enumerate(calls):
         # Only ever populated on the sequential path (parallel_safe tools never
         # mutate, so there is nothing to lint-delta there).
@@ -1543,15 +1700,7 @@ def _dispatch_round(
             blocked_this_round = True
 
         if call.name in _VERIFICATION_TOOLS:
-            if call.name == "run_command":
-                detail = str(call.arguments.get("cmd", ""))
-            else:
-                detail = str(call.arguments.get("path") or ".")
-            state.turn_report["verification_runs"].append(
-                {"tool": call.name, "status": result.status, "detail": detail}
-            )
-            if result.status == "success":
-                state.needs_verification = False
+            _record_verification_run(state, call, result)
         if call.name == "record" and str(call.arguments.get("kind", "")).strip().lower() in (
             "decision",
             "spec",
@@ -1579,8 +1728,8 @@ def _dispatch_round(
 
     diagnostics_inject_summary(session)
 
-    # Fold-surviving post-round steers (blocked-round + reproduce-before-edit):
-    # both ride the user role — which
+    # Fold-surviving post-round steers (blocked-round + the two first-mutation
+    # verify steers): all ride the user role — which
     # _prune_messages keeps across a compaction fold — and are appended HERE,
     # after every tool result and diagnostics_inject_summary, so their user row
     # lands after the last tool message and never between an assistant tool_calls
@@ -1596,6 +1745,13 @@ def _dispatch_round(
     # verification runs so far — steer the model to reproduce before editing on.
     if state.repro_steer_fired and not repro_fired_before:
         session.append_steer(_REPRO_BEFORE_EDIT_STEER)
+    # No-failure-observed steer: the turn's first relevant file mutation just
+    # landed while every recorded run had passed on a bug-report task — steer the
+    # model to demonstrate the reported failure before "fixing" what it never saw
+    # fail. Mutually exclusive with the reproduce-before-edit steer above (see
+    # _maybe_arm_first_mutation_steer).
+    if state.no_failure_steer_fired and not no_failure_fired_before:
+        session.append_steer(_NO_FAILURE_OBSERVED_STEER)
 
 
 def _finalize_answer(
@@ -1818,6 +1974,7 @@ def handle_user_message(
         cap=compaction.compute_cap(window, comp_cfg),
         window=window,
         comp_cfg=comp_cfg,
+        user_message=text,
     )
 
     def _sink(piece: str) -> None:
