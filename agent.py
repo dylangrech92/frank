@@ -387,7 +387,7 @@ def _activate_verification_tools() -> None:
     for name in _VERIFICATION_TOOLS:
         activate(name)
 
-# E8 escalation ladder above the hard cap. Once the cap starts refusing an
+# Escalation ladder above the hard cap. Once the cap starts refusing an
 # identical call, a determined model can re-issue it every round — each a full
 # LLM round-trip that dispatches nothing. Worse, when compaction drops the block
 # error and the tool result from context, the model loses even the feedback that
@@ -410,7 +410,7 @@ _BLOCKED_ROUND_STEER = (
     "action, or give your final answer now."
 )
 
-# E13 fold-surviving reproduce-before-edit steer, same wire-safety and plain-
+# Fold-surviving reproduce-before-edit steer, same wire-safety and plain-
 # language rules as _BLOCKED_ROUND_STEER (append_steer prepends STEER_PREFIX, so
 # this is the body only — no duplicate "not from the user" preamble). Fires on
 # the first relevant file mutation of a turn that has run nothing to observe the
@@ -916,7 +916,7 @@ class _TurnState:
     # moment such a call succeeds. The nudge fires at most once per turn.
     needs_verification: bool = False
     verification_nudge_fired: bool = False
-    # E13 reproduce-before-edit steer: True once the first relevant file mutation
+    # Reproduce-before-edit steer: True once the first relevant file mutation
     # of the turn landed with zero verification runs recorded so far. Fires the
     # fold-surviving steer at most once per turn (see _dispatch_sequential_call /
     # _dispatch_round).
@@ -961,7 +961,7 @@ class _TurnState:
     # the identical earlier run, so a byte-identical re-run with nothing modified
     # is deduped while a genuine edit→retest re-renders the full body.
     mutation_events: int = 0
-    # E8 loop-guard escalation: consecutive tool calls refused by the repeat-call
+    # Loop-guard escalation: consecutive tool calls refused by the repeat-call
     # hard cap, counted regardless of key (alternating between two blocked calls
     # is just as stuck). Incremented on every hard-cap block, reset to 0 the
     # moment any call actually dispatches (sequential or a parallel-safe batch) —
@@ -971,30 +971,41 @@ class _TurnState:
     blocked_streak: int = 0
 
 
-# E14 — how many files / verification runs a synthesized give-up answer lists
+# How many files / verification runs a synthesized give-up answer lists
 # before collapsing the tail into a "+N more" count, so a huge turn cannot bloat
 # the envelope.
 _GIVEUP_FILES_CAP = 10
 _GIVEUP_RUNS_CAP = 5
 
 
-def _turn_verified(state: "_TurnState") -> bool:
-    """Single source of truth for ``turn_report["verified"]`` (E14).
+def _turn_verified(state: "_TurnState") -> bool | None:
+    """Single source of truth for ``turn_report["verified"]``.
 
-    A turn counts as verified iff it actually mutated a file this turn AND no
-    unresolved verification gate remains (a ``run_tests``/``run_command``/
-    ``verify_scratch`` call succeeded after the last mutation, clearing
-    ``needs_verification``). Shared verbatim by ``_finalize_answer`` and both
-    early-exit give-up paths so the flag means the same thing however the turn
-    ended — a give-up envelope no longer under-reports verified work.
+    Tri-state, so a consumer can tell an unverified edit from a turn that never
+    touched code:
+
+    * ``None`` — the turn mutated no file, so there was nothing to verify (e.g.
+      a read-only research turn). Neither pass nor fail applies.
+    * ``True`` — the turn mutated a file AND the verification gate is clear (a
+      ``run_tests``/``run_command``/``verify_scratch`` call succeeded after the
+      last mutation, clearing ``needs_verification``).
+    * ``False`` — the turn mutated a file but the gate is still open (no passing
+      run after the last mutation).
+
+    Shared verbatim by ``_finalize_answer`` and both early-exit give-up paths so
+    the flag means the same thing however the turn ended — a give-up envelope no
+    longer under-reports verified work, and a no-op turn no longer masquerades as
+    an unverified edit.
     """
-    return bool(state.mutated_paths) and not state.needs_verification
+    if not state.mutated_paths:
+        return None
+    return not state.needs_verification
 
 
 def _synthesize_giveup_answer(reason: str, retry_hint: str, state: "_TurnState") -> str:
     """Build a truthful give-up answer from the facts already in ``turn_report``.
 
-    E14 — the two early-exit give-up paths used to emit a static string claiming
+    The two early-exit give-up paths used to emit a static string claiming
     "a report of what was accomplished is unavailable", which is false whenever
     the turn had already applied edits and verified them on disk. ``turn_report``
     already holds those facts (``files_changed`` + ``verification_runs``), so this
@@ -1051,7 +1062,7 @@ def _finalize_giveup(
     retry_hint: str,
     on_delta: Callable[[str], None] | None,
 ) -> str:
-    """Shared tail for the two early-exit give-up paths (E14).
+    """Shared tail for the two early-exit give-up paths.
 
     Both ``_over_cap_giveup`` and ``_blocked_loop_giveup`` end a turn without
     reaching ``_finalize_answer``. They fold their common tail here: synthesize a
@@ -1073,7 +1084,7 @@ def _over_cap_giveup(
 ) -> str:
     """Terminal give-up when compaction cannot get the context under cap.
 
-    Records a truthful synthesized answer (E14) as the turn's final answer
+    Records a truthful synthesized answer as the turn's final answer
     (transcript, ``turn_report``, and on_delta payload), stamps ``verified``, and
     returns it verbatim.
     """
@@ -1096,7 +1107,7 @@ def _blocked_loop_giveup(
     between (the model ignored both the block error and the fold-surviving steer),
     further chat rounds only burn a full LLM round-trip per blocked call. This
     ends the turn instead — mirroring ``_over_cap_giveup``: records a truthful
-    synthesized answer (E14) as the turn's final answer (transcript,
+    synthesized answer as the turn's final answer (transcript,
     ``turn_report``, and on_delta payload), stamps ``verified``, and returns it
     verbatim.
     """
@@ -1359,7 +1370,7 @@ def _dispatch_sequential_call(
     rebuild/retest cycle legitimately repeats). The count is maintained
     post-render by ``_repeat_call_check``; here we read the tally of *previous*
     identical calls and block before dispatching, guaranteeing a stuck no-op loop
-    ends. E8: a block increments ``state.blocked_streak`` (feeding the escalation
+    ends. A block increments ``state.blocked_streak`` (feeding the escalation
     ladder in handle_user_message), while any real dispatch resets it to 0 —
     consecutive blocks with no dispatch in between are the stuck signal.
 
@@ -1412,7 +1423,7 @@ def _dispatch_sequential_call(
         if any_relevant:
             state.needs_verification = True
             state.mutated_paths |= new_paths
-            # E13 — reproduce-before-edit steer: this call mutated a file but
+            # Reproduce-before-edit steer: this call mutated a file but
             # nothing has been run to observe the problem yet this turn.
             # turn_report["verification_runs"] records every run_command/
             # run_tests/verify_scratch call regardless of exit status, so a
@@ -1480,9 +1491,10 @@ def _dispatch_round(
     Two fold-surviving steers may be appended AFTER all tool results (never
     between an assistant tool_calls message and its results, which would break
     the OpenAI wire protocol), each riding the user role so it survives a
-    compaction fold. E8: when this round refused at least one call at the hard cap
-    but has not yet hit the escalation cap — the model's only remaining feedback
-    that it is stuck. E13: when this round produced the turn's first relevant file
+    compaction fold. Blocked-round steer: when this round refused at least one
+    call at the hard cap but has not yet hit the escalation cap — the model's only
+    remaining feedback that it is stuck. Reproduce-before-edit steer: when this
+    round produced the turn's first relevant file
     mutation with zero verification runs so far — steering the model to reproduce
     the reported problem before it keeps editing on assumption.
     """
@@ -1511,11 +1523,11 @@ def _dispatch_round(
                 pool.map(lambda c: dispatch(c.name, c.arguments), calls)
             )
         # A completed parallel-safe batch never blocks and is real progress —
-        # clear any pending consecutive-block streak (E8), same as a dispatch.
+        # clear any pending consecutive-block streak, same as a dispatch.
         state.blocked_streak = 0
 
     blocked_this_round = False
-    # E13 — snapshot the one-shot repro flag before the loop so the post-round
+    # Snapshot the one-shot repro flag before the loop so the post-round
     # block can tell whether THIS round is the one that flipped it (and so should
     # append the steer). A no-op on every later round once it has fired.
     repro_fired_before = state.repro_steer_fired
@@ -1567,19 +1579,20 @@ def _dispatch_round(
 
     diagnostics_inject_summary(session)
 
-    # Fold-surviving post-round steers (E8, E13): both ride the user role — which
+    # Fold-surviving post-round steers (blocked-round + reproduce-before-edit):
+    # both ride the user role — which
     # _prune_messages keeps across a compaction fold — and are appended HERE,
     # after every tool result and diagnostics_inject_summary, so their user row
     # lands after the last tool message and never between an assistant tool_calls
     # entry and its results (which would break the OpenAI wire protocol). Each is
     # driven by a flag settled during the loop above and fires at most once here.
     #
-    # E8: this round refused a call at the hard cap but the streak has not yet
+    # Blocked-round steer: this round refused a call at the hard cap but the streak has not yet
     # reached the escalation cap (which handle_user_message enforces after this
     # returns) — bounded at ~2 steers per turn.
     if blocked_this_round and 0 < state.blocked_streak < _BLOCKED_STREAK_CAP:
         session.append_steer(_BLOCKED_ROUND_STEER.format(n=_REPEAT_CALL_CAP))
-    # E13: the turn's first relevant file mutation just landed with zero
+    # Reproduce-before-edit steer: the turn's first relevant file mutation just landed with zero
     # verification runs so far — steer the model to reproduce before editing on.
     if state.repro_steer_fired and not repro_fired_before:
         session.append_steer(_REPRO_BEFORE_EDIT_STEER)
@@ -1681,7 +1694,7 @@ def _finalize_answer(
                 ),
                 file=sys.stderr,
             )
-    # E14 — one shared formula for verified across every turn-exit path.
+    # One shared formula for verified across every turn-exit path.
     state.turn_report["verified"] = _turn_verified(state)
 
     # Empty-answer placeholder: if the model returned no text at all (the retry
@@ -1791,7 +1804,7 @@ def handle_user_message(
     turn_report: dict = {
         "files_changed": [],
         "verification_runs": [],
-        "verified": False,
+        "verified": None,
         "declared_unverified": False,
         "answer": None,
         "usage": {"prompt_tokens": None, "completion_tokens": None, "llm_calls": 0},
@@ -1858,7 +1871,7 @@ def handle_user_message(
 
         _dispatch_round(session, state, response, on_delta)
 
-        # E8 escalation ladder: the model has re-issued a call the hard cap keeps
+        # Escalation ladder: the model has re-issued a call the hard cap keeps
         # refusing, ignoring both the block error and the fold-surviving steer.
         # Every further round is a wasted LLM round-trip that dispatches nothing,
         # so force-finalize the turn instead of looping unbounded (observed live:
@@ -1867,7 +1880,7 @@ def handle_user_message(
             answer = _blocked_loop_giveup(session, state, on_delta)
             break
 
-    # Single choke point (E11): mine this settled turn — its diff plus the
+    # Single choke point: mine this settled turn — its diff plus the
     # transcript tail, now including the final answer / give-up message — into
     # durable memory exactly once, on every exit path (normal finalize,
     # blocked-loop escalation, over-cap). Force-finalized turns did real work

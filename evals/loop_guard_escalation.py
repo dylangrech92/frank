@@ -20,13 +20,14 @@ E8 adds two things this script exercises against the *real* production hot path
        exactly once even on this force-finalized path — so the real work the
        turn did is mined into memory rather than silently dropped.
 
-    A2. Truthful give-up envelope (E14) — the force-finalized answer is
+    A2. Truthful give-up envelope — the force-finalized answer is
        synthesized from ``turn_report`` (no extra LLM call), not a static string.
        A turn that mutated a file and ran a successful ``run_command`` yields an
        answer that names the file and the run, never says "unavailable", and
        stamps ``verified == True``; a mutation with no verification run keeps the
        cut-short caveat and ``verified == False``; and a turn that did no work
-       stays close to the plain give-up with no "Work already applied" section.
+       stays close to the plain give-up with no "Work already applied" section
+       and stamps ``verified is None`` (nothing changed, so nothing to verify).
 
     B. Reset — a real dispatch between blocked calls clears the streak, so a run
        that blocks twice, then dispatches a genuinely different call, then ends
@@ -174,7 +175,7 @@ def _drive_giveup(tmp_prefix: str, prefix_script: list):
 
 
 def check_giveup_verified_work() -> list[str]:
-    """E14 (a). Force-finalize after a mutation + successful run_command.
+    """(a). Force-finalize after a mutation + successful run_command.
 
     The synthesized give-up answer must name the mutated file and the verification
     run, must NOT claim the report is 'unavailable', and turn_report['verified']
@@ -214,7 +215,7 @@ def check_giveup_verified_work() -> list[str]:
 
 
 def check_giveup_unverified_work() -> list[str]:
-    """E14 (b). Force-finalize after a mutation with NO verification run.
+    """(b). Force-finalize after a mutation with NO verification run.
 
     The answer must still name the file and carry the cut-short caveat, but
     turn_report['verified'] must be False (nothing ran to verify the change).
@@ -246,10 +247,12 @@ def check_giveup_unverified_work() -> list[str]:
 
 
 def check_giveup_no_work() -> list[str]:
-    """E14 (c). Force-finalize a turn that did no work at all.
+    """(c). Force-finalize a turn that did no work at all.
 
     With no mutation and no run, the answer stays close to the plain give-up (no
-    'Work already applied' section) and verified is False.
+    'Work already applied' section) and verified is None — the turn changed
+    nothing, so there was nothing to verify (distinct from an unverified edit,
+    which stamps False).
     """
     failures: list[str] = []
     answer, session = _drive_giveup("giveup-nowork-", [])
@@ -262,11 +265,59 @@ def check_giveup_no_work() -> list[str]:
     low = answer.lower()
     if not ("harness" in low or "repeated" in low or "blocked" in low):
         failures.append(f"give-up answer names no harness/blocked cause: {answer!r}")
-    if report["verified"] is not False:
+    if report["verified"] is not None:
         failures.append(
-            f"turn_report['verified']={report['verified']!r}, expected False "
-            f"(no work this turn)"
+            f"turn_report['verified']={report['verified']!r}, expected None "
+            f"(no work this turn — nothing to verify)"
         )
+    return failures
+
+
+def check_verified_tristate_contract() -> list[str]:
+    """The full tri-state contract for ``turn_report['verified']``, one place.
+
+    Drives three turns through the real machinery (``_drive_giveup``) and asserts
+    the three distinct states — proving ``None`` (nothing to verify) is never
+    conflated with ``False`` (an edit that went unverified):
+
+        * read-only turn (no mutation) -> ``None``
+        * mutation with a passing verification run after it -> ``True``
+        * mutation with no verification run -> ``False``
+    """
+    failures: list[str] = []
+
+    # Read-only turn: the only tool activity is a repeated list_files that
+    # dispatches (read-only) until it blocks and escalates — no file mutated.
+    _, ro_session = _drive_giveup("tristate-readonly-", [])
+    if ro_session.turn_report["verified"] is not None:
+        failures.append(
+            f"read-only turn: verified={ro_session.turn_report['verified']!r}, "
+            f"expected None (nothing mutated, so nothing to verify)"
+        )
+
+    # Mutation followed by a passing verification run -> True.
+    verified_prefix = [
+        _same_call_response("create_file", {"path": "ok.py", "content": "a = 1\n"}),
+        _same_call_response("run_command", {"cmd": "python3 -c \"print('ok')\""}),
+    ]
+    _, ok_session = _drive_giveup("tristate-verified-", verified_prefix)
+    if ok_session.turn_report["verified"] is not True:
+        failures.append(
+            f"mutation + passing run: verified="
+            f"{ok_session.turn_report['verified']!r}, expected True"
+        )
+
+    # Mutation with no verification run at all -> False.
+    unverified_prefix = [
+        _same_call_response("create_file", {"path": "raw.py", "content": "b = 2\n"}),
+    ]
+    _, bad_session = _drive_giveup("tristate-unverified-", unverified_prefix)
+    if bad_session.turn_report["verified"] is not False:
+        failures.append(
+            f"mutation, no run: verified="
+            f"{bad_session.turn_report['verified']!r}, expected False"
+        )
+
     return failures
 
 
@@ -384,6 +435,7 @@ def main() -> int:
         ("giveup-verified-work", check_giveup_verified_work),
         ("giveup-unverified-work", check_giveup_unverified_work),
         ("giveup-no-work", check_giveup_no_work),
+        ("verified-tristate", check_verified_tristate_contract),
         ("reset", check_reset_no_premature_escalation),
         ("fold-survival", check_fold_survival),
     ):
