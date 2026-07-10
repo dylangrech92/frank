@@ -38,9 +38,9 @@ def main() -> int:
     rend = "[replace_one(success)] Replaced 1 occurrence in app.py"
 
     seen: dict[tuple[str, str], int] = {}
-    seen_renders: dict[tuple[str, str], tuple[str, int]] = {}
-    rendered1 = agent._repeat_call_check("replace_one", arguments, ok, rend, seen, seen_renders, 0)
-    rendered2 = agent._repeat_call_check("replace_one", arguments, ok, rend, seen, seen_renders, 0)
+    seen_renders: dict[tuple[str, str], tuple[str, int, int]] = {}
+    rendered1 = agent._repeat_call_check("replace_one", arguments, ok, rend, seen, seen_renders, 0, 0)
+    rendered2 = agent._repeat_call_check("replace_one", arguments, ok, rend, seen, seen_renders, 0, 0)
 
     ok_flag = True
 
@@ -60,9 +60,9 @@ def main() -> int:
     err = ToolResult.err("boom", code="boom")
     erend = "[replace_one(error code=boom)] boom"
     seen_err: dict[tuple[str, str], int] = {}
-    seen_renders_err: dict[tuple[str, str], tuple[str, int]] = {}
-    e1 = agent._repeat_call_check("replace_one", arguments, err, erend, seen_err, seen_renders_err, 0)
-    e2 = agent._repeat_call_check("replace_one", arguments, err, erend, seen_err, seen_renders_err, 0)
+    seen_renders_err: dict[tuple[str, str], tuple[str, int, int]] = {}
+    e1 = agent._repeat_call_check("replace_one", arguments, err, erend, seen_err, seen_renders_err, 0, 0)
+    e2 = agent._repeat_call_check("replace_one", arguments, err, erend, seen_err, seen_renders_err, 0, 0)
     if "[loop-guard]" in e1 or "[loop-guard]" in e2:
         print("FAIL: error result was steered by the success-path guard", file=sys.stderr)
         print(f"  e1={e1!r} e2={e2!r}", file=sys.stderr)

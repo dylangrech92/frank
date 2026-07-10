@@ -221,11 +221,14 @@ SCENARIOS: list[dict] = [
         "description": (
             "End-to-end check (stub LLM, no network): a repeated identical "
             "successful read-only call is deduped — its full body replaced by a "
-            "short stub from repeat #2 on — while two safety conditions force the "
+            "short stub from repeat #2 on — while safety conditions force the "
             "full body instead: a fingerprint mismatch when a re-read reflects a "
             "just-applied edit, and a compaction since the last full render (both "
-            "would otherwise strand the model). Exempt / non-parallel_safe tools "
-            "(run_command) are never stubbed."
+            "would otherwise strand the model). Verification tools (run_command) "
+            "are deduped to a [no-change] stub only when nothing has been modified "
+            "since the identical run; a mutation between runs (or changed output) "
+            "forces the full body and re-stamps, and read-only dedup ignores the "
+            "mutation stamp."
         ),
         "inline": "repeat_dedup_render.py",
     },

@@ -452,6 +452,23 @@ _REPEAT_DEDUP_STUB = (
     "change your arguments or approach."
 )
 
+# Dedup stub that REPLACES the full render of a repeated identical successful
+# VERIFICATION call (run_command/run_tests/verify_scratch) when nothing has been
+# modified since the identical earlier run this turn. Verification is exempt from
+# the repeat suffix and the hard cap because the edit→retest cycle legitimately
+# repeats — but re-running a byte-identical command with ZERO intervening file
+# mutations cannot produce a different result, so its output is omitted and the
+# model is told to change something before re-verifying. Separate wording from
+# _REPEAT_DEDUP_STUB (world fact + one directive) so the message names the true
+# reason (no change on disk, not "read-only re-read"). Only used when the
+# fingerprint, compaction count, AND mutation count are all unchanged since the
+# last full render (see _repeat_render).
+_VERIFY_NOCHANGE_STUB = (
+    "[no-change] {name} already ran with these exact arguments and nothing has "
+    "been modified since — its output is identical to the result shown above. "
+    "Make a change before re-running verification."
+)
+
 
 def _render_fingerprint(rendered: str) -> str:
     """Stable content fingerprint of a rendered tool result.
@@ -469,42 +486,80 @@ def _repeat_render(
     name: str,
     key: tuple[str, str],
     rendered: str,
-    seen_renders: dict[tuple[str, str], tuple[str, int]],
+    seen_renders: dict[tuple[str, str], tuple[str, int, int]],
     compactions: int,
+    mutations: int,
+    *,
+    verification: bool,
 ) -> str:
-    """Return a dedup stub for a redundant repeated read, else the full render+suffix.
+    """Return a dedup stub for a provably-redundant repeat, else the full render.
 
     Called only for a repeat (count >= 2) that is a success on a tool eligible
-    for dedup (``parallel_safe`` and not verification-exempt). Two conditions,
-    each guarding a distinct correctness hazard, gate the stub — and both must
-    hold or the full body is re-emitted:
+    for dedup — either a read-only tool (``parallel_safe`` and not
+    verification-exempt) or a verification tool (run_command/run_tests/
+    verify_scratch). The stamp recorded at the last full render is
+    ``key -> (fingerprint, compactions, mutations)``; which of those three
+    stamps gate the stub depends on the tool class. Full gate table (a matched
+    row omits the body; any mismatch re-emits the full body and re-stamps):
+
+    | tool class   | fingerprint | compaction | mutation  | render on match      |
+    |--------------|-------------|------------|-----------|----------------------|
+    | read-only    | match       | unchanged  | (ignored) | _REPEAT_DEDUP_STUB   |
+    | verification | match       | unchanged  | unchanged | _VERIFY_NOCHANGE_STUB|
+
+    The three conditions each guard a distinct hazard:
 
     (d) Identical arguments do NOT imply an identical result. A re-read of a
         file the model just edited is legitimate and MUST get the fresh body, so
         the render's content *fingerprint* is compared against the one recorded
-        at the last full render; on any mismatch the fresh body is returned and
-        the stamp updated.
+        at the last full render; on any mismatch the fresh body is returned.
     (e) A compaction may have folded the earlier result out of context. A stub
         that points at a result no longer present strands the model (the known
         amnesia loop), so the stub is withheld unless ``compactions`` is
-        unchanged since the last full render; if it advanced, the full body is
-        returned once and the stamp re-stamped at the new compaction count.
+        unchanged since the last full render.
+    (m) For VERIFICATION only: an identical command whose output is stamp-clean
+        can still be worth re-running once a file has changed (the edit→retest
+        cycle). So the verification stub is withheld unless the turn's mutation
+        count is also unchanged since the last full render — nothing modified
+        means the output cannot differ. Read-only tools do NOT gate on (m): a
+        re-read whose body is byte-identical is redundant regardless of an
+        unrelated edit to some OTHER file, so the mutation stamp is carried on
+        the record but never consulted for them (the fingerprint already speaks
+        for content).
 
-    ``seen_renders`` is mutated in place: ``key -> (fingerprint, compactions)``
-    is refreshed on every full-render return so the next repeat compares against
-    the most recent body and context. Kept as a small pure function so an eval
-    can drive the two branches directly with a fabricated stamp dict.
+    A verification tool is EXEMPT from the no-progress suffix (a legitimate
+    retest is progress, not a no-op loop), so its full-render branch returns the
+    body plain; a read-only tool's carries ``_REPEAT_STEER_SUFFIX``.
+
+    ``seen_renders`` is mutated in place: it is re-stamped with the current
+    ``(fingerprint, compactions, mutations)`` on every full-render return so the
+    NEXT repeat compares against the most recent body/context/mutation-count —
+    in particular, after a verification mutation-stamp mismatch this lets a later
+    identical run with no further mutations stub again. Kept as a small pure
+    function so an eval can drive every branch with a fabricated stamp dict.
     """
     fingerprint = _render_fingerprint(rendered)
     prev = seen_renders.get(key)
-    if prev is not None and prev == (fingerprint, compactions):
-        # (d) body unchanged AND (e) no fold since the last full render — the
-        # earlier result is still both identical and visible, so omit the body.
-        return _REPEAT_DEDUP_STUB.format(name=name)
-    # Mismatch on either condition: re-emit the body and re-stamp so the model
-    # sees the fresh/re-materialised result, tagged with the no-progress suffix.
-    seen_renders[key] = (fingerprint, compactions)
-    return rendered + _REPEAT_STEER_SUFFIX.format(name=name)
+    if verification:
+        # (d) AND (e) AND (m): body, context, and disk all unchanged -> omit.
+        matched = prev is not None and prev == (fingerprint, compactions, mutations)
+        stub = _VERIFY_NOCHANGE_STUB
+        full = rendered  # verification is exempt from the no-progress suffix
+    else:
+        # (d) AND (e) only; the mutation stamp is carried but not consulted.
+        matched = (
+            prev is not None
+            and prev[0] == fingerprint
+            and prev[1] == compactions
+        )
+        stub = _REPEAT_DEDUP_STUB
+        full = rendered + _REPEAT_STEER_SUFFIX.format(name=name)
+    if matched:
+        return stub.format(name=name)
+    # Mismatch on a gating condition: re-emit the body and re-stamp so the next
+    # repeat compares against the fresh/re-materialised result and its stamps.
+    seen_renders[key] = (fingerprint, compactions, mutations)
+    return full
 
 
 def _call_signature(arguments: dict) -> str:
@@ -527,8 +582,9 @@ def _repeat_call_check(
     result: ToolResult,
     rendered: str,
     seen_calls: dict[tuple[str, str], int],
-    seen_renders: dict[tuple[str, str], tuple[str, int]],
+    seen_renders: dict[tuple[str, str], tuple[str, int, int]],
     compactions: int,
+    mutations: int,
 ) -> str:
     """Steer (and, when safe, dedup) a repeated identical successful call.
 
@@ -542,13 +598,25 @@ def _repeat_call_check(
     to avoid double-suffixing.
 
     From repeat #2 on, the full body is normally re-rendered with a no-progress
-    suffix (``_REPEAT_STEER_SUFFIX``). But for a read-only tool (``parallel_safe``
-    and not verification-exempt) whose body has not changed, re-emitting a
-    byte-identical result wastes context and rewards the re-issue; ``_repeat_render``
-    replaces the body with a short stub instead — but only when both of its safety
-    conditions hold (fingerprint unchanged AND no compaction since the last full
-    render). ``seen_renders`` and ``compactions`` are always required so no caller
-    can silently lose the dedup by forgetting to pass them.
+    suffix (``_REPEAT_STEER_SUFFIX``). But when the body has provably not changed
+    it is replaced by a short stub instead (``_repeat_render`` owns the gate
+    table). Two tool classes are dedup-eligible, with different gates:
+
+    * A read-only tool (``parallel_safe`` and not verification-exempt) is stubbed
+      when the fingerprint and compaction count are unchanged since the last full
+      render — a re-read whose body is byte-identical is redundant regardless of
+      any unrelated edit.
+    * A verification tool (run_command/run_tests/verify_scratch) is normally
+      exempt from the repeat machinery, but a byte-identical re-run with ZERO
+      intervening file mutations cannot produce a different result, so it too is
+      stubbed — under the read-only gate PLUS an unchanged mutation count, and
+      with its own ``_VERIFY_NOCHANGE_STUB`` wording. It never receives the
+      no-progress suffix and is never hard-capped: a genuine edit→retest repeat
+      (mutation count advanced) re-renders the full body plainly and re-stamps,
+      so a later identical run with no new mutation stubs again.
+
+    ``seen_renders``, ``compactions`` and ``mutations`` are always required so no
+    caller can silently lose the dedup by forgetting to pass them.
 
     The count this maintains is also read pre-dispatch by the hard-cap block in
     ``handle_user_message`` to *refuse* an identical call once it has repeated
@@ -567,14 +635,22 @@ def _repeat_call_check(
             mutated in place. Incremented for *every* call (success or error)
             so the pre-dispatch hard cap sees an accurate tally.
         seen_renders: Per-turn dedup stamps, ``(name, signature) ->
-            (render fingerprint, compactions-at-render)``, mutated in place.
+            (render fingerprint, compactions-at-render, mutations-at-render)``,
+            mutated in place.
         compactions: Compactions performed so far this turn — the condition-(e)
             input that detects a fold between the last full render and this one.
+        mutations: Monotonic count of file-mutation events this turn — the
+            condition-(m) input that gates the VERIFICATION stub (an identical
+            re-run after zero mutations cannot differ). Read-only dedup ignores
+            it (the fingerprint already speaks for content), but it is stamped on
+            the record for every dedup-eligible tool.
 
     Returns:
         *rendered* unchanged on a first success or an error; the full body plus
-        ``_REPEAT_STEER_SUFFIX`` on a repeat that cannot be safely deduped; or a
-        short ``_REPEAT_DEDUP_STUB`` replacing the body when it can.
+        ``_REPEAT_STEER_SUFFIX`` on a read-only repeat that cannot be safely
+        deduped; the full body plain on an unstubbable verification repeat; or a
+        short ``_REPEAT_DEDUP_STUB`` / ``_VERIFY_NOCHANGE_STUB`` replacing the
+        body when the gate says the result is provably redundant.
     """
     key = (name, _call_signature(arguments))
     seen_calls[key] = seen_calls.get(key, 0) + 1
@@ -583,25 +659,31 @@ def _repeat_call_check(
     if result.status != "success":
         return rendered
 
-    # A tool is dedup-eligible only when it is read-only (parallel_safe) and not
-    # a verification tool (whose identical re-runs inside an edit→verify cycle are
-    # legitimate and exempt from the whole repeat machinery). get_tool -> None on
-    # an unknown name yields False here, which is correct (no dedup).
-    dedupable = (
+    # Two dedup-eligible classes, each with its own gate in _repeat_render:
+    #   * verification tools (run_command/run_tests/verify_scratch) — stubbed
+    #     only when nothing has changed on disk since the identical run;
+    #   * read-only tools (parallel_safe, non-exempt) — stubbed on an unchanged
+    #     body. get_tool -> None on an unknown name yields False (no dedup).
+    is_verification = name in _VERIFICATION_TOOLS
+    is_readonly = (
         name not in _REPEAT_CAP_EXEMPT
         and getattr(get_tool(name), "parallel_safe", False)
     )
+    dedupable = is_verification or is_readonly
 
     if seen_calls[key] < 2:
-        # First success: stamp the full render's fingerprint + compaction count
-        # so a later identical repeat can distinguish an unchanged body (dedup to
-        # a stub) from a fresh one (re-read after an edit -> keep the body).
+        # First success: stamp the full render's fingerprint + compaction + mutation
+        # count so a later identical repeat can tell an unchanged result (dedup to a
+        # stub) from a changed one (fresh body after an edit / a real retest).
         if dedupable:
-            seen_renders[key] = (_render_fingerprint(rendered), compactions)
+            seen_renders[key] = (_render_fingerprint(rendered), compactions, mutations)
         return rendered
 
     if dedupable:
-        return _repeat_render(name, key, rendered, seen_renders, compactions)
+        return _repeat_render(
+            name, key, rendered, seen_renders, compactions, mutations,
+            verification=is_verification,
+        )
     return rendered + _REPEAT_STEER_SUFFIX.format(name=name)
 
 
@@ -858,16 +940,27 @@ class _TurnState:
     # Identical (name, arg-signature) pairs dispatched this turn, for the
     # repeated-successful-call loop-guard steer plus the hard dispatch cap.
     seen_calls: dict[tuple[str, str], int] = field(default_factory=dict)
-    # Full-render dedup stamps for repeated identical successful read-only calls,
-    # keyed by (name, arg-signature) -> (render fingerprint, compactions-at-render).
+    # Full-render dedup stamps for repeated identical successful dedup-eligible
+    # calls, keyed by (name, arg-signature) ->
+    # (render fingerprint, compactions-at-render, mutations-at-render).
     # Lets _repeat_call_check replace a provably-unchanged repeat with a short stub
     # instead of re-emitting the body: the fingerprint forces a fresh body when a
-    # re-read reflects a just-applied edit, and the compaction count forces one when
-    # a fold may have dropped the earlier result out of context. Distinct from
-    # seen_calls, whose int tally the pre-dispatch hard cap depends on.
-    seen_renders: dict[tuple[str, str], tuple[str, int]] = field(default_factory=dict)
+    # re-read reflects a just-applied edit, the compaction count forces one when a
+    # fold may have dropped the earlier result out of context, and the mutation
+    # count forces one for verification tools when a file changed since the run
+    # (read-only dedup carries but does not gate on it). Distinct from seen_calls,
+    # whose int tally the pre-dispatch hard cap depends on.
+    seen_renders: dict[tuple[str, str], tuple[str, int, int]] = field(default_factory=dict)
     # Every distinct path mutated this turn (H1/H5 tracking).
     mutated_paths: set[str] = field(default_factory=set)
+    # Monotonic count of file-mutation EVENTS this turn (not distinct paths — a
+    # second edit to an already-mutated path bumps it), spanning both direct
+    # edit-tool mutations and run_command's snapshot-diff shell mutations (both
+    # publish on the _TURN_MUTATIONS bus). Recorded at every dedup-eligible full
+    # render; a verification repeat is only stubbed when this is unchanged since
+    # the identical earlier run, so a byte-identical re-run with nothing modified
+    # is deduped while a genuine edit→retest re-renders the full body.
+    mutation_events: int = 0
     # E8 loop-guard escalation: consecutive tool calls refused by the repeat-call
     # hard cap, counted regardless of key (alternating between two blocked calls
     # is just as stuck). Incremented on every hard-cap block, reset to 0 the
@@ -1347,6 +1440,11 @@ def _dispatch_sequential_call(
             for _ev in new_events:
                 if _ev.get("kind") not in ("created", "changed", "renamed"):
                     continue
+                # Count EVERY relevant mutation event (before the path-dedup
+                # below) so a second edit to an already-mutated path still bumps
+                # the stamp the verification dedup gates on — len(mutated_paths)
+                # would miss it.
+                state.mutation_events += 1
                 _ev_path = _ev.get("path")
                 if _ev_path and _ev_path not in state.files_changed_seen:
                     state.files_changed_seen.add(_ev_path)
@@ -1455,7 +1553,7 @@ def _dispatch_round(
         rendered = _loop_guard_check(call.name, rendered, state.seen_errors)
         rendered = _repeat_call_check(
             call.name, call.arguments, result, rendered, state.seen_calls,
-            state.seen_renders, state.compactions,
+            state.seen_renders, state.compactions, state.mutation_events,
         )
         rendered, state.searches_without_read = _web_search_focus_check(
             call.name, result, rendered, state.searches_without_read
