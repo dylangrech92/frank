@@ -692,8 +692,8 @@ class _TurnState:
     # local-model bare-stop failure mode). Fires at most once per turn; a second
     # empty turn falls through to a transparent placeholder at the return site.
     empty_answer_nudge_fired: bool = False
-    # H5 graph-memory nudge input: whether record_decision/record_spec ran this
-    # turn (paired with mutated_paths); the fired-once-per-session flag lives in
+    # H5 graph-memory nudge input: whether a record(kind='decision'/'spec') call ran
+    # this turn (paired with mutated_paths); the fired-once-per-session flag lives in
     # _GRAPH_MEMORY_NUDGE_FIRED.
     record_decision_or_spec_called: bool = False
     # Reactive web-search focus nudge: consecutive successful web_search calls
@@ -977,7 +977,7 @@ def _maybe_graph_memory_nudge(session: Session, state: "_TurnState") -> None:
     """H5 — graph-memory usage nudge, fired at most once per session.
 
     When this turn's mutations spanned 3+ distinct paths with no
-    record_decision/record_spec call, append a one-line reminder to the last
+    record(kind='decision'/'spec') call, append a one-line reminder to the last
     tool result already in the transcript (the same append mechanism
     diagnostics_inject_summary uses). Must run BEFORE ``session.append_assistant``
     records this turn's answer, since ``amend_last_tool_result`` only touches
@@ -992,8 +992,8 @@ def _maybe_graph_memory_nudge(session: Session, state: "_TurnState") -> None:
         print(ui.telemetry("graph-memory-nudge: fired"), file=sys.stderr)
         session.amend_last_tool_result(
             "\n\n[memory] This change spans several files. If a design "
-            "decision drove it, record it with record_decision so future "
-            "sessions inherit the reasoning."
+            "decision drove it, record it with record(kind='decision') so "
+            "future sessions inherit the reasoning."
         )
 
 
@@ -1163,7 +1163,10 @@ def _dispatch_round(
             )
             if result.status == "success":
                 state.needs_verification = False
-        if call.name in ("record_decision", "record_spec"):
+        if call.name == "record" and str(call.arguments.get("kind", "")).strip().lower() in (
+            "decision",
+            "spec",
+        ):
             state.record_decision_or_spec_called = True
 
         rendered = render_tool_result(call.name, result)

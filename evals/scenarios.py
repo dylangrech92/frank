@@ -282,6 +282,17 @@ SCENARIOS: list[dict] = [
         ),
         "inline": "compaction_force_fold.py",
     },
+    {
+        "name": "record_graph",
+        "description": (
+            "Dispatch-level check (no LLM): the unified `record` graph tool writes "
+            "each kind and echoes the new node id; a pivot supersedes a decision by "
+            "TITLE (edge + superseded_at stamp); an ambiguous title lists candidates "
+            "and refuses the whole write; an unknown title refuses transactionally; "
+            "and supersedes by raw id still works."
+        ),
+        "inline": "record_graph.py",
+    },
 ]
 
 

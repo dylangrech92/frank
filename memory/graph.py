@@ -11,10 +11,6 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from memory.recall import MemoryContext
 
 NODE_TYPES = ("rule", "decision", "pivot", "spec")
 EDGE_TYPES = ("supersedes", "implements", "constrains", "refines", "relates_to")
@@ -128,6 +124,26 @@ def link_nodes(ctx, from_id: int, to_id: int, edge_type: str) -> int:
     return cur.lastrowid
 
 
+def _apply_supersede(store, from_id: int, target_id: int, now: str) -> None:
+    """Create one ``supersedes`` edge and stamp the target superseded (no commit).
+
+    Shared by :func:`record_pivot` (pivot node supersedes prior nodes) and
+    :func:`supersede` (any node supersedes prior nodes). The caller owns the
+    surrounding transaction (commit / rollback).
+    """
+    if not _node_exists(store, target_id):
+        raise ValueError(f"supersedes target {target_id} does not exist")
+    store.conn.execute(
+        "INSERT INTO graph_edges(from_id, to_id, edge_type, created_at) "
+        "VALUES(?, ?, 'supersedes', ?)",
+        (from_id, target_id, now),
+    )
+    store.conn.execute(
+        "UPDATE graph_nodes SET superseded_at=?, active=0 WHERE id=?",
+        (now, target_id),
+    )
+
+
 def record_pivot(ctx, title: str, why: str, supersedes: list[int]) -> int:
     """Transactionally record a pivot node that supersedes one or more nodes.
 
@@ -156,23 +172,106 @@ def record_pivot(ctx, title: str, why: str, supersedes: list[int]) -> int:
         _insert_vec(store, pivot_id, _embed(ctx, f"{title}\n{why or ''}"))
 
         for target in targets:
-            if not _node_exists(store, target):
-                raise ValueError(f"supersedes target {target} does not exist")
-            store.conn.execute(
-                "INSERT INTO graph_edges(from_id, to_id, edge_type, created_at) "
-                "VALUES(?, ?, 'supersedes', ?)",
-                (pivot_id, target, now),
-            )
-            store.conn.execute(
-                "UPDATE graph_nodes SET superseded_at=?, active=0 WHERE id=?",
-                (now, target),
-            )
+            _apply_supersede(store, pivot_id, target, now)
 
         store.conn.commit()
         return pivot_id
     except Exception:
         store.conn.rollback()
         raise
+
+
+def supersede(ctx, from_id: int, targets: list[int]) -> None:
+    """Transactionally stamp *targets* as superseded by *from_id*.
+
+    Creates a ``supersedes`` edge ``from_id -> target`` and marks each target
+    ``superseded_at`` + ``active=0`` for every target, all-or-nothing. Used when a
+    non-pivot node (a new decision/spec/rule) replaces earlier ones. If any target
+    is missing (or any write fails) the whole operation is rolled back.
+    """
+    if not targets:
+        return
+    store = ctx.store
+    now = _now_iso()
+    try:
+        for target in targets:
+            _apply_supersede(store, from_id, target, now)
+        store.conn.commit()
+    except Exception:
+        store.conn.rollback()
+        raise
+
+
+def _fts_title_query(title: str) -> str:
+    """Build an FTS5 MATCH expression requiring EVERY token, scoped to the title column.
+
+    All-tokens (implicit AND) keeps resolution precise: a multi-token reference that
+    merely shares one word with some node must refuse loudly rather than silently
+    resolve to it — a wrong supersedes target stamps the wrong node inactive.
+    """
+    tokens = [t for t in title.replace('"', " ").split() if t]
+    if not tokens:
+        return 'title:""'
+    return " ".join('title:"' + t + '"' for t in tokens)
+
+
+def resolve_node_ref(ctx, ref) -> tuple[dict | None, list[dict]]:
+    """Resolve a node reference (raw id or a title string) to a single ACTIVE node.
+
+    A reference is either a raw integer id (or its digit-string form) or a node
+    title. Resolution is loud and all-or-nothing for the caller: exactly one active
+    match returns ``(row, [])`` where ``row`` is ``{"id", "type", "title"}``; zero or
+    many matches return ``(None, candidates)`` where ``candidates`` is the closest
+    active nodes (each ``{"id", "type", "title"}``) so the caller can refuse the
+    whole write and surface them for a disambiguated retry.
+
+    Title resolution prefers an exact (case-insensitive) title match; failing that it
+    falls back to the graph_nodes FTS index scoped to the title column.
+    """
+    store = ctx.store
+
+    # --- raw id path -----------------------------------------------------
+    node_id: int | None = None
+    if isinstance(ref, int) and not isinstance(ref, bool):
+        node_id = ref
+    elif isinstance(ref, str) and ref.strip().isdigit():
+        node_id = int(ref.strip())
+    if node_id is not None:
+        row = store.conn.execute(
+            "SELECT id, type, title FROM graph_nodes WHERE id=? AND active=1", (node_id,)
+        ).fetchone()
+        if row is not None:
+            return {"id": row["id"], "type": row["type"], "title": row["title"]}, []
+        return None, []
+
+    # --- title path ------------------------------------------------------
+    title = ref.strip() if isinstance(ref, str) else ""
+    if not title:
+        return None, []
+
+    exact = store.conn.execute(
+        "SELECT id, type, title FROM graph_nodes WHERE active=1 AND lower(title)=lower(?)",
+        (title,),
+    ).fetchall()
+    if len(exact) == 1:
+        r = exact[0]
+        return {"id": r["id"], "type": r["type"], "title": r["title"]}, []
+    if len(exact) > 1:
+        return None, [{"id": r["id"], "type": r["type"], "title": r["title"]} for r in exact]
+
+    try:
+        rows = store.conn.execute(
+            "SELECT gn.id AS id, gn.type AS type, gn.title AS title "
+            "FROM graph_nodes_fts f JOIN graph_nodes gn ON gn.id = f.rowid "
+            "WHERE f.graph_nodes_fts MATCH ? AND gn.active=1",
+            (_fts_title_query(title),),
+        ).fetchall()
+    except Exception:
+        rows = []
+    if len(rows) == 1:
+        r = rows[0]
+        return {"id": r["id"], "type": r["type"], "title": r["title"]}, []
+    return None, [{"id": r["id"], "type": r["type"], "title": r["title"]} for r in rows]
 
 
 # ---------------------------------------------------------------------------
