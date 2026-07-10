@@ -293,6 +293,17 @@ SCENARIOS: list[dict] = [
         ),
         "inline": "record_graph.py",
     },
+    {
+        "name": "consolidation_ops",
+        "description": (
+            "Dispatch-level check (no LLM): consolidation's op-apply seam "
+            "(apply_ops) writes a DECISION node; a PIVOT supersedes a decision by "
+            "EXACT TITLE (edge + superseded_at stamp) and by raw id; an unknown "
+            "pivot title writes nothing and is counted as a noop; and an ADD atom "
+            "op still writes a fact row after the refactor."
+        ),
+        "inline": "consolidation_ops.py",
+    },
 ]
 
 

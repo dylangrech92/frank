@@ -48,31 +48,36 @@ MAX_MINED_CHARS = 8000         # total diff+transcript cap embedded in the promp
 CONFIDENCE_FLOOR = 0.45        # ADD/UPDATE below this confidence is dropped (poisoning defence)
 KEY_REUSE_SIMILARITY = 0.62    # min (key+value) similarity to reuse a live atom's key (see _best_existing_key_match)
 
-_CONSOLIDATION_SYSTEM_PROMPT = """You maintain a project's durable, reusable KNOWLEDGE ATOMS -- concepts, vocabulary, cross-cutting flows, invariants, conventions, gotchas, domain facts learned by investigation (counts, inventories, configuration values, capabilities, behavior), and the WHY behind decisions. You are NOT recording pure code-location trivia like "the function at line N does Z" or "X is defined at path:line" -- a separate, zero-LLM project skeleton already answers exactly where symbols live. A file path may still appear as an atom's anchor/evidence; the ban is on facts whose ONLY content is a location, never on a domain fact that happens to cite one.
+_CONSOLIDATION_SYSTEM_PROMPT = """You maintain TWO durable records for a software project, from one completed task's code diff and/or transcript tail:
 
-You are shown the code diff and/or transcript tail from one completed task, plus the existing atoms and decisions most similar to it. Decide what durable knowledge this task establishes and return operations against the store.
+1. KNOWLEDGE ATOMS -- reusable concepts, vocabulary, cross-cutting flows, invariants, conventions, gotchas, and domain facts learned by investigation (counts, inventories, configuration values, capabilities, behavior). NOT pure code-location trivia like "the function at line N does Z" or "X is defined at path:line" -- a separate, zero-LLM project skeleton already answers exactly where symbols live. A file path may still appear as an atom's anchor; the ban is on facts whose ONLY content is a location.
+2. THE DECISION RECORD -- the project's design decisions and the reversals of them. When this task chose one approach over alternatives, adopted a constraint, or settled a design question, that is a DECISION. When this task overturns an earlier decision, that is a PIVOT.
+
+You are shown the diff/transcript for this task plus the existing atoms and decisions most similar to it. Decide what durable knowledge AND what decisions this task establishes, then return operations against the store.
 
 Return ONLY a JSON array of operation objects (no prose, no markdown fences). Each object is ONE of:
 
 Atom operation:
 {"op": "ADD" | "UPDATE" | "DELETE" | "NOOP", "kind": "project" | "convention", "key": "short-stable-identifier", "value": "the durable insight, stated atomically", "confidence": 0.0-1.0, "anchor_path": "relative/path/to/file.ext" or null}
 
-Decision operation (a genuine design "why"):
-{"op": "DECISION", "title": "short title", "body": "the reasoning"}
+Decision operation:
+{"op": "DECISION", "title": "short imperative title", "body": "what was chosen AND which alternative was rejected and why"}
 
-Pivot operation (a REVERSAL of a decision/spec shown to you below, by its [id]):
-{"op": "PIVOT", "title": "short title", "body": "why this reverses the prior decision(s)", "supersedes": [id, ...]}
+Pivot operation (this task reversed or replaced a decision listed under "Existing decisions" below):
+{"op": "PIVOT", "title": "short imperative title", "body": "what changed and why it overturns the prior decision", "supersedes": ["exact title copied from the existing-decisions block", 12]}
 
 Rules:
-- ADD: a new durable, reusable fact not already present below -- including a concrete count/inventory/configuration value the task discovered (e.g. "this project registers N of X"), not only abstract concepts. Example ADD-worthy: "This project has 37 registered abilities, loaded via backend/abilities/_registry.py::_load." Example NOOP-worthy: "I checked the file and found the function" (transient narration, no reusable content).
+- ADD: a new durable, reusable fact not already present below -- including a concrete count/inventory/configuration value the task discovered (e.g. "this project registers N of X"), not only abstract concepts. Example NOOP-worthy: "I checked the file and found the function" (transient narration, no reusable content).
 - UPDATE: this task refines, corrects, or SUPERSEDES an atom shown below -- reuse that atom's EXACT key.
 - DELETE: an atom shown below is now wrong/abandoned -- give its exact key.
 - NOOP: nothing durable (transient chatter, restates something already known). Prefer NOOP over a low-value ADD, but a concrete fact the user or agent explicitly established this task is NOT low-value merely for being short.
-- confidence: how durable/important/reusable this atom is for a FUTURE task (0=trivial, 1=core invariant). Be conservative -- routine progress notes and one-off details score LOW.
 - If a later reply in the transcript CORRECTS an earlier claim (yours or an existing atom shown below), you MUST emit an UPDATE (same key when an existing atom matches) with the corrected value -- never leave a superseded wrong fact standing.
+- confidence: how durable/important/reusable this atom is for a FUTURE task (0=trivial, 1=core invariant). Be conservative.
 - anchor_path: the single file this insight is most about, if the transcript/diff names one; else null (repo-wide).
 - kind is ALWAYS "project" (a fact about this codebase) or "convention" (an observed coding convention/style).
-- Prefer FEW high-value atoms over many trivial ones. Use DECISION only for a genuine, non-obvious design choice; PIVOT only when it truly reverses something shown below."""
+- DECISION: emit one when the task chose an approach among alternatives, adopted a constraint, or settled a design question -- name the rejected alternative and why in the body. Do NOT emit a decision for a mechanical edit (a rename, a value tweak, a formatting change). A few real decisions beat many noisy ones.
+- PIVOT: emit one only when the task reverses or replaces a decision shown in the existing-decisions block. Each "supersedes" entry is the TITLE of that decision copied verbatim from the block (preferred) or its [id].
+- Prefer FEW high-value atoms and decisions over many trivial ones."""
 
 _NAMED_PATH_RE = re.compile(r"[\w./-]+\.[A-Za-z]{1,10}(?::\d+)?")
 
@@ -145,6 +150,23 @@ def _normalize_for_match(text: str) -> str:
     return " ".join(text.lower().split())
 
 
+def _decision_line(hit: dict) -> str:
+    """Render one existing decision/spec/pivot as a line whose title is quotable.
+
+    ``graph.recall_graph`` returns the node title under ``value`` and the full
+    ``[kind] title: body`` render under ``text``; the model must be able to copy
+    the title VERBATIM into a PIVOT ``supersedes`` entry, so the title is quoted
+    explicitly and the body appended for context.
+    """
+    node_id = hit.get("id")
+    kind = hit.get("kind")
+    title = (hit.get("value") or "").strip()
+    text = hit.get("text") or ""
+    body = text.split(": ", 1)[1].strip() if ": " in text else ""
+    line = f'- [{node_id}] {kind} titled "{title}"'
+    return f"{line} -- {body}" if body else line
+
+
 def _best_existing_key_match(key: str, value: str, existing_atoms: list[dict]) -> str | None:
     """Best-effort reuse of a live atom's key for a same-subject fact whose
     key the model chose differently this time.
@@ -182,6 +204,202 @@ def _best_existing_key_match(key: str, value: str, existing_atoms: list[dict]) -
         return None
 
 
+def _new_stats() -> dict:
+    """Return a fresh observability/stats dict for one consolidation pass."""
+    return {
+        "ran": False,
+        "reason": "not-run",
+        "processed": 0,
+        "added": 0,
+        "updated": 0,
+        "deleted": 0,
+        "noop": 0,
+        "decisions": 0,
+        "pivots": 0,
+        "skipped_low_confidence": 0,
+    }
+
+
+def _apply_atom_op(ctx, op, action, *, project_root, existing_atoms, stats) -> None:
+    """Apply one ADD/UPDATE atom op via ``memory.atomic.remember`` (code-anchored)."""
+    from memory.atomic import remember
+
+    conn = ctx.store.conn
+    key = op.get("key")
+    key = key.strip() if isinstance(key, str) else ""
+    value = op.get("value")
+    value = value.strip() if isinstance(value, str) else ""
+    if not key or not value:
+        stats["noop"] += 1
+        return
+    try:
+        confidence = float(op.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+    if confidence < CONFIDENCE_FLOOR:
+        stats["skipped_low_confidence"] += 1
+        return
+    # Resolve the EFFECTIVE key before anything else: two independent weak-LLM
+    # key choices for the same underlying fact need not match (e.g. a correction
+    # turn inventing a different key than the original wrong atom -- see
+    # MEMORY_REDESIGN.md / consolidation module docstring). Try the model's own
+    # key first; if no live atom holds it, fall back to the key of the
+    # most-similar existing atom shown to the model, so supersession below closes
+    # the stale/wrong atom instead of leaving it live alongside a new sibling.
+    pre = conn.execute(
+        "SELECT kind FROM facts WHERE key=? AND valid_to IS NULL "
+        "AND active=1 AND deleted_at IS NULL",
+        (key,),
+    ).fetchone()
+    effective_key = key
+    if pre is None:
+        reused_key = _best_existing_key_match(key, value, existing_atoms)
+        if reused_key is not None:
+            effective_key = reused_key
+            pre = conn.execute(
+                "SELECT kind FROM facts WHERE key=? AND valid_to IS NULL "
+                "AND active=1 AND deleted_at IS NULL",
+                (effective_key,),
+            ).fetchone()
+    # Same-key identity wins over the model's kind choice: if a live atom already
+    # holds this key (under ANY kind -- it may predate consolidation and carry a
+    # legacy/TTL kind), reuse ITS kind so remember()'s (kind, key)-scoped
+    # supersession actually closes it instead of leaving it live alongside a
+    # same-key sibling under a different kind.
+    kind = pre["kind"] if pre is not None else _coerce_kind(op.get("kind"))
+    anchor_path = _resolve_anchor_path(project_root, op.get("anchor_path"))
+    anchor_hash, learned_commit = _anchor.anchor_for(anchor_path)
+
+    try:
+        remember(
+            ctx,
+            kind,
+            effective_key,
+            value,
+            anchor_path=anchor_path,
+            anchor_hash=anchor_hash,
+            learned_commit=learned_commit,
+            confidence=confidence,
+            source="consolidation",
+        )
+    except Exception as exc:
+        _log(f"write-error op={action} key={effective_key!r}: {exc}")
+        return
+    stats["updated" if pre is not None else "added"] += 1
+
+
+def _apply_delete_op(ctx, op, stats) -> None:
+    """Apply one DELETE atom op: soft-delete every live atom under the given key."""
+    from memory.atomic import forget
+
+    key = op.get("key")
+    key = key.strip() if isinstance(key, str) else ""
+    if not key:
+        stats["noop"] += 1
+        return
+    # Same identity-over-metadata reasoning as ADD/UPDATE: match this key under
+    # ANY kind rather than trusting the model's kind guess.
+    try:
+        n = forget(ctx, key, None)
+    except Exception as exc:
+        _log(f"delete-error key={key!r}: {exc}")
+        return
+    stats["deleted"] += n
+
+
+def _apply_decision_op(ctx, op, stats) -> None:
+    """Apply one DECISION op: create a decision node in the graph layer."""
+    from memory import graph
+
+    title = op.get("title")
+    body = op.get("body")
+    title = title.strip() if isinstance(title, str) else ""
+    body = body.strip() if isinstance(body, str) else ""
+    if not title or not body:
+        stats["noop"] += 1
+        return
+    try:
+        graph.create_node(ctx, "decision", title, body)
+        stats["decisions"] += 1
+    except Exception as exc:
+        _log(f"decision-error title={title!r}: {exc}")
+
+
+def _apply_pivot_op(ctx, op, stats) -> None:
+    """Apply one PIVOT op, resolving each ``supersedes`` ref (title OR id) first.
+
+    Each ``supersedes`` entry may be an integer node id or a node TITLE. Titles
+    are resolved via ``graph.resolve_node_ref`` (exact-id -> exact lower(title)
+    -> all-tokens FTS): an unambiguous hit yields its node id; a zero- or
+    many-candidate ref is dropped LOUDLY (it must never fuzzy-resolve to the
+    wrong node and stamp it inactive). Resolved ids are de-duped so the same
+    target given twice (once by id, once by title) is superseded once. The pivot
+    proceeds only with >=1 resolved target; otherwise it is a loud noop.
+    """
+    from memory import graph
+
+    title = op.get("title")
+    why = op.get("body")
+    title = title.strip() if isinstance(title, str) else ""
+    why = why.strip() if isinstance(why, str) else ""
+    raw_supersedes = op.get("supersedes")
+    refs = raw_supersedes if isinstance(raw_supersedes, list) else []
+    if not title or not why or not refs:
+        stats["noop"] += 1
+        return
+
+    resolved: list[int] = []
+    for ref in refs:
+        node, candidates = graph.resolve_node_ref(ctx, ref)
+        if node is None:
+            _log(f"pivot-skip: unresolved supersedes ref {ref!r} ({len(candidates)} candidates)")
+            continue
+        node_id = node["id"]
+        if node_id not in resolved:
+            resolved.append(node_id)
+    if not resolved:
+        _log(f"pivot-noop: title={title!r} has no resolvable supersedes target")
+        stats["noop"] += 1
+        return
+    try:
+        graph.record_pivot(ctx, title, why, resolved)
+        stats["pivots"] += 1
+    except Exception as exc:
+        _log(f"pivot-error title={title!r}: {exc}")
+
+
+def apply_ops(ctx, ops, *, project_root, existing_atoms=None, stats=None) -> dict:
+    """Apply a parsed list of consolidation ops against the memory stores.
+
+    The seam the deterministic eval drives directly: no LLM call and no diff
+    mining -- just dispatch of the ADD/UPDATE/DELETE/NOOP atom ops and the
+    DECISION/PIVOT graph ops to their per-op handlers. *existing_atoms* feeds the
+    key-reuse fallback for ADD/UPDATE (the top-k atoms the model was shown);
+    *stats* is created fresh when not supplied. Returns the stats dict.
+    """
+    if stats is None:
+        stats = _new_stats()
+    existing_atoms = existing_atoms or []
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        action = str(op.get("op", "")).strip().upper()
+        if action in ("ADD", "UPDATE"):
+            _apply_atom_op(
+                ctx, op, action, project_root=project_root, existing_atoms=existing_atoms, stats=stats
+            )
+        elif action == "DELETE":
+            _apply_delete_op(ctx, op, stats)
+        elif action == "DECISION":
+            _apply_decision_op(ctx, op, stats)
+        elif action == "PIVOT":
+            _apply_pivot_op(ctx, op, stats)
+        else:
+            stats["noop"] += 1
+    return stats
+
+
 def consolidate(ctx: "MemoryContext", client, session) -> dict:
     """Reconcile one completed turn's diff + transcript tail into durable atoms.
 
@@ -205,18 +423,7 @@ def consolidate(ctx: "MemoryContext", client, session) -> dict:
     "updated", "deleted", "noop", "decisions", "pivots",
     "skipped_low_confidence"}``.
     """
-    stats = {
-        "ran": False,
-        "reason": "not-run",
-        "processed": 0,
-        "added": 0,
-        "updated": 0,
-        "deleted": 0,
-        "noop": 0,
-        "decisions": 0,
-        "pivots": 0,
-        "skipped_low_confidence": 0,
-    }
+    stats = _new_stats()
     try:
         project_root = str(getattr(session, "project_root", "") or os.getcwd())
         turn_report = getattr(session, "turn_report", None) or {}
@@ -239,7 +446,7 @@ def consolidate(ctx: "MemoryContext", client, session) -> dict:
             stats["reason"] = "nothing-to-mine"
             return stats
 
-        from memory.atomic import forget, recall_facts, remember
+        from memory.atomic import recall_facts
         from memory import graph
 
         try:
@@ -262,10 +469,7 @@ def consolidate(ctx: "MemoryContext", client, session) -> dict:
             ]
         except Exception:
             existing_decisions = []
-        decisions_block = (
-            "\n".join(f'- [{d.get("id")}] {d.get("kind")}: {d.get("text")}' for d in existing_decisions)
-            or "(none)"
-        )
+        decisions_block = "\n".join(_decision_line(d) for d in existing_decisions) or "(none)"
 
         named = sorted(_named_paths(mined_text))
         user_msg = (
@@ -292,131 +496,7 @@ def consolidate(ctx: "MemoryContext", client, session) -> dict:
         stats["ran"] = True
         stats["processed"] = 1
         ops = _safe_json_array(raw)
-        conn = ctx.store.conn
-
-        for op in ops:
-            if not isinstance(op, dict):
-                continue
-            action = str(op.get("op", "")).strip().upper()
-
-            if action in ("ADD", "UPDATE"):
-                key = op.get("key")
-                key = key.strip() if isinstance(key, str) else ""
-                value = op.get("value")
-                value = value.strip() if isinstance(value, str) else ""
-                if not key or not value:
-                    stats["noop"] += 1
-                    continue
-                try:
-                    confidence = float(op.get("confidence", 0.5))
-                except (TypeError, ValueError):
-                    confidence = 0.5
-                confidence = max(0.0, min(1.0, confidence))
-                if confidence < CONFIDENCE_FLOOR:
-                    stats["skipped_low_confidence"] += 1
-                    continue
-                # Resolve the EFFECTIVE key before anything else: two
-                # independent weak-LLM key choices for the same underlying
-                # fact need not match (e.g. a correction turn inventing a
-                # different key than the original wrong atom -- see
-                # MEMORY_REDESIGN.md / consolidation module docstring). Try
-                # the model's own key first; if no live atom holds it, fall
-                # back to the key of the most-similar existing atom shown to
-                # the model, so supersession below closes the stale/wrong
-                # atom instead of leaving it live alongside a new sibling.
-                pre = conn.execute(
-                    "SELECT kind FROM facts WHERE key=? AND valid_to IS NULL "
-                    "AND active=1 AND deleted_at IS NULL",
-                    (key,),
-                ).fetchone()
-                effective_key = key
-                if pre is None:
-                    reused_key = _best_existing_key_match(key, value, existing_atoms)
-                    if reused_key is not None:
-                        effective_key = reused_key
-                        pre = conn.execute(
-                            "SELECT kind FROM facts WHERE key=? AND valid_to IS NULL "
-                            "AND active=1 AND deleted_at IS NULL",
-                            (effective_key,),
-                        ).fetchone()
-                # Same-key identity wins over the model's kind choice: if a live
-                # atom already holds this key (under ANY kind -- it may predate
-                # consolidation and carry a legacy/TTL kind), reuse ITS kind so
-                # remember()'s (kind, key)-scoped supersession actually closes
-                # it instead of leaving it live alongside a same-key sibling
-                # under a different kind.
-                kind = pre["kind"] if pre is not None else _coerce_kind(op.get("kind"))
-                anchor_path = _resolve_anchor_path(project_root, op.get("anchor_path"))
-                anchor_hash, learned_commit = _anchor.anchor_for(anchor_path)
-
-                try:
-                    remember(
-                        ctx,
-                        kind,
-                        effective_key,
-                        value,
-                        anchor_path=anchor_path,
-                        anchor_hash=anchor_hash,
-                        learned_commit=learned_commit,
-                        confidence=confidence,
-                        source="consolidation",
-                    )
-                except Exception as exc:
-                    _log(f"write-error op={action} key={effective_key!r}: {exc}")
-                    continue
-                stats["updated" if pre is not None else "added"] += 1
-
-            elif action == "DELETE":
-                key = op.get("key")
-                key = key.strip() if isinstance(key, str) else ""
-                if not key:
-                    stats["noop"] += 1
-                    continue
-                # Same identity-over-metadata reasoning as ADD/UPDATE above: match
-                # this key under ANY kind rather than trusting the model's guess.
-                try:
-                    n = forget(ctx, key, None)
-                except Exception as exc:
-                    _log(f"delete-error key={key!r}: {exc}")
-                    continue
-                stats["deleted"] += n
-
-            elif action == "DECISION":
-                title = op.get("title")
-                body = op.get("body")
-                title = title.strip() if isinstance(title, str) else ""
-                body = body.strip() if isinstance(body, str) else ""
-                if not title or not body:
-                    stats["noop"] += 1
-                    continue
-                try:
-                    graph.create_node(ctx, "decision", title, body)
-                    stats["decisions"] += 1
-                except Exception as exc:
-                    _log(f"decision-error title={title!r}: {exc}")
-
-            elif action == "PIVOT":
-                title = op.get("title")
-                why = op.get("body")
-                title = title.strip() if isinstance(title, str) else ""
-                why = why.strip() if isinstance(why, str) else ""
-                raw_supersedes = op.get("supersedes")
-                supersedes = (
-                    [i for i in raw_supersedes if isinstance(i, int) and not isinstance(i, bool)]
-                    if isinstance(raw_supersedes, list)
-                    else []
-                )
-                if not title or not why or not supersedes:
-                    stats["noop"] += 1
-                    continue
-                try:
-                    graph.record_pivot(ctx, title, why, supersedes)
-                    stats["pivots"] += 1
-                except Exception as exc:
-                    _log(f"pivot-error title={title!r}: {exc}")
-
-            else:
-                stats["noop"] += 1
+        apply_ops(ctx, ops, project_root=project_root, existing_atoms=existing_atoms, stats=stats)
 
         stats["reason"] = "ok"
         return stats
