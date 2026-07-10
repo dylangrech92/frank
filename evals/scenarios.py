@@ -365,6 +365,18 @@ SCENARIOS: list[dict] = [
         "inline": "run_command_mutations.py",
     },
     {
+        "name": "run_command_grounding",
+        "description": (
+            "Dispatch-level check (no LLM): run_command appends a grounding "
+            "line to a NONZERO-exit render naming the exit code and the concrete "
+            "absolute working directory (so a hallucinated cd self-corrects), "
+            "while a zero-exit render and the timeout render carry no such line "
+            "(no token tax on success); and the tool description states commands "
+            "already run at the project root so a cd is never needed."
+        ),
+        "inline": "run_command_grounding.py",
+    },
+    {
         "name": "consolidation_ops",
         "description": (
             "Dispatch-level check (no LLM): consolidation's op-apply seam "

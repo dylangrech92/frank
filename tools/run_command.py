@@ -56,6 +56,19 @@ def _snapshot_tree(root: Path) -> dict[str, tuple[int, int]] | None:
     return snapshot
 
 
+def _format_streams(stdout_text: str, stderr_text: str) -> str:
+    """Render captured stdout/stderr with section labels.
+
+    The ``--- stderr ---`` section is only emitted when *stderr_text* is
+    non-empty, so a command that produced no error output does not carry an
+    empty labelled block. Shared by the timeout and normal foreground paths so
+    the two render captured streams identically.
+    """
+    if stderr_text:
+        return f'--- stdout ---\n{stdout_text}\n--- stderr ---\n{stderr_text}'
+    return f'--- stdout ---\n{stdout_text}'
+
+
 def _publish_snapshot_diff(
     before: dict[str, tuple[int, int]],
     after: dict[str, tuple[int, int]],
@@ -102,10 +115,11 @@ class RunCommand(Tool):
     name = 'run_command'
     summary = 'Run a shell command (foreground or background).'
     description = (
-        'Runs a shell command inside the project root. The default mode is '
-        'foreground and waits for result; set background=true to run it in '
-        'the background and poll later. A deny-list blocks certain hazardous '
-        'commands before they are executed.'
+        'Runs a shell command. The default mode is foreground and waits for '
+        'the result; set background=true to run it in the background and poll '
+        'later. Commands always run with the project root as the working '
+        'directory, so a cd into the project is never needed. A deny-list '
+        'blocks certain hazardous commands before they are executed.'
     )
     action = 'run the command'
     oversize_hint = 'pipe the output through head/tail or redirect it to a file and read a slice'
@@ -114,9 +128,7 @@ class RunCommand(Tool):
         'properties': {
             'cmd': {
                 'type': 'string',
-                'description': (
-                    'The shell command to execute inside the project root.'
-                ),
+                'description': 'The shell command to execute.',
             },
             'timeout': {
                 'type': 'integer',
@@ -149,7 +161,8 @@ class RunCommand(Tool):
             stdout/stderr; background returns a process handle.  Deny-list blocks,
             timeouts, and subprocess errors are reported as error results.
         """
-        cmd = kwargs.get('cmd') if isinstance(kwargs.get('cmd'), str) else ''
+        raw_cmd = kwargs.get('cmd')
+        cmd = raw_cmd if isinstance(raw_cmd, str) else ''
         timeout: int = kwargs.get('timeout') or 60
         background: bool = bool(kwargs.get('background', False))
 
@@ -191,34 +204,27 @@ class RunCommand(Tool):
                 _publish_snapshot_diff(before, after)
 
         if result['timed_out']:
-            partial = result['stdout']
-            stderr_part = result.get('stderr', '')
-            if stderr_part:
-                body = (
-                    f'--- stdout ---\n{partial}\n'
-                    f'--- stderr ---\n{stderr_part}'
-                )
-            else:
-                body = f'--- stdout ---\n{partial}'
-
+            body = _format_streams(str(result['stdout']), str(result.get('stderr', '')))
             return ToolResult.err(
                 f'Command was killed after {timeout} seconds.\n\n{body}',
                 code='timeout',
                 hint=f'The command ran longer than {timeout}s. Try a shorter timeout or run in background mode with background=true.',
             )
 
-        # Normalize: stderr may be '' when not produced — label only if non-empty
-        stdout_text = result['stdout']
-        stderr_text = result.get('stderr', '')
-        if stderr_text:
-            output = (
-                f'--- stdout ---\n{stdout_text}\n'
-                f'--- stderr ---\n{stderr_text}'
-            )
-        else:
-            output = f'--- stdout ---\n{stdout_text}'
+        output = _format_streams(str(result['stdout']), str(result.get('stderr', '')))
 
         exit_code = result['exit_code']
+        # A nonzero exit is otherwise only visible as a trailing meta line while
+        # the result header still reads "success". Append a grounding line that
+        # names the exit code and the concrete absolute working directory at the
+        # failure moment, so a command that failed after a hallucinated `cd`
+        # learns where it actually ran instead of retrying the same wrong path.
+        if exit_code != 0:
+            output += (
+                f'\n(exit code {exit_code} — this command ran in working directory '
+                f'{root}; commands always run there, a cd into the project is '
+                f'never needed)'
+            )
         return ToolResult.ok(
             output,
             exit_code=exit_code,
