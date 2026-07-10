@@ -2,12 +2,82 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 from runtime.process import is_denied, run_one_shot, start_background
+from tools._sandbox import IGNORED_DIRS, emit_mutation
 from tools.base import Tool
 from tools.result import ToolResult
+
+# Upper bound on files walked when snapshotting the tree around a foreground
+# command. A very large tree must not pay a per-command walk tax, so detection
+# is abandoned (no snapshot, no diff) once the walk crosses this many files.
+_MAX_SNAPSHOT_FILES = 20000
+
+
+def _snapshot_tree(root: Path) -> dict[str, tuple[int, int]] | None:
+    """Record ``{abs_path: (st_mtime_ns, st_size)}`` for every file under *root*.
+
+    Prunes any directory whose name starts with ``.`` plus the shared
+    :data:`IGNORED_DIRS`, and skips any file whose name starts with ``.``. Walk
+    or stat problems degrade to a partial/absent snapshot rather than raising —
+    a detection failure must never break the command result.
+
+    Returns:
+        The snapshot mapping, or ``None`` when the file cap is exceeded or the
+        walk cannot be completed (so the caller skips the diff entirely).
+    """
+    snapshot: dict[str, tuple[int, int]] = {}
+    count = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                d for d in dirnames
+                if not d.startswith('.') and d not in IGNORED_DIRS
+            ]
+            for filename in filenames:
+                if filename.startswith('.'):
+                    continue
+                count += 1
+                if count > _MAX_SNAPSHOT_FILES:
+                    return None
+                full = os.path.join(dirpath, filename)
+                try:
+                    stat = os.stat(full)
+                except OSError:
+                    # A file that vanished mid-walk (a race) or is unreadable is
+                    # simply absent from this snapshot, not a fatal error.
+                    continue
+                snapshot[full] = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+    return snapshot
+
+
+def _publish_snapshot_diff(
+    before: dict[str, tuple[int, int]],
+    after: dict[str, tuple[int, int]],
+) -> None:
+    """Emit a mutation event for every file that a command created/changed/deleted.
+
+    A path present only afterwards is ``created``, present only before is
+    ``deleted``, and present in both with a different ``(mtime_ns, size)`` is
+    ``changed``. Paths are already absolute (from :func:`os.walk`), matching how
+    the edit tools publish resolved paths. ``emit_mutation`` is called directly
+    (not wrapped) so subscriber errors surface exactly as they do for the other
+    publishers.
+    """
+    before_paths = set(before)
+    after_paths = set(after)
+    for path in after_paths - before_paths:
+        emit_mutation('created', path)
+    for path in before_paths - after_paths:
+        emit_mutation('deleted', path)
+    for path in before_paths & after_paths:
+        if before[path] != after[path]:
+            emit_mutation('changed', path)
 
 
 class RunCommand(Tool):
@@ -20,6 +90,13 @@ class RunCommand(Tool):
     Timeout is only meaningful for foreground runs; the background mode does not
     apply a per-process timeout because it delegates lifecycle to the model via
     ``read_output`` and ``stop_process``.
+
+    A foreground command that mutates files (e.g. a shell redirect or a script
+    that writes to disk) publishes mutation events through the shared bus by
+    snapshotting the project tree before and after the run and diffing it, so
+    the per-turn files_changed accounting, the reactive lint delta, and the
+    verify gate all arm even when the edit did not go through an edit tool.
+    Background commands do not publish mutation events.
     """
 
     name = 'run_command'
@@ -100,7 +177,18 @@ class RunCommand(Tool):
             )
 
         # --- Foreground mode ---
-        result = run_one_shot(cmd, str(Path.cwd()), timeout_seconds=timeout)
+        root = Path.cwd()
+        before = _snapshot_tree(root)
+        result = run_one_shot(cmd, str(root), timeout_seconds=timeout)
+
+        # Publish snapshot-diff mutation events once, regardless of how the
+        # command ended (success, nonzero exit, or timeout) — files may be
+        # mutated on any of those paths. A failed/aborted snapshot degrades to
+        # no events rather than crashing the command result.
+        if before is not None:
+            after = _snapshot_tree(root)
+            if after is not None:
+                _publish_snapshot_diff(before, after)
 
         if result['timed_out']:
             partial = result['stdout']

@@ -13,6 +13,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+# Directory names never worth walking when a tool sweeps the project tree:
+# version-control internals, the harness's own state dir, Python bytecode
+# caches, and vendored/virtual-env trees. Shared here so every tool that walks
+# the tree agrees on the same skip set instead of keeping private copies that
+# can drift apart. Tools with a deliberately different skip policy (e.g.
+# gitignore-driven listing) keep their own filter.
+IGNORED_DIRS = frozenset({'.git', '.coding_agent', '__pycache__', 'node_modules', '.venv', 'venv'})
+
 
 def resolve_in_root(root: str | Path, candidate: str | Path) -> Path:
     """Resolve *candidate* as a path under *root*.

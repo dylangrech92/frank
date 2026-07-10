@@ -306,6 +306,18 @@ SCENARIOS: list[dict] = [
         "inline": "find_dead_code_contract.py",
     },
     {
+        "name": "run_command_mutations",
+        "description": (
+            "Dispatch-level check (no LLM): run_command's foreground path "
+            "snapshot-diffs the project tree and publishes 'created'/'changed'/"
+            "'deleted' mutation events for files a shell command touches; writes "
+            "into __pycache__/ and dot-dirs emit nothing; a pure read stays "
+            "silent; and the timeout path still fires the event for a file "
+            "written before the kill. Every event carries an absolute path."
+        ),
+        "inline": "run_command_mutations.py",
+    },
+    {
         "name": "consolidation_ops",
         "description": (
             "Dispatch-level check (no LLM): consolidation's op-apply seam "

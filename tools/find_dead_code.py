@@ -9,12 +9,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from tools._sandbox import resolve_in_root
+from tools._sandbox import IGNORED_DIRS, resolve_in_root
 from tools.base import Tool
 from tools.result import ToolResult
-
-# Directories never walked while sniffing a directory target for Python files.
-_IGNORED_DIRS = frozenset({'.git', '.coding_agent', '__pycache__', 'node_modules', '.venv', 'venv'})
 
 # vulture's Item.get_report() renders exactly:
 #   "{path}:{lineno}: {message} ({confidence}% confidence[, N lines])"
@@ -32,7 +29,7 @@ def _dir_has_python(directory: Path) -> bool:
     Skips common vendored/build/vcs directories so the sniff stays cheap.
     """
     for dirpath, dirnames, filenames in os.walk(directory):
-        dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIRS]
+        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
         for fn in filenames:
             if Path(fn).suffix == '.py':
                 return True
