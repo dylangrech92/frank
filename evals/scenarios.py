@@ -359,6 +359,20 @@ SCENARIOS: list[dict] = [
         ),
         "inline": "consolidation_ops.py",
     },
+    {
+        "name": "verify_tool_wiring",
+        "description": (
+            "End-to-end check (stub LLM, no network): when the reproduce-before-"
+            "edit steer fires, the harness activates the verification tool it "
+            "names, so a scripted model can call run_command DIRECTLY the next "
+            "round (no load_tool) and it dispatches — recorded in "
+            "verification_runs status=success, never a not-loaded error; a "
+            "read-only turn never fires the steer and leaves run_command "
+            "inactive; and activating the verification tools twice never "
+            "duplicates a schema entry."
+        ),
+        "inline": "verify_tool_wiring.py",
+    },
 ]
 
 

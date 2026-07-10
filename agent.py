@@ -359,8 +359,32 @@ def _loop_guard_check(
 # dispatched, the call is refused at dispatch time (see handle_user_message).
 # Verification tools (run_command / run_tests / verify_scratch) are exempt —
 # repeating an identical build/test inside an edit→verify→edit cycle is legitimate.
+#
+# Single source of truth for the verification-tool names. The repeat-cap
+# exemption, the verification_runs recording branch, and _activate_verification_tools
+# all read this one set so the list cannot drift across the file.
+_VERIFICATION_TOOLS = frozenset({"run_command", "run_tests", "verify_scratch"})
 _REPEAT_CALL_CAP = 3
-_REPEAT_CAP_EXEMPT = frozenset({"run_command", "run_tests", "verify_scratch"})
+_REPEAT_CAP_EXEMPT = _VERIFICATION_TOOLS
+
+
+def _activate_verification_tools() -> None:
+    """Idempotently activate the verification tools the verify steers name.
+
+    Both reactive verify steers (reproduce-before-edit, H1) tell the model to run
+    a verification tool by name, but those tools are catalog-gated — they are only
+    in the request's tools array once activated. Firing a steer without activating
+    them demands a tool the model cannot call. This puts every verification tool
+    into the active set so the next round's ``schemas()`` (re-derived per round in
+    ``handle_user_message``) carries them and the guidance is actionable.
+
+    ``registry.activate`` is a no-op for a tool already active/pinned/unknown, so
+    this is safe to call repeatedly and never raises.
+    """
+    from tools.registry import activate
+
+    for name in _VERIFICATION_TOOLS:
+        activate(name)
 
 # E8 escalation ladder above the hard cap. Once the cap starts refusing an
 # identical call, a determined model can re-issue it every round — each a full
@@ -397,7 +421,8 @@ _REPRO_BEFORE_EDIT_STEER = (
     "command with run_command and read its actual output: for a reported bug, "
     "crash, or wrong output that means reproducing the failure; otherwise it "
     "means running the code to confirm your change. Base any further edits on "
-    "that observed output, not on assumption."
+    "that observed output, not on assumption. The run_command tool is loaded "
+    "into your toolset now — call it directly."
 )
 
 
@@ -1190,6 +1215,10 @@ def _dispatch_sequential_call(
             # _dispatch_round (never between a tool_calls row and its results).
             if not state.repro_steer_fired and not state.turn_report["verification_runs"]:
                 state.repro_steer_fired = True
+                # Load the verification tools the steer names so the very next
+                # round's schemas() carries them — the steer tells the model to
+                # call run_command, so run_command must be callable.
+                _activate_verification_tools()
                 print(
                     ui.telemetry(
                         "repro-steer: fired (mutation before any verification "
@@ -1289,7 +1318,7 @@ def _dispatch_round(
         if result.code == "loop-guard-blocked":
             blocked_this_round = True
 
-        if call.name in ("run_tests", "run_command", "verify_scratch"):
+        if call.name in _VERIFICATION_TOOLS:
             if call.name == "run_command":
                 detail = str(call.arguments.get("cmd", ""))
             else:
@@ -1393,6 +1422,9 @@ def _finalize_answer(
     # at most once per turn.
     if state.needs_verification and not state.verification_nudge_fired:
         state.verification_nudge_fired = True
+        # Load the verification tools this nudge names so the next round's
+        # schemas() carries them and the guidance is actionable.
+        _activate_verification_tools()
         print(
             ui.telemetry("verification-nudge: fired (unverified file mutation)"),
             file=sys.stderr,
@@ -1403,8 +1435,9 @@ def _finalize_answer(
             "snippet, no file pollution), run_tests, or run_command "
             "against a separate script — never by adding repro/test code "
             "to a production file or repurposing its "
-            "`if __name__ == \"__main__\"` block. Or state explicitly in "
-            "your answer that the change is unverified. Either way, end "
+            "`if __name__ == \"__main__\"` block. These tools are loaded "
+            "into your toolset now — call one directly. Or state explicitly "
+            "in your answer that the change is unverified. Either way, end "
             "your answer with a one-line verification breakdown: what "
             "you checked (tests, commands, diagnostics) and what it "
             "showed."
