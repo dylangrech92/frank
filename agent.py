@@ -20,6 +20,8 @@ guidance from real human input.
 
 import hashlib
 import json
+import re
+import shlex
 import sys
 import compaction
 import ui
@@ -416,6 +418,69 @@ def _verification_run_passed(name: str, result: ToolResult) -> bool:
     return True
 
 
+def _run_failure_is_environment_noise(
+    call: ToolCall, result: ToolResult, project_root: str
+) -> bool:
+    """True only when a FAILED run failed at the shell level, never reaching code.
+
+    A verification run that failed normally counts as "the reported failure was
+    observed this turn" and suppresses the no-failure-observed steer. But some
+    shell-level failures never exercised the project at all — a hallucinated
+    directory, a missing binary, a git probe in a tree that is not a repository —
+    so treating them as an observed failure lets the model skip reproducing the
+    real one. This recognises exactly three such shapes, each decided from a
+    *fact about the world* (an exit code, a path on disk, a directory's
+    contents), never from matching output text:
+
+    * ``run_command`` exited 127 — the OS reported command-not-found, so nothing
+      ran.
+    * ``run_command`` begins with a ``cd <target>`` segment whose target does not
+      exist on disk (resolved against *project_root* when relative). The ``cd``
+      itself failed, so nothing after it ran.
+    * ``run_command`` whose first token is ``git`` while *project_root* holds no
+      ``.git`` — any git failure there is environment probing, not project
+      behavior.
+
+    ``run_tests`` and ``verify_scratch`` failures are never noise: they only run
+    project code. Anything not matching one of the three shapes is treated as a
+    genuinely observed failure, and any command-parse error returns False (not
+    noise) — the conservative default keeps a real failure from being waved off.
+    """
+    from pathlib import Path
+
+    if call.name != "run_command":
+        return False
+    # Shape (a): the OS could not find the command — exit 127, nothing ran.
+    if result.meta.get("exit_code") == 127:
+        return True
+    cmd = str(call.arguments.get("cmd", ""))
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    # Shape (b): a leading `cd <target>` whose target is not on disk. The target
+    # is the first shell word after `cd` in the first segment (the command up to
+    # the first &&, ||, ;, or | — anything after a failed cd never ran).
+    if tokens[0] == "cd":
+        segment = re.split(r"&&|\|\||;|\|", cmd, maxsplit=1)[0]
+        try:
+            seg_tokens = shlex.split(segment)
+        except ValueError:
+            return False
+        if len(seg_tokens) > 1:
+            target = Path(seg_tokens[1])
+            if not target.is_absolute():
+                target = Path(project_root) / seg_tokens[1]
+            if not target.exists():
+                return True
+    # Shape (c): a git command in a tree that is not a git repository.
+    if tokens[0] == "git" and not (Path(project_root) / ".git").exists():
+        return True
+    return False
+
+
 def _is_bug_report(message: str) -> bool:
     """True when the user's request reads as a bug report (case-insensitive).
 
@@ -469,15 +534,20 @@ _REPRO_BEFORE_EDIT_STEER = (
 # Fold-surviving no-failure-observed steer, same wire-safety and plain-language
 # rules as the steers above (append_steer prepends STEER_PREFIX, so this is the
 # body only). Fires on the turn's first relevant file mutation when the task
-# reports a failure but every command and test run so far this turn has passed —
-# i.e. the model is starting to "fix" a failure it has never actually seen fail.
-# Mutually exclusive with the reproduce-before-edit steer above (that one owns
-# the zero-runs case; this one owns the runs-all-passed case).
+# reports a failure but every run so far this turn that exercised the project has
+# passed — i.e. the model is starting to "fix" a failure it has never actually
+# seen fail. Mutually exclusive with the reproduce-before-edit steer above (that
+# one owns the zero-runs case; this one owns the runs-all-passed case, including
+# a turn where the only failing runs were shell-level environment noise that
+# never reached project code — see _run_failure_is_environment_noise). The first
+# two sentences and the directive from "Do not fix code you have not seen fail"
+# onward are empirically tuned against reward-hacking and must stay verbatim.
 _NO_FAILURE_OBSERVED_STEER = (
     "The edit you just made was applied successfully and is already in the files. "
     "Do not re-check whether the original request still applies — it does. The "
-    "task reports a failure, but every command and test run this turn has passed: "
-    "the reported failure has never been observed on this project as it stands. "
+    "task reports a failure, but every command and test run this turn that "
+    "exercised this project has passed: the reported failure has never been "
+    "observed on this project as it stands. "
     "Do not fix code you have not seen fail, and do not modify files or data to "
     "force a failure — a failure you manufacture is not the reported failure. Run "
     "the reported failing command on the project exactly as it is; if it passes, "
@@ -1499,6 +1569,20 @@ def _maybe_graph_memory_nudge(session: Session, state: "_TurnState") -> None:
         )
 
 
+def _arm_verify_steer(state: "_TurnState", flag_attr: str, telemetry: str) -> None:
+    """Arm one first-mutation verify steer: flip its one-shot flag, load the
+    verification tools it names, and emit its telemetry line.
+
+    The shared mechanics behind both first-mutation steers so the two conditions
+    in ``_maybe_arm_first_mutation_steer`` read declaratively. Activating the
+    verification tools here keeps the steer's directive actionable in the very
+    next round (the tool set is re-derived from the registry per round).
+    """
+    setattr(state, flag_attr, True)
+    _activate_verification_tools()
+    print(ui.telemetry(telemetry), file=sys.stderr)
+
+
 def _maybe_arm_first_mutation_steer(state: "_TurnState") -> None:
     """Arm at most one first-mutation verify steer for the turn.
 
@@ -1507,68 +1591,77 @@ def _maybe_arm_first_mutation_steer(state: "_TurnState") -> None:
 
     * zero verification runs recorded so far -> reproduce-before-edit (observe
       the problem before editing on assumption);
-    * >= 1 run recorded AND every one passed, on a task whose original request
-      reads as a bug report -> no-failure-observed (the model is starting to
-      "fix" a failure it has never seen fail).
+    * >= 1 run recorded, at least one of which PASSED, and every non-passed run
+      was shell-level environment noise (see _run_failure_is_environment_noise),
+      on a task whose original request reads as a bug report -> no-failure-
+      observed (the model is starting to "fix" a failure it has never seen fail).
 
-    A run that failed at least once means a failure WAS observed this turn, so
-    neither steer arms. Each flag is one-shot; both load the verification tools
-    the steer names so the tool is callable in the very next round.
+    A genuinely failed run — one that actually exercised project code and failed
+    — means a failure WAS observed this turn, so neither steer arms. Known limit:
+    a turn whose ONLY runs are environment noise (nothing passed) arms nothing —
+    the reproduce-before-edit steer owns the zero-runs case, and with no passing
+    run we cannot assert the project is green, so we stay silent rather than
+    steer on an unproven premise. Each flag is one-shot.
     """
     runs = state.turn_report["verification_runs"]
     if not runs:
         if not state.repro_steer_fired:
-            state.repro_steer_fired = True
-            _activate_verification_tools()
-            print(
-                ui.telemetry(
-                    "repro-steer: fired (mutation before any verification "
-                    "run this turn)"
-                ),
-                file=sys.stderr,
+            _arm_verify_steer(
+                state,
+                "repro_steer_fired",
+                "repro-steer: fired (mutation before any verification "
+                "run this turn)",
             )
         return
+    passed_or_noise_only = any(r["passed"] for r in runs) and all(
+        r["passed"] or r["noise"] for r in runs
+    )
     if (
         not state.no_failure_steer_fired
-        and all(r["passed"] for r in runs)
+        and passed_or_noise_only
         and _is_bug_report(state.user_message)
     ):
-        state.no_failure_steer_fired = True
-        _activate_verification_tools()
-        print(
-            ui.telemetry(
-                "no-failure-steer: fired (edit on a reported failure that has "
-                "not been observed this turn)"
-            ),
-            file=sys.stderr,
+        _arm_verify_steer(
+            state,
+            "no_failure_steer_fired",
+            "no-failure-steer: fired (edit on a reported failure that has "
+            "not been observed this turn)",
         )
 
 
 def _record_verification_run(
-    state: "_TurnState", call: ToolCall, result: ToolResult
+    state: "_TurnState", call: ToolCall, result: ToolResult, project_root: str
 ) -> None:
     """Record one verification run and update the pass-based verify gate.
 
     Appends a ``verification_runs`` entry — ``tool``/``status``/``detail`` (kept
-    verbatim; evals assert on them) plus a first-class ``passed`` bool from
-    ``_verification_run_passed`` — and clears ``needs_verification`` ONLY when the
-    run passed. A run that merely completed but failed (a nonzero ``run_command``
+    verbatim; evals assert on them), a first-class ``passed`` bool from
+    ``_verification_run_passed``, and a ``noise`` bool that is meaningful only
+    when ``passed`` is False: True when the failure was shell-level environment
+    noise that never reached project code (``_run_failure_is_environment_noise``)
+    and always False for a passing run. ``noise`` is consumed by the
+    no-failure-observed steer, which treats a noise-only failure as "no failure
+    observed on the project". Clears ``needs_verification`` ONLY when the run
+    passed: a run that merely completed but failed (a nonzero ``run_command``
     exit, a failing ``run_tests`` count, a ``verify_scratch`` snippet error) no
-    longer counts as verification: the gate stays open so a later ``verified:
-    true`` cannot be stamped off a run that never went green, and the model gets
-    no false signal that the change is confirmed.
+    longer counts as verification, so the gate stays open and no false
+    ``verified: true`` can be stamped off a run that never went green.
     """
     if call.name == "run_command":
         detail = str(call.arguments.get("cmd", ""))
     else:
         detail = str(call.arguments.get("path") or ".")
     passed = _verification_run_passed(call.name, result)
+    noise = (not passed) and _run_failure_is_environment_noise(
+        call, result, project_root
+    )
     state.turn_report["verification_runs"].append(
         {
             "tool": call.name,
             "status": result.status,
             "detail": detail,
             "passed": passed,
+            "noise": noise,
         }
     )
     if passed:
@@ -1817,7 +1910,9 @@ def _dispatch_round(
             blocked_this_round = True
 
         if call.name in _VERIFICATION_TOOLS:
-            _record_verification_run(state, call, result)
+            _record_verification_run(
+                state, call, result, str(session.project_root)
+            )
         if call.name == "record" and str(call.arguments.get("kind", "")).strip().lower() in (
             "decision",
             "spec",

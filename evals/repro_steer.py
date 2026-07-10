@@ -26,8 +26,9 @@ d. No-failure-observed fires — a bug-report task whose only runs this turn PAS
    gets the no-failure-observed steer on its first edit (once, user role, with
    telemetry) and NOT the reproduce-before-edit steer (a run was recorded).
 
-e. No-failure-observed suppressed by a failing run — a recorded nonzero-exit run
-   means a failure WAS observed, so neither first-mutation steer fires.
+e. No-failure-observed suppressed by a genuine failing run — a recorded
+   nonzero-exit run that actually exercised project code means a failure WAS
+   observed, so neither first-mutation steer fires.
 
 f. No-failure-observed scoped to bug reports — a pure feature task (no bug-report
    lexicon) never gets the no-failure-observed steer.
@@ -36,6 +37,15 @@ g. Gate honesty — a mutation followed by ONLY a nonzero-exit run_command leave
    ``turn_report['verified']`` False (a failing run does not clear the verify
    gate); a passing run flips it True. The failing run is still recorded, marked
    ``passed=False``.
+
+h. Environment-noise failures do not count as an observed project failure. A run
+   that failed only at the shell level — a `cd` into a directory that does not
+   exist, a `git` command in a tree with no `.git`, or a command-not-found (exit
+   127) — never reached project code, so when a real run also PASSED this turn
+   the no-failure-observed steer still fires (h1 cd, h2 git, h3 exit-127). The
+   noise run is still recorded with ``passed=False``. A genuine nonzero-exit run
+   (not 127, no `cd` prefix, not `git`) alongside a passing run is NOT noise and
+   still suppresses the steer (h4).
 
 Exits 0 on success, prints ``FAIL: <reason>`` to stderr and exits 1 otherwise.
 Runs with the repo root on ``sys.path`` (evals/run.py inserts it before exec'ing
@@ -360,6 +370,118 @@ def check_no_failure_suppressed_without_lexicon() -> list[str]:
     return failures
 
 
+def _check_noise_run_fires(noise_cmd: str, tmp_prefix: str) -> list[str]:
+    """Shared driver for h1-h3: a noise run + a passing run + a bug-report edit.
+
+    A run that failed only at the shell level (*noise_cmd*) followed by a PASSING
+    run and then a file edit must still fire the no-failure-observed steer exactly
+    once (with telemetry) — the noise failure never reached project code, so the
+    reported failure remains unobserved. The noise run is still recorded with
+    ``passed=False``, and it must be classified ``noise=True``.
+    """
+    import agent
+
+    script = [
+        _tool_call_response("run_command", {"cmd": noise_cmd}),
+        _tool_call_response("run_command", {"cmd": "exit 0"}),
+        _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
+        _final_answer_response("Applied a defensive fix."),
+    ]
+    session, stderr = _drive_turn(
+        "list --category food crashes with a KeyError; reproduce and fix",
+        script,
+        tmp_prefix,
+    )
+
+    failures: list[str] = []
+    nf_rows = _steer_rows(session, agent._NO_FAILURE_OBSERVED_STEER)
+    if len(nf_rows) != 1:
+        failures.append(
+            f"expected exactly 1 no-failure-observed steer row after a "
+            f"{noise_cmd!r} noise run + a passing run + a bug-report edit, found "
+            f"{len(nf_rows)}"
+        )
+    if stderr.count("no-failure-steer: fired") != 1:
+        failures.append(
+            f"expected the 'no-failure-steer: fired' telemetry line exactly once "
+            f"for noise cmd {noise_cmd!r}, stderr had "
+            f"{stderr.count('no-failure-steer: fired')}"
+        )
+    runs = session.turn_report["verification_runs"]
+    noise_runs = [r for r in runs if r["detail"] == noise_cmd]
+    if not noise_runs:
+        failures.append(f"noise run {noise_cmd!r} produced no verification_runs entry")
+    else:
+        if noise_runs[0].get("passed") is not False:
+            failures.append(
+                f"noise run {noise_cmd!r} recorded passed="
+                f"{noise_runs[0].get('passed')!r}, expected False"
+            )
+        if noise_runs[0].get("noise") is not True:
+            failures.append(
+                f"noise run {noise_cmd!r} recorded noise="
+                f"{noise_runs[0].get('noise')!r}, expected True"
+            )
+    return failures
+
+
+def check_noise_cd_fires() -> list[str]:
+    """h1. A `cd` into a nonexistent directory is noise -- steer still fires."""
+    return _check_noise_run_fires(
+        "cd /definitely/not/a/real/dir && echo x", "repro-steer-noise-cd-"
+    )
+
+
+def check_noise_git_fires() -> list[str]:
+    """h2. A `git` command in a tree with no `.git` is noise -- steer still fires."""
+    return _check_noise_run_fires("git log", "repro-steer-noise-git-")
+
+
+def check_noise_exit127_fires() -> list[str]:
+    """h3. A command-not-found (exit 127) is noise -- steer still fires."""
+    return _check_noise_run_fires(
+        "definitely_not_a_real_command_xyz", "repro-steer-noise-127-"
+    )
+
+
+def check_genuine_failure_suppresses() -> list[str]:
+    """h4. A genuine nonzero-exit run (not noise) still suppresses the steer.
+
+    A project run that exits nonzero without matching any environment-noise shape
+    (not 127, no `cd` prefix, not `git`) is a genuinely observed failure, so even
+    with a passing run also present this turn the no-failure-observed steer must
+    NOT fire.
+    """
+    import agent
+
+    script = [
+        _tool_call_response("run_command", {"cmd": "exit 7"}),
+        _tool_call_response("run_command", {"cmd": "exit 0"}),
+        _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
+        _final_answer_response("Reproduced then edited."),
+    ]
+    session, stderr = _drive_turn(
+        "the list command crashes with a KeyError; fix it",
+        script,
+        "repro-steer-genuine-fail-",
+    )
+
+    failures: list[str] = []
+    nf_rows = _steer_rows(session, agent._NO_FAILURE_OBSERVED_STEER)
+    if nf_rows:
+        failures.append(
+            f"no-failure-observed steer fired {len(nf_rows)} time(s) despite a "
+            f"GENUINE failing run this turn (a real failure was observed — must "
+            f"suppress even with a passing run present)"
+        )
+    if "no-failure-steer: fired" in stderr:
+        failures.append(
+            "'no-failure-steer: fired' telemetry appeared despite a genuine "
+            "failing run"
+        )
+    return failures
+
+
 def check_gate_honesty() -> list[str]:
     """g. The verify gate/flag key on a PASSING run, not a merely-completed one.
 
@@ -422,6 +544,10 @@ def main() -> int:
         ("no-failure-fires", check_no_failure_steer_fires),
         ("no-failure-suppressed-failing-run", check_no_failure_suppressed_on_failing_run),
         ("no-failure-suppressed-no-lexicon", check_no_failure_suppressed_without_lexicon),
+        ("noise-cd-fires", check_noise_cd_fires),
+        ("noise-git-fires", check_noise_git_fires),
+        ("noise-exit127-fires", check_noise_exit127_fires),
+        ("genuine-failure-suppresses", check_genuine_failure_suppresses),
         ("gate-honesty", check_gate_honesty),
     ):
         try:
@@ -438,8 +564,12 @@ def main() -> int:
         "PASS: an unverified edit steers reproduce-before-edit once; a prior "
         "(failing) run_command suppresses it; a second edit does not double-steer; "
         "a passing run then a bug-report edit steers no-failure-observed once "
-        "(suppressed by a failing run or a non-bug task, mutually exclusive with "
-        "reproduce-before-edit); and the verify gate keys on a PASSING run"
+        "(suppressed by a genuine failing run or a non-bug task, mutually "
+        "exclusive with reproduce-before-edit); shell-level environment noise "
+        "(cd into a missing dir, git with no .git, exit 127) does not count as an "
+        "observed project failure so the steer still fires alongside a passing "
+        "run, while a genuine nonzero-exit run still suppresses it; and the "
+        "verify gate keys on a PASSING run"
     )
     return 0
 
