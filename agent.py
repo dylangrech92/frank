@@ -18,6 +18,7 @@ the compaction summarizer, and any transcript reader can all tell harness
 guidance from real human input.
 """
 
+import hashlib
 import json
 import sys
 import compaction
@@ -425,6 +426,86 @@ _REPRO_BEFORE_EDIT_STEER = (
     "into your toolset now — call it directly."
 )
 
+# Success-path loop-guard suffix, APPENDED to the full re-rendered result of a
+# repeated identical successful call (repeat #2..#cap). Used whenever the body
+# must still be shown — a non-dedupable tool, or a changed / possibly-folded
+# result — so the model both sees the output and is told the repeat made no
+# progress. The dedup stub below replaces the body entirely when it is provably
+# redundant.
+_REPEAT_STEER_SUFFIX = (
+    "\n\n[loop-guard] {name} was just called with these exact arguments "
+    "and succeeded. Repeating the identical successful call makes no "
+    "progress. Do not re-issue it. If the result was not what you needed, "
+    "change your arguments or approach; otherwise move on or tell the "
+    "user you are done."
+)
+
+# Dedup stub that REPLACES the full render of a repeated identical successful
+# read-only call whose body has not changed since its last full render this
+# turn. Re-emitting a byte-identical body wastes context and rewards the
+# re-issue; the stub points the model back at the earlier result instead. Only
+# used when _repeat_render's two safety conditions hold (see there).
+_REPEAT_DEDUP_STUB = (
+    "[loop-guard] {name} was already called with these exact arguments this "
+    "turn and the result has not changed — output omitted; use the earlier "
+    "result above. Do not re-issue this call. If you need something different, "
+    "change your arguments or approach."
+)
+
+
+def _render_fingerprint(rendered: str) -> str:
+    """Stable content fingerprint of a rendered tool result.
+
+    Lets the repeat-render dedup tell an *unchanged* repeated read (safe to
+    replace with a stub) from one whose body actually differs — e.g. a re-read
+    of a file the model just edited, which MUST get the fresh body. Hashing
+    keeps the per-key bookkeeping O(1) in memory regardless of render size, and
+    ``errors="replace"`` guarantees encoding never raises on odd bytes.
+    """
+    return hashlib.sha256(rendered.encode("utf-8", "replace")).hexdigest()
+
+
+def _repeat_render(
+    name: str,
+    key: tuple[str, str],
+    rendered: str,
+    seen_renders: dict[tuple[str, str], tuple[str, int]],
+    compactions: int,
+) -> str:
+    """Return a dedup stub for a redundant repeated read, else the full render+suffix.
+
+    Called only for a repeat (count >= 2) that is a success on a tool eligible
+    for dedup (``parallel_safe`` and not verification-exempt). Two conditions,
+    each guarding a distinct correctness hazard, gate the stub — and both must
+    hold or the full body is re-emitted:
+
+    (d) Identical arguments do NOT imply an identical result. A re-read of a
+        file the model just edited is legitimate and MUST get the fresh body, so
+        the render's content *fingerprint* is compared against the one recorded
+        at the last full render; on any mismatch the fresh body is returned and
+        the stamp updated.
+    (e) A compaction may have folded the earlier result out of context. A stub
+        that points at a result no longer present strands the model (the known
+        amnesia loop), so the stub is withheld unless ``compactions`` is
+        unchanged since the last full render; if it advanced, the full body is
+        returned once and the stamp re-stamped at the new compaction count.
+
+    ``seen_renders`` is mutated in place: ``key -> (fingerprint, compactions)``
+    is refreshed on every full-render return so the next repeat compares against
+    the most recent body and context. Kept as a small pure function so an eval
+    can drive the two branches directly with a fabricated stamp dict.
+    """
+    fingerprint = _render_fingerprint(rendered)
+    prev = seen_renders.get(key)
+    if prev is not None and prev == (fingerprint, compactions):
+        # (d) body unchanged AND (e) no fold since the last full render — the
+        # earlier result is still both identical and visible, so omit the body.
+        return _REPEAT_DEDUP_STUB.format(name=name)
+    # Mismatch on either condition: re-emit the body and re-stamp so the model
+    # sees the fresh/re-materialised result, tagged with the no-progress suffix.
+    seen_renders[key] = (fingerprint, compactions)
+    return rendered + _REPEAT_STEER_SUFFIX.format(name=name)
+
 
 def _call_signature(arguments: dict) -> str:
     """Return a stable, hashable signature for a tool call's arguments.
@@ -446,8 +527,10 @@ def _repeat_call_check(
     result: ToolResult,
     rendered: str,
     seen_calls: dict[tuple[str, str], int],
+    seen_renders: dict[tuple[str, str], tuple[str, int]],
+    compactions: int,
 ) -> str:
-    """Append a steer suffix when the same (tool, arguments) succeeds repeatedly.
+    """Steer (and, when safe, dedup) a repeated identical successful call.
 
     Companion to ``_loop_guard_check``: that function owns repeated identical
     *failures* (keyed on the rendered error envelope, which a cooperative model
@@ -458,11 +541,21 @@ def _repeat_call_check(
     success results are steered here; errors are left to ``_loop_guard_check``
     to avoid double-suffixing.
 
+    From repeat #2 on, the full body is normally re-rendered with a no-progress
+    suffix (``_REPEAT_STEER_SUFFIX``). But for a read-only tool (``parallel_safe``
+    and not verification-exempt) whose body has not changed, re-emitting a
+    byte-identical result wastes context and rewards the re-issue; ``_repeat_render``
+    replaces the body with a short stub instead — but only when both of its safety
+    conditions hold (fingerprint unchanged AND no compaction since the last full
+    render). ``seen_renders`` and ``compactions`` are always required so no caller
+    can silently lose the dedup by forgetting to pass them.
+
     The count this maintains is also read pre-dispatch by the hard-cap block in
     ``handle_user_message`` to *refuse* an identical call once it has repeated
     ``_REPEAT_CALL_CAP`` times — a steer alone does not reliably break a
     determined loop (the failure-path steer is known not to fire live), so the
-    cap guarantees termination.
+    cap guarantees termination. The stub therefore only ever replaces renders
+    for repeats #2..#cap; the blocked call at #cap+1 keeps its own block message.
 
     Args:
         name: Registered tool name.
@@ -473,11 +566,15 @@ def _repeat_call_check(
         seen_calls: Per-turn counting dict keyed by ``(name, signature)``,
             mutated in place. Incremented for *every* call (success or error)
             so the pre-dispatch hard cap sees an accurate tally.
+        seen_renders: Per-turn dedup stamps, ``(name, signature) ->
+            (render fingerprint, compactions-at-render)``, mutated in place.
+        compactions: Compactions performed so far this turn — the condition-(e)
+            input that detects a fold between the last full render and this one.
 
     Returns:
-        *rendered* unchanged, or *rendered* with a ``[loop-guard]`` suffix
-        appended when this exact (name, arguments) pair has now been seen two
-        or more times this turn as a success.
+        *rendered* unchanged on a first success or an error; the full body plus
+        ``_REPEAT_STEER_SUFFIX`` on a repeat that cannot be safely deduped; or a
+        short ``_REPEAT_DEDUP_STUB`` replacing the body when it can.
     """
     key = (name, _call_signature(arguments))
     seen_calls[key] = seen_calls.get(key, 0) + 1
@@ -486,17 +583,26 @@ def _repeat_call_check(
     if result.status != "success":
         return rendered
 
+    # A tool is dedup-eligible only when it is read-only (parallel_safe) and not
+    # a verification tool (whose identical re-runs inside an edit→verify cycle are
+    # legitimate and exempt from the whole repeat machinery). get_tool -> None on
+    # an unknown name yields False here, which is correct (no dedup).
+    dedupable = (
+        name not in _REPEAT_CAP_EXEMPT
+        and getattr(get_tool(name), "parallel_safe", False)
+    )
+
     if seen_calls[key] < 2:
+        # First success: stamp the full render's fingerprint + compaction count
+        # so a later identical repeat can distinguish an unchanged body (dedup to
+        # a stub) from a fresh one (re-read after an edit -> keep the body).
+        if dedupable:
+            seen_renders[key] = (_render_fingerprint(rendered), compactions)
         return rendered
 
-    steer = (
-        f"\n\n[loop-guard] {name} was just called with these exact arguments "
-        f"and succeeded. Repeating the identical successful call makes no "
-        f"progress. Do not re-issue it. If the result was not what you needed, "
-        f"change your arguments or approach; otherwise move on or tell the "
-        f"user you are done."
-    )
-    return rendered + steer
+    if dedupable:
+        return _repeat_render(name, key, rendered, seen_renders, compactions)
+    return rendered + _REPEAT_STEER_SUFFIX.format(name=name)
 
 
 # Write tools that mutate exactly the file named by their own `path` argument
@@ -752,6 +858,14 @@ class _TurnState:
     # Identical (name, arg-signature) pairs dispatched this turn, for the
     # repeated-successful-call loop-guard steer plus the hard dispatch cap.
     seen_calls: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Full-render dedup stamps for repeated identical successful read-only calls,
+    # keyed by (name, arg-signature) -> (render fingerprint, compactions-at-render).
+    # Lets _repeat_call_check replace a provably-unchanged repeat with a short stub
+    # instead of re-emitting the body: the fingerprint forces a fresh body when a
+    # re-read reflects a just-applied edit, and the compaction count forces one when
+    # a fold may have dropped the earlier result out of context. Distinct from
+    # seen_calls, whose int tally the pre-dispatch hard cap depends on.
+    seen_renders: dict[tuple[str, str], tuple[str, int]] = field(default_factory=dict)
     # Every distinct path mutated this turn (H1/H5 tracking).
     mutated_paths: set[str] = field(default_factory=set)
     # E8 loop-guard escalation: consecutive tool calls refused by the repeat-call
@@ -1340,7 +1454,8 @@ def _dispatch_round(
         )
         rendered = _loop_guard_check(call.name, rendered, state.seen_errors)
         rendered = _repeat_call_check(
-            call.name, call.arguments, result, rendered, state.seen_calls
+            call.name, call.arguments, result, rendered, state.seen_calls,
+            state.seen_renders, state.compactions,
         )
         rendered, state.searches_without_read = _web_search_focus_check(
             call.name, result, rendered, state.searches_without_read

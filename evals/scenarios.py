@@ -217,6 +217,19 @@ SCENARIOS: list[dict] = [
         "inline": "repeat_call_guard.py",
     },
     {
+        "name": "repeat_dedup_render",
+        "description": (
+            "End-to-end check (stub LLM, no network): a repeated identical "
+            "successful read-only call is deduped — its full body replaced by a "
+            "short stub from repeat #2 on — while two safety conditions force the "
+            "full body instead: a fingerprint mismatch when a re-read reflects a "
+            "just-applied edit, and a compaction since the last full render (both "
+            "would otherwise strand the model). Exempt / non-parallel_safe tools "
+            "(run_command) are never stubbed."
+        ),
+        "inline": "repeat_dedup_render.py",
+    },
+    {
         "name": "verify_scratch_contract",
         "description": (
             "Dispatch-level check (no LLM): verify_scratch honors its full "
