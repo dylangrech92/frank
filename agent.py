@@ -1023,6 +1023,16 @@ class _TurnState:
     searches_without_read: int = 0
     # files_changed dedupe set: first-tool-wins, in order of first mutation.
     files_changed_seen: set[str] = field(default_factory=set)
+    # Turn-start pre-images for net-change detection: normalized absolute path
+    # (the SAME resolved key a files_changed entry carries, so the two join
+    # exactly) -> sha256 hex of the file's bytes BEFORE this turn first touched
+    # it, or None meaning "did not exist at turn start". Captured at the dispatch
+    # seam before a mutating tool writes; first capture per path wins (= the
+    # turn-start state). A path ABSENT from this map is UNKNOWN — e.g. a file
+    # whose first mutation came from a run_command shell side effect, which
+    # carries no path argument to snapshot — and is never guessed at annotation
+    # time. Read once at the turn-exit choke point to flag reverted entries.
+    preimages: dict[str, str | None] = field(default_factory=dict)
     # Rendered error envelopes seen this turn, for the repeated-identical-failure
     # loop-guard (keyed by (name, rendered)).
     seen_errors: dict[tuple[str, str], int] = field(default_factory=dict)
@@ -1090,6 +1100,49 @@ def _turn_verified(state: "_TurnState") -> bool | None:
     if not state.mutated_paths:
         return None
     return not state.needs_verification
+
+
+def _annotate_reverted_files(state: "_TurnState") -> None:
+    """Flag ``files_changed`` entries the turn left byte-identical to their start.
+
+    ``files_changed`` is an activity log — a file edited and then reverted to its
+    original bytes still appears — so a consumer reading it alone would conclude
+    the tree changed when the net state did not. This walks the log once and adds
+    ``entry["reverted"] = True`` to an entry ONLY when the harness knows the
+    file's turn-start state (a pre-image was captured, see ``_capture_preimage``)
+    AND the file ended the turn identical to it:
+
+    * a recorded hash that matches the current on-disk bytes (edited then written
+      back), or
+    * a recorded ``None`` (did not exist at turn start) and the path no longer
+      exists (created then deleted).
+
+    A path with no recorded pre-image is UNKNOWN and never annotated — the flag
+    is absent, never guessed. The key is left off entirely otherwise (absent =
+    changed-or-unknown), keeping the envelope shape minimal and append-only.
+    Called at the single turn-exit choke point beside the ``verified`` stamp so
+    every exit path (normal finalize and both give-up paths) reports net state.
+    """
+    from pathlib import Path as _Path
+
+    for entry in state.turn_report["files_changed"]:
+        key = entry.get("path")
+        if key not in state.preimages:
+            continue  # unknown turn-start state — never guess
+        pre = state.preimages[key]
+        target = _Path(key)
+        if pre is None:
+            if not target.exists():
+                entry["reverted"] = True
+            continue
+        try:
+            if (
+                target.exists()
+                and hashlib.sha256(target.read_bytes()).hexdigest() == pre
+            ):
+                entry["reverted"] = True
+        except OSError:
+            continue  # unreadable now — cannot confirm a revert, leave absent
 
 
 def _synthesize_giveup_answer(reason: str, retry_hint: str, state: "_TurnState") -> str:
@@ -1165,6 +1218,7 @@ def _finalize_giveup(
     msg = _synthesize_giveup_answer(reason, retry_hint, state)
     session.append_assistant(msg)
     state.turn_report["answer"] = msg
+    _annotate_reverted_files(state)
     state.turn_report["verified"] = _turn_verified(state)
     if on_delta is not None:
         on_delta(msg + "\n")
@@ -1521,6 +1575,80 @@ def _record_verification_run(
         state.needs_verification = False
 
 
+# Files larger than this are not pre-imaged for net-change detection: hashing
+# them on every mutating call would tax the dispatch hot path, and the reverted
+# flag is a best-effort truthful signal, not a guarantee — an un-hashed path
+# stays UNKNOWN (no reverted key), never guessed.
+_PREIMAGE_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _capture_preimage(state: "_TurnState", call: ToolCall, project_root: str) -> None:
+    """Record the turn-start state of *call*'s target file, once per path.
+
+    Called at the dispatch seam BEFORE a mutating tool writes, so the recorded
+    hash reflects the file as it was when the turn first touched it. The key is
+    the resolved absolute path the mutation event (and thus the ``files_changed``
+    entry) uses — via the same ``_lint_resolve_call_path`` resolution — so the
+    two join exactly at annotation time.
+
+    Records nothing (leaving the path UNKNOWN) unless the call carries a
+    resolvable ``path`` argument on a non-parallel_safe tool: a ``run_command``
+    shell side effect has no ``path`` argument, so a file it mutates first has no
+    capturable pre-image and stays unknown, never guessed. A nonexistent target
+    records ``None`` (did-not-exist at turn start); an oversize
+    (> ``_PREIMAGE_MAX_BYTES``) or unreadable file records nothing (unknown).
+
+    A path already mutated this turn is skipped (``files_changed_seen``): its
+    turn-start state is gone, so a pre-image taken now would be a mid-turn state,
+    not the start — this is what keeps a path whose FIRST mutation was a
+    pre-imageless ``run_command`` side effect unknown even when a later edit tool
+    touches it. Combined with the ``preimages`` guard, first capture per path
+    wins and a later write never overwrites a recorded turn-start state.
+    """
+    if getattr(get_tool(call.name), "parallel_safe", False):
+        return  # read-only tools never mutate — nothing to pre-image
+    key = _lint_resolve_call_path(call, project_root)
+    if key is None or key in state.preimages or key in state.files_changed_seen:
+        return
+    from pathlib import Path as _Path
+
+    target = _Path(key)
+    if not target.exists():
+        state.preimages[key] = None  # did not exist at turn start
+        return
+    try:
+        if target.stat().st_size > _PREIMAGE_MAX_BYTES:
+            return  # too large to hash cheaply — leave unknown, never guess
+        state.preimages[key] = hashlib.sha256(target.read_bytes()).hexdigest()
+    except OSError:
+        return  # unreadable — unknown
+
+
+def _record_file_mutations(
+    state: "_TurnState", call: ToolCall, new_events: list[dict]
+) -> None:
+    """Fold this call's mutation events into the S4 ``files_changed`` log.
+
+    Correlated with the dispatched call's own slice of ``_TURN_MUTATIONS`` (NOT
+    the module-level list read later — ``diagnostics_inject_summary`` drains it at
+    the end of the dispatch round). Counts EVERY relevant mutation event (before
+    the path dedup) so a second edit to an already-mutated path still bumps
+    ``mutation_events`` — the stamp the verification dedup gates on, which
+    ``len(mutated_paths)`` would miss. Appends to ``files_changed`` deduped by
+    path, first-tool-wins, in order of first mutation.
+    """
+    for event in new_events:
+        if event.get("kind") not in ("created", "changed", "renamed"):
+            continue
+        state.mutation_events += 1
+        path = event.get("path")
+        if path and path not in state.files_changed_seen:
+            state.files_changed_seen.add(path)
+            state.turn_report["files_changed"].append(
+                {"path": path, "tool": call.name}
+            )
+
+
 def _dispatch_sequential_call(
     session: Session,
     state: "_TurnState",
@@ -1528,10 +1656,11 @@ def _dispatch_sequential_call(
 ) -> tuple[ToolResult, str]:
     """Dispatch one tool call on the sequential path, applying the per-call guards.
 
-    Echoes the call to stderr, snapshots the mutation log and the target file's
-    lint state before dispatch, applies the loop-guard hard cap, then attributes
-    any mutation events this specific call produced (H1/S3 verification tracking,
-    S4 files_changed accounting, and the I2 reactive lint-delta).
+    Echoes the call to stderr, snapshots the mutation log, the target file's
+    lint state, and its net-change pre-image before dispatch, applies the
+    loop-guard hard cap, then attributes any mutation events this specific call
+    produced (H1/S3 verification tracking, S4 files_changed accounting via
+    ``_record_file_mutations``, and the I2 reactive lint-delta).
 
     The hard cap refuses an identical call once it has repeated
     ``_REPEAT_CALL_CAP`` times this turn (verification tools exempt — a
@@ -1561,6 +1690,11 @@ def _dispatch_sequential_call(
     # _LINT_TRACKED_TOOLS; None means "nothing to compare against", so no delta is
     # ever appended).
     lint_pre = _lint_pre_snapshot(call, str(session.project_root))
+    # Net-change pre-image: capture the target file's turn-start state before this
+    # call writes, keyed to match its future files_changed entry. Harmless on
+    # read-only/non-path calls (they record nothing); files first mutated by
+    # run_command have no path argument here and stay unknown.
+    _capture_preimage(state, call, str(session.project_root))
     _repeat_key = (call.name, _call_signature(call.arguments))
     _repeat_n = state.seen_calls.get(_repeat_key, 0)
     if call.name not in _REPEAT_CAP_EXEMPT and _repeat_n >= _REPEAT_CALL_CAP:
@@ -1600,24 +1734,7 @@ def _dispatch_sequential_call(
             state.mutated_paths |= new_paths
             if first_mutation:
                 _maybe_arm_first_mutation_steer(state)
-            # S4 — captured here (correlated with this dispatched call's own slice
-            # of _TURN_MUTATIONS), NOT by reading the module-level list later:
-            # diagnostics_inject_summary drains it at the end of the dispatch
-            # round. Deduped by path, first-tool-wins, in order of first mutation.
-            for _ev in new_events:
-                if _ev.get("kind") not in ("created", "changed", "renamed"):
-                    continue
-                # Count EVERY relevant mutation event (before the path-dedup
-                # below) so a second edit to an already-mutated path still bumps
-                # the stamp the verification dedup gates on — len(mutated_paths)
-                # would miss it.
-                state.mutation_events += 1
-                _ev_path = _ev.get("path")
-                if _ev_path and _ev_path not in state.files_changed_seen:
-                    state.files_changed_seen.add(_ev_path)
-                    state.turn_report["files_changed"].append(
-                        {"path": _ev_path, "tool": call.name}
-                    )
+            _record_file_mutations(state, call, new_events)
             resolved_call_path = _lint_resolve_call_path(
                 call, str(session.project_root)
             )
@@ -1850,7 +1967,11 @@ def _finalize_answer(
                 ),
                 file=sys.stderr,
             )
-    # One shared formula for verified across every turn-exit path.
+    # Net-change annotation + one shared formula for verified, both stamped at
+    # this single turn-exit choke point (shared with the give-up paths via
+    # _annotate_reverted_files / _turn_verified) so every exit reports the same
+    # truth.
+    _annotate_reverted_files(state)
     state.turn_report["verified"] = _turn_verified(state)
 
     # Empty-answer placeholder: if the model returned no text at all (the retry

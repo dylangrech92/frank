@@ -416,6 +416,20 @@ SCENARIOS: list[dict] = [
         ),
         "inline": "verify_tool_wiring.py",
     },
+    {
+        "name": "envelope_net_changes",
+        "description": (
+            "End-to-end check (stub LLM, no network): the result envelope's "
+            "files_changed entries are annotated with reverted only on a KNOWN "
+            "net no-op. A file edited then written back byte-for-byte is flagged "
+            "reverted while verified stays True; a create-then-delete is flagged; "
+            "a file left changed carries no reverted key; and a file whose first "
+            "mutation is a run_command shell side effect (no capturable "
+            "pre-image) is never flagged even when a later call restores its "
+            "original content — unknown is never guessed."
+        ),
+        "inline": "envelope_net_changes.py",
+    },
 ]
 
 
