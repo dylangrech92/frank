@@ -9,8 +9,7 @@ zero-LLM derived skeleton's job, ``memory.skeleton``). Reconciliation reuses
 the same ADD/UPDATE/DELETE/NOOP shape as ``memory.atomic.extract_facts``
 against the top-k most similar existing atoms, but every write is
 code-anchored (``source='consolidation'``) and genuine design reasoning /
-reversals route to the graph layer instead of the facts table. See
-MEMORY_REDESIGN.md section 8.
+decisions/specs route to the graph layer instead of the facts table.
 
 Runs off the hot path: the turn-end hook in agent.py
 (``consolidation_maybe_extract``) only *enqueues* a snapshot of this turn onto
@@ -173,7 +172,7 @@ def _best_existing_key_match(key: str, value: str, existing_atoms: list[dict]) -
 
     Two independent weak-LLM key choices for the same underlying fact need
     not match (e.g. a correction turn inventing ``abilities_total`` where the
-    original wrong atom lives under ``chalie.abilities.count``). Compares the
+    original wrong atom lives under ``app.abilities.count``). Compares the
     proposed ``key + value`` text against each existing atom's ``key + value``
     text via ``difflib.SequenceMatcher`` on lowercased, whitespace-normalized
     strings, and returns the single best match's key if its ratio clears
@@ -243,7 +242,7 @@ def _apply_atom_op(ctx, op, action, *, project_root, existing_atoms, stats) -> N
     # Resolve the EFFECTIVE key before anything else: two independent weak-LLM
     # key choices for the same underlying fact need not match (e.g. a correction
     # turn inventing a different key than the original wrong atom -- see
-    # MEMORY_REDESIGN.md / consolidation module docstring). Try the model's own
+    # consolidation module docstring). Try the model's own
     # key first; if no live atom holds it, fall back to the key of the
     # most-similar existing atom shown to the model, so supersession below closes
     # the stale/wrong atom instead of leaving it live alongside a new sibling.

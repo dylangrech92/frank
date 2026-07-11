@@ -162,7 +162,7 @@ def _run_migration(conn: sqlite3.Connection, vec_enabled: bool) -> None:
         """)
 
 
-# Six anchor columns added to `facts` in schema v2 (code-anchoring, MEMORY_REDESIGN.md §5).
+# Six anchor columns added to `facts` in schema v2 (code-anchoring, schema v2).
 _V2_ANCHOR_COLUMNS = [
     ("anchor_path", "TEXT"),
     ("anchor_symbol", "TEXT"),

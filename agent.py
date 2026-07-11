@@ -270,7 +270,7 @@ def _guard_oversize_result(
 ) -> tuple[ToolResult, str]:
     """Discard an oversized rendered tool result and substitute a clean error.
 
-    Dylan's explicit spec: never silently truncate a tool result — if it would
+    The design spec: never silently truncate a tool result — if it would
     consume more than 75% of the remaining token budget, discard the body
     entirely and return a ``result-too-large`` error instead, so the oversized
     raw body never enters the session transcript.
@@ -313,8 +313,8 @@ def _loop_guard_check(
 ) -> str:
     """Append a steer suffix when the same (tool, error) has repeated within a turn.
 
-    Cheap prefix check on the rendered text (mirrors Chalie's ``dispatch_service``
-    pattern) so the success path pays nothing: only rendered error envelopes
+    Cheap prefix check on the rendered text (mirrors a standard dispatch
+    service pattern) so the success path pays nothing: only rendered error envelopes
     (``"[name(error..."`` header) participate in the count.
 
     Args:

@@ -4,10 +4,10 @@ Deterministic, zero-LLM "where things live" map: a gitignore-aware file listing
 personalised to a task, plus the top-ranked symbols per most task-relevant file.
 Rebuilt fresh from source on every call (mtime-cached so re-rendering within a
 session is cheap) rather than persisted as memory — structural facts go stale
-silently, so they are *derived*, never remembered (MEMORY_REDESIGN.md SS2/SS5/SS6).
+silently, so they are *derived*, never remembered.
 
 Ranking is deliberately v1-simple: a task-personalised token-overlap sort over
-file paths and symbol names — NOT PageRank (MEMORY_REDESIGN.md SS12 decision D).
+file paths and symbol names.
 
 Never calls an LLM or embedder. Degrades loudly (stderr) instead of silently
 when the LSP layer is unavailable or a warm server hasn't been spawned for a

@@ -52,7 +52,7 @@ def session_start_jobs(session: Session) -> None:
     Registers the always-on rules provider and the orientation provider
     synchronously (cheap, needed before turn 0). There is no longer a
     background maintenance sweep here: the old episodic eviction / facts-TTL
-    purge / gist-mining jobs were retired in M7 (MEMORY_REDESIGN.md section 9)
+    purge / gist-mining jobs were retired in M7
     -- ``memory.consolidation`` now owns all durable-knowledge writes,
     entirely off the hot path via its own background writer (see
     ``agent.consolidation_maybe_extract`` / ``session_end_jobs`` below).
@@ -223,8 +223,7 @@ def _build_envelope(
         duration_s: Wall-clock seconds the turn took, from ``time.monotonic()``.
 
     Returns:
-        A JSON-serializable dict matching the envelope schema pinned in
-        DESIGN.md's one-shot mode section.
+        A JSON-serializable dict matching the one-shot result envelope schema.
     """
     report = getattr(session, "turn_report", None) or {}
     usage = report.get("usage") or {}
@@ -299,7 +298,7 @@ def main() -> None:
         help=(
             "One-shot mode only (requires -p/--prompt): print exactly one JSON "
             "result envelope to stdout instead of prose. Streaming/telemetry on "
-            "stderr and exit codes are unchanged. See DESIGN.md for the schema."
+            "stderr and exit codes are unchanged."
         ),
     )
     args = parser.parse_args()

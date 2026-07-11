@@ -15,7 +15,6 @@ The caller (``memory.orientation._maybe_explore``) is the one that persists
 the brief as anchored knowledge atoms (``persist_brief`` below) and injects
 it into the current turn -- this module only explores and parses.
 
-See MEMORY_REDESIGN.md section 6 step 3 and the pinned D5 decision.
 """
 
 from __future__ import annotations

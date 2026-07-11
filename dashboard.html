@@ -151,36 +151,10 @@
 const $ = (id) => document.getElementById(id);
 
 /* window.STATS_DATA is populated by stats.js above. The EMBEDDED_RAW snapshot
-   below is only a last-resort fallback if stats.js is absent (e.g. a fresh
-   checkout before any run), so the page is never empty. */
-const EMBEDDED_RAW = [
-  {"session_id": "2026-07-07T22-31-47-52129", "run_time": 219.563, "tool_calls": 0, "input": 1645, "output": 46},
-  {"session_id": "2026-07-07T22-46-34-62978", "run_time": 453.092, "tool_calls": 8, "input": 10117, "output": 363},
-  {"session_id": "2026-07-07T23-00-57-72875", "run_time": 1140.162, "tool_calls": 15, "input": 92204, "output": 8452},
-  {"session_id": "2026-07-07T23-01-00-72898", "run_time": 990.258, "tool_calls": 19, "input": 168033, "output": 15575},
-  {"session_id": "2026-07-07T23-01-02-73035", "run_time": 32.57, "tool_calls": 0, "input": 3482, "output": 118},
-  {"session_id": "2026-07-07T23-02-54-74471", "run_time": 868.218, "tool_calls": 15, "input": 27068, "output": 684},
-  {"session_id": "2026-07-08T00-09-55-23212", "run_time": 129.066, "tool_calls": 15, "input": 101924, "output": 926},
-  {"session_id": "2026-07-08T00-09-58-23238", "run_time": 109.025, "tool_calls": 17, "input": 45343, "output": 745},
-  {"session_id": "2026-07-08T01-13-44-75897", "run_time": 62.228, "tool_calls": 20, "input": 82110, "output": 5832},
-  {"session_id": "2026-07-08T01-25-45-84252", "run_time": 377.006, "tool_calls": 37, "input": 225022, "output": 8157},
-  {"session_id": "2026-07-08T01-33-14-89463", "run_time": 65.464, "tool_calls": 24, "input": 80140, "output": 5115},
-  {"session_id": "2026-07-08T01-35-02-90738", "run_time": 138.988, "tool_calls": 41, "input": 285969, "output": 9383},
-  {"session_id": "2026-07-08T09-35-39-11069", "run_time": 2.93, "tool_calls": 0, "input": 1638, "output": 30},
-  {"session_id": "2026-07-08T09-54-24-23581", "run_time": 1078.125, "tool_calls": 55, "input": 759547, "output": 40497},
-  {"session_id": "2026-07-08T09-54-28-23629", "run_time": 2272.641, "tool_calls": 111, "input": 2971708, "output": 84479},
-  {"session_id": "2026-07-08T09-54-35-23762", "run_time": 463.342, "tool_calls": 68, "input": 990667, "output": 15413},
-  {"session_id": "2026-07-08T09-54-27-23607", "run_time": 2839.092, "tool_calls": 45, "input": 889016, "output": 112588},
-  {"session_id": "2026-07-08T10-47-30-59864", "run_time": 247.659, "tool_calls": 8, "input": 89171, "output": 8476},
-  {"session_id": "2026-07-08T10-48-25-60550", "run_time": 102.15, "tool_calls": 13, "input": 149595, "output": 2249},
-  {"session_id": "2026-07-08T10-48-25-60548", "run_time": 111.758, "tool_calls": 23, "input": 123447, "output": 2486},
-  {"session_id": "2026-07-08T10-48-25-60551", "run_time": 112.884, "tool_calls": 15, "input": 88280, "output": 2588},
-  {"session_id": "2026-07-08T10-48-25-60549", "run_time": 112.985, "tool_calls": 14, "input": 85946, "output": 2590},
-  {"session_id": "2026-07-08T10-50-07-61755", "run_time": 46.104, "tool_calls": 15, "input": 85027, "output": 3111},
-  {"session_id": "2026-07-08T11-29-00-88374", "run_time": 11.895, "tool_calls": 6, "input": 5795, "output": 575},
-  {"session_id": "2026-07-08T11-29-28-88754", "run_time": 237.812, "tool_calls": 55, "input": 950668, "output": 16924},
-  {"session_id": "2026-07-08T12-47-59-41810", "run_time": 269.291, "tool_calls": 79, "input": 1112034, "output": 18834}
-];
+   is only a last-resort fallback if stats.js is absent (e.g. a fresh
+   checkout before any run), so the page is never empty. Empty by default —
+   stats.py regenerates stats.js with real data after the first session. */
+const EMBEDDED_RAW = [];
 
 let RAW = [];
 let MODE = "week";                 // day | week | month
@@ -212,7 +186,7 @@ function normalize(rows) {
 
 function ingest(rows, live) {
   RAW = normalize(rows);
-  if (!RAW.length) { $("sub").innerHTML = "No sessions found in stats.json."; render(); return; }
+  if (!RAW.length) { $("sub").innerHTML = "No telemetry yet — run the agent to start collecting."; render(); return; }
   const first = RAW.reduce((a, b) => (a.start < b.start ? a : b)).start;
   const last = RAW.reduce((a, b) => (a.start > b.start ? a : b)).start;
   $("sub").innerHTML =

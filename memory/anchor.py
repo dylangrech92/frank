@@ -5,7 +5,7 @@ A knowledge atom (a row in the ``facts`` table) may be *anchored* to a file
 learn time plus the git commit it was learned against. Recall re-checks the
 anchor -- **anchor-liveness**, not a clock -- to decide whether an atom is
 still trustworthy: staleness is "the code under this insight changed", never
-"time has passed". See MEMORY_REDESIGN.md section 5.
+"time has passed".
 
 Both the write side (``memory.atomic.remember``) and the read side
 (``memory.atomic.recall_facts``) import from this module so the two stay in

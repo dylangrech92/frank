@@ -2,8 +2,7 @@
 
 The episodic memory layer this module used to hold (turn-end gist encoder,
 salience/novelty scoring, clock-based erosion + eviction, and a recall/forget
-layer over an ``episodes`` table) was retired in M7 (MEMORY_REDESIGN.md
-section 9): "what happened this session," eroded by a clock, is conversational
+layer over an ``episodes`` table) was retired in M7 -- "what happened this session," eroded by a clock, is conversational
 continuity, not codebase knowledge. ``memory.consolidation`` replaced it --
 mining the accepted turn's diff + transcript tail directly into anchored
 knowledge atoms, off the hot path.

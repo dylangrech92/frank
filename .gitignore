@@ -2,5 +2,15 @@ __pycache__/
 *.pyc
 .coding_agent/
 .idea/
+.claude/
+
+# Personal configs — copy config.example.json to config.json and edit
+config.json
+.env
+
+# Stats / telemetry
 stats.json
 stats.js
+
+# Ruff
+.ruff_cache/

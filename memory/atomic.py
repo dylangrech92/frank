@@ -2,7 +2,7 @@
 
 Provides a structured ``remember / forget / recall`` API over the ``facts``
 table (bi-temporal keyed supersession). Staleness is anchor-liveness, not a
-clock (MEMORY_REDESIGN.md section 5) -- ``recall_facts`` checks each atom's
+clock -- ``recall_facts`` checks each atom's
 code anchor and down-weights/labels drift; there is no TTL or time-decay in
 this layer (retired M7 -- see git history for the prior clock-decay scorer).
 """
@@ -114,7 +114,7 @@ def remember(
 ) -> int:
     """Insert a new atom, superseding any current one with the same (kind, key).
 
-    Optional code-anchor fields (MEMORY_REDESIGN.md §5): *anchor_path*/
+    Optional code-anchor fields: *anchor_path*/
     *anchor_symbol* name what the insight is about (NULL/None = repo-wide);
     *anchor_hash*/*learned_commit* stamp what the code looked like when
     learned -- callers compute these with ``memory.anchor.anchor_for(path)``
@@ -384,8 +384,7 @@ def recall_facts(ctx: "MemoryContext", query: str, limit: int) -> list[dict]:
 
     # Final score: relevance + confidence + anchor-freshness (§7 rank formula).
     # Anchor-liveness replaces the clock-decay nudge -- staleness is "the code
-    # under this insight changed", never "time has passed" (MEMORY_REDESIGN.md
-    # §5/§10). The old clock-decay/TTL apparatus (`decay_weight`, `KIND_TTL_DAYS`,
+    # under this insight changed", never "time has passed"). The old clock-decay/TTL apparatus (`decay_weight`, `KIND_TTL_DAYS`,
     # `purge_expired`) was removed in M7 -- this scorer never called it anyway.
     # Candidate set only (bounded by the FTS/vec legs above, well under the
     # whole table) and hashes are cached per file so a file anchoring several
@@ -457,4 +456,3 @@ def recall_facts(ctx: "MemoryContext", query: str, limit: int) -> list[dict]:
             pass  # Non-critical; ignore failures.
 
     return results
-

@@ -6,7 +6,7 @@ heuristic, orientation recalls the *codebase*: a zero-LLM derived skeleton
 (``memory.skeleton``) plus anchored, code-linked knowledge atoms and graph
 decisions/specs relevant to the current task. It runs every turn (retrieval is
 already task-relative, so there is no topic-shift gate to maintain) and never
-raises. See MEMORY_REDESIGN.md section 6.
+raises.
 """
 
 from __future__ import annotations
