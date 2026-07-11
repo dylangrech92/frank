@@ -89,17 +89,16 @@ def _drive_turn(task: str, script: list, tmp_prefix: str, seed: dict[str, str]):
     """
     import agent
     import tools.registry as registry
-    from evals._stub import _StubClient
+    from evals._stub import _StubClient, disable_memory_hooks
+    disable_memory_hooks()
     from session import Session
 
     for name in ("read_file", "create_file", "update_file", "run_command"):
         registry.activate(name)
 
     original_cwd = os.getcwd()
-    original_memory = agent.MEMORY_ENABLED
     tmp = tempfile.mkdtemp(prefix=tmp_prefix)
     os.chdir(tmp)
-    agent.MEMORY_ENABLED = False
     try:
         for rel, content in seed.items():
             with open(os.path.join(tmp, rel), "w", encoding="utf-8") as fh:
@@ -113,7 +112,6 @@ def _drive_turn(task: str, script: list, tmp_prefix: str, seed: dict[str, str]):
             )
         return session
     finally:
-        agent.MEMORY_ENABLED = original_memory
         os.chdir(original_cwd)
 
 

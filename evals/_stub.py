@@ -122,3 +122,18 @@ def _final_answer_response(text: str):
         return ChatResponse(text=text, tool_calls=[])
 
     return factory
+
+
+def disable_memory_hooks() -> None:
+    """Patch the agent's memory hooks to no-ops for offline evals.
+
+    Eval scripts drive the real ``handle_user_message`` turn loop but must stay
+    deterministic and offline. The orientation and consolidation hooks now run
+    unconditionally (no ``--no-memory`` flag), so every eval that calls
+    ``handle_user_message`` must call this once to prevent the hooks from
+    spawning explorers, writing memory.db, or making LLM calls via the stub.
+    """
+    import agent
+
+    agent.orientation_maybe_seed = lambda session: None  # noqa: E731
+    agent.consolidation_maybe_extract = lambda session, client: None  # noqa: E731

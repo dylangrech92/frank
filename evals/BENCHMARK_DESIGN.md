@@ -114,7 +114,7 @@ report median, show min–max range):
 
 1. Copy fixture repo to a fresh temp worktree; `git init`/pin so the diff is clean.
 2. Launch headless:
-   - Harness: `python3 main.py -p "$(cat prompt.md)" --no-memory` with repo
+   - Harness: `python3 main.py -p "$(cat prompt.md)"` with repo
      `config.json` pinned to Qwen3.6:27b.
    - Claude Code: `claude -p "$(cat prompt.md)" --output-format json
      --dangerously-skip-permissions` in a sandboxed HOME — **no CLAUDE.md, no

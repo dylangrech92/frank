@@ -106,7 +106,8 @@ def check_steer_fire_activates() -> list[str]:
     """a. The repro steer fire activates run_command so the next round can call it."""
     import agent
     import tools.registry as registry
-    from evals._stub import _StubClient
+    from evals._stub import _StubClient, disable_memory_hooks
+    disable_memory_hooks()
     from session import Session
 
     failures: list[str] = []
@@ -118,10 +119,8 @@ def check_steer_fire_activates() -> list[str]:
     registry.activate("create_file")
 
     original_cwd = os.getcwd()
-    original_memory = agent.MEMORY_ENABLED
     tmp = tempfile.mkdtemp(prefix="verify-wiring-fires-")
     os.chdir(tmp)
-    agent.MEMORY_ENABLED = False
     try:
         if registry.is_loaded("run_command"):
             failures.append(
@@ -181,7 +180,6 @@ def check_steer_fire_activates() -> list[str]:
                 "was not activated by the steer fire"
             )
     finally:
-        agent.MEMORY_ENABLED = original_memory
         os.chdir(original_cwd)
         _restore_active(registry, saved)
 
@@ -192,7 +190,8 @@ def check_no_steer_no_activation() -> list[str]:
     """b. A read-only turn never fires the steer and leaves run_command inactive."""
     import agent
     import tools.registry as registry
-    from evals._stub import _StubClient
+    from evals._stub import _StubClient, disable_memory_hooks
+    disable_memory_hooks()
     from session import Session
 
     failures: list[str] = []
@@ -200,10 +199,8 @@ def check_no_steer_no_activation() -> list[str]:
     saved = _reset_verification_tools(registry)
 
     original_cwd = os.getcwd()
-    original_memory = agent.MEMORY_ENABLED
     tmp = tempfile.mkdtemp(prefix="verify-wiring-noop-")
     os.chdir(tmp)
-    agent.MEMORY_ENABLED = False
     try:
         # A real file to read so read_file (PINNED, no activation needed) succeeds.
         with open(os.path.join(tmp, "readme.txt"), "w", encoding="utf-8") as fh:
@@ -234,7 +231,6 @@ def check_no_steer_no_activation() -> list[str]:
                 "tools must only activate when a verify steer fires"
             )
     finally:
-        agent.MEMORY_ENABLED = original_memory
         os.chdir(original_cwd)
         _restore_active(registry, saved)
 

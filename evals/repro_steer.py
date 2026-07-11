@@ -109,7 +109,8 @@ def check_fires_and_one_shot() -> list[str]:
     """a. + c. First unverified edit steers; a second edit does not double-steer."""
     import agent
     import tools.registry as registry
-    from evals._stub import _StubClient
+    from evals._stub import _StubClient, disable_memory_hooks
+    disable_memory_hooks()
     from session import Session
 
     # create_file / run_command are catalog tools (not PINNED); a live model
@@ -120,10 +121,8 @@ def check_fires_and_one_shot() -> list[str]:
     failures: list[str] = []
 
     original_cwd = os.getcwd()
-    original_memory = agent.MEMORY_ENABLED
     tmp = tempfile.mkdtemp(prefix="repro-steer-fires-")
     os.chdir(tmp)
-    agent.MEMORY_ENABLED = False
     try:
         session = Session(tmp, "test-model", "You are a test agent.")
         # Two distinct edits in one turn, no run_command anywhere, then a plain
@@ -164,7 +163,6 @@ def check_fires_and_one_shot() -> list[str]:
                 f"steer (mutual exclusion broken)"
             )
     finally:
-        agent.MEMORY_ENABLED = original_memory
         os.chdir(original_cwd)
 
     return failures
@@ -174,7 +172,8 @@ def check_suppressed_after_run() -> list[str]:
     """b. A prior (failing) run_command suppresses the steer -- status-agnostic."""
     import agent
     import tools.registry as registry
-    from evals._stub import _StubClient
+    from evals._stub import _StubClient, disable_memory_hooks
+    disable_memory_hooks()
     from session import Session
 
     # create_file / run_command are catalog tools (not PINNED); a live model
@@ -185,10 +184,8 @@ def check_suppressed_after_run() -> list[str]:
     failures: list[str] = []
 
     original_cwd = os.getcwd()
-    original_memory = agent.MEMORY_ENABLED
     tmp = tempfile.mkdtemp(prefix="repro-steer-suppressed-")
     os.chdir(tmp)
-    agent.MEMORY_ENABLED = False
     try:
         session = Session(tmp, "test-model", "You are a test agent.")
         # A FAILING command runs first (nonzero exit still records a verification
@@ -220,7 +217,6 @@ def check_suppressed_after_run() -> list[str]:
                 "run_command this turn"
             )
     finally:
-        agent.MEMORY_ENABLED = original_memory
         os.chdir(original_cwd)
 
     return failures
@@ -235,17 +231,16 @@ def _drive_turn(task: str, script: list, tmp_prefix: str):
     """
     import agent
     import tools.registry as registry
-    from evals._stub import _StubClient
+    from evals._stub import _StubClient, disable_memory_hooks
+    disable_memory_hooks()
     from session import Session
 
     registry.activate("create_file")
     registry.activate("run_command")
 
     original_cwd = os.getcwd()
-    original_memory = agent.MEMORY_ENABLED
     tmp = tempfile.mkdtemp(prefix=tmp_prefix)
     os.chdir(tmp)
-    agent.MEMORY_ENABLED = False
     try:
         session = Session(tmp, "test-model", "You are a test agent.")
         client = _StubClient(script)
@@ -256,7 +251,6 @@ def _drive_turn(task: str, script: list, tmp_prefix: str):
             )
         return session, buf.getvalue()
     finally:
-        agent.MEMORY_ENABLED = original_memory
         os.chdir(original_cwd)
 
 

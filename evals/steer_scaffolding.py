@@ -110,7 +110,8 @@ def check_e2e_scaffolding_survives() -> list[str]:
     """a. A mid-turn steer leaves the pre-steer scaffolding intact in the sent view."""
     import agent
     import tools.registry as registry
-    from evals._stub import _StubClient
+    from evals._stub import _StubClient, disable_memory_hooks
+    disable_memory_hooks()
     from session import Session
 
     # create_file is a catalog tool (read_file is PINNED); a live model activates
@@ -120,10 +121,8 @@ def check_e2e_scaffolding_survives() -> list[str]:
     failures: list[str] = []
 
     original_cwd = os.getcwd()
-    original_memory = agent.MEMORY_ENABLED
     tmp = tempfile.mkdtemp(prefix="steer-scaffolding-e2e-")
     os.chdir(tmp)
-    agent.MEMORY_ENABLED = False
     try:
         session = Session(tmp, "test-model", "You are a test agent.")
         # Round 1 edits with no verification run this turn -> the repro steer
@@ -180,7 +179,6 @@ def check_e2e_scaffolding_survives() -> list[str]:
                     f"steer={steer_idx}"
                 )
     finally:
-        agent.MEMORY_ENABLED = original_memory
         os.chdir(original_cwd)
 
     return failures

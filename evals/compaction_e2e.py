@@ -49,7 +49,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from evals._stub import _StubClient
+from evals._stub import _StubClient, disable_memory_hooks
 
 # A distinctive original request — checked verbatim to prove the task anchor is
 # re-injected after the user message is folded behind the watermark.
@@ -147,6 +147,7 @@ def _useless_summarizer(messages):
 
 def check_normal_fold() -> list[str]:
     """Compaction fires, splices a digest under cap, keeps the anchor, and ends."""
+    disable_memory_hooks()
     import agent
     import compaction
     from session import Session
@@ -229,6 +230,7 @@ def check_normal_fold() -> list[str]:
 
 def check_force_fold_overflow() -> list[str]:
     """A useless summarizer thrashes, force_fold engages, and the turn still ends."""
+    disable_memory_hooks()
     import agent
     from session import Session
 

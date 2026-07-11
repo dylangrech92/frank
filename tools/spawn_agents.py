@@ -1,8 +1,8 @@
 """Spawn-agents tool: fan out independent subtasks to concurrent one-shot children.
 
-Each child is a fresh, memory-less invocation of this same harness
-(``main.py --no-memory -p -``) running in its own process. Children have no
-access to the parent's context, transcript, or memory — every spec's
+Each child is a fresh one-shot invocation of this same harness
+(``main.py -p -``) running in its own process. Children have no
+access to the parent's context or transcript — every spec's
 ``prompt`` must be fully self-contained.
 """
 
@@ -33,32 +33,32 @@ _STDERR_TAIL_LINES = 15
 
 
 class SpawnAgents(Tool):
-    """Fan out independent subtasks to concurrent, memory-less one-shot children.
+    """Fan out independent subtasks to concurrent one-shot children.
 
     Use this to delegate independent read/research questions (e.g. "what does
     file A do", "what does file B do") to keep your own context clean, or to
     run genuinely independent subtasks concurrently instead of doing them one
     at a time. Each spec becomes a brand-new child process of this same
-    harness with **no memory of this conversation and no shared context** — it
-    only ever sees the single ``prompt`` string you give it, so every prompt
-    must be fully self-contained (state the question, any needed background,
-    and what form the answer should take; do not say "as discussed above" or
-    reference anything the child cannot see). Children may read and edit
-    files, so do not use this for two subtasks that touch the same file
+    harness with **no access to this conversation's history and no shared
+    context** — it only ever sees the single ``prompt`` string you give it, so
+    every prompt must be fully self-contained (state the question, any needed
+    background, and what form the answer should take; do not say "as discussed
+    above" or reference anything the child cannot see). Children may read and
+    edit files, so do not use this for two subtasks that touch the same file
     concurrently. Not for trivial single-step lookups you could just do
     yourself with a normal tool call.
     """
 
     name = 'spawn_agents'
-    summary = 'Fan out independent subtasks to concurrent, memory-less one-shot subagents.'
+    summary = 'Fan out independent subtasks to concurrent one-shot subagents.'
     description = (
-        'Fan out independent subtasks to concurrent, memory-less one-shot subagent '
+        'Fan out independent subtasks to concurrent one-shot subagent '
         'children of this same harness. Use this to delegate independent read/research '
         'questions (keeping your own context clean) or to run genuinely independent '
         'subtasks concurrently rather than sequentially. Each child is a brand-new '
-        'process with NO memory of this conversation and no shared context — it only '
-        'ever sees the exact `prompt` string in its spec, so every prompt must be '
-        'fully self-contained (state the question, any needed background, and the '
+        'process with no access to this conversation\'s history and no shared context — '
+        'it only ever sees the exact `prompt` string in its spec, so every prompt must '
+        'be fully self-contained (state the question, any needed background, and the '
         'expected answer shape). Children run up to a configured concurrency limit '
         'and each has a bounded timeout. Not `parallel_safe` — children may mutate '
         'files. Refuses to spawn when already running as a subagent two levels deep '
@@ -234,7 +234,7 @@ def _spawn_one(
     """
     try:
         proc = subprocess.run(
-            ['python3', str(main_py), '--no-memory', '-p', '-'],
+            ['python3', str(main_py), '-p', '-'],
             cwd=spec['cwd'],
             input=spec['prompt'],
             capture_output=True,

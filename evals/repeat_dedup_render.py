@@ -112,16 +112,15 @@ def _tool_rows(session, name: str) -> list[str]:
 def check_identical_read_stubbed() -> list[str]:
     """a. Two identical successful reads: first body shown, second stubbed."""
     import agent
-    from evals._stub import _StubClient
+    from evals._stub import _StubClient, disable_memory_hooks
+    disable_memory_hooks()
     from session import Session
 
     failures: list[str] = []
 
     original_cwd = os.getcwd()
-    original_memory = agent.MEMORY_ENABLED
     tmp = tempfile.mkdtemp(prefix="repeat-dedup-read-")
     os.chdir(tmp)
-    agent.MEMORY_ENABLED = False
     try:
         with open(os.path.join(tmp, "readme.txt"), "w", encoding="utf-8") as fh:
             fh.write("hello world\n")
@@ -159,7 +158,6 @@ def check_identical_read_stubbed() -> list[str]:
                 f"second identical read was not deduped to a stub: {rows[1]!r}"
             )
     finally:
-        agent.MEMORY_ENABLED = original_memory
         os.chdir(original_cwd)
 
     return failures
@@ -169,7 +167,8 @@ def check_reread_after_edit_full_body() -> list[str]:
     """b. Read → edit → identical re-read renders the fresh body, not a stub."""
     import agent
     import tools.registry as registry
-    from evals._stub import _StubClient
+    from evals._stub import _StubClient, disable_memory_hooks
+    disable_memory_hooks()
     from session import Session
 
     failures: list[str] = []
@@ -178,10 +177,8 @@ def check_reread_after_edit_full_body() -> list[str]:
     registry.activate("update_file")  # catalog-gated write tool
 
     original_cwd = os.getcwd()
-    original_memory = agent.MEMORY_ENABLED
     tmp = tempfile.mkdtemp(prefix="repeat-dedup-edit-")
     os.chdir(tmp)
-    agent.MEMORY_ENABLED = False
     try:
         with open(os.path.join(tmp, "conf.txt"), "w", encoding="utf-8") as fh:
             fh.write("old_marker = 1\n")
@@ -224,7 +221,6 @@ def check_reread_after_edit_full_body() -> list[str]:
                 f"re-read rendered stale content instead of the edit: {rows[1]!r}"
             )
     finally:
-        agent.MEMORY_ENABLED = original_memory
         os.chdir(original_cwd)
         registry._active.clear()
         registry._active.update(saved_active)
@@ -236,7 +232,8 @@ def check_verify_nochange_stubbed() -> list[str]:
     """c1. Identical run_command twice, no intervening mutation → 2nd is the [no-change] stub."""
     import agent
     import tools.registry as registry
-    from evals._stub import _StubClient
+    from evals._stub import _StubClient, disable_memory_hooks
+    disable_memory_hooks()
     from session import Session
 
     failures: list[str] = []
@@ -245,10 +242,8 @@ def check_verify_nochange_stubbed() -> list[str]:
     registry.activate("run_command")
 
     original_cwd = os.getcwd()
-    original_memory = agent.MEMORY_ENABLED
     tmp = tempfile.mkdtemp(prefix="repeat-dedup-cmd-")
     os.chdir(tmp)
-    agent.MEMORY_ENABLED = False
     try:
         session = Session(tmp, "test-model", "You are a test agent.")
         script = [
@@ -283,7 +278,6 @@ def check_verify_nochange_stubbed() -> list[str]:
                 f"stub: {rows[1]!r}"
             )
     finally:
-        agent.MEMORY_ENABLED = original_memory
         os.chdir(original_cwd)
         registry._active.clear()
         registry._active.update(saved_active)
@@ -295,7 +289,8 @@ def check_verify_remutate_then_restub() -> list[str]:
     """c2/c3. run_command → mutation → identical run_command is FULL; one more run re-stubs."""
     import agent
     import tools.registry as registry
-    from evals._stub import _StubClient
+    from evals._stub import _StubClient, disable_memory_hooks
+    disable_memory_hooks()
     from session import Session
 
     failures: list[str] = []
@@ -305,10 +300,8 @@ def check_verify_remutate_then_restub() -> list[str]:
     registry.activate("create_file")
 
     original_cwd = os.getcwd()
-    original_memory = agent.MEMORY_ENABLED
     tmp = tempfile.mkdtemp(prefix="repeat-dedup-remutate-")
     os.chdir(tmp)
-    agent.MEMORY_ENABLED = False
     try:
         session = Session(tmp, "test-model", "You are a test agent.")
         # run (stamps) → create a file (a real mutation event on the same bus the
@@ -354,7 +347,6 @@ def check_verify_remutate_then_restub() -> list[str]:
                 f"the re-stubbed run still carried the full body: {rows[2]!r}"
             )
     finally:
-        agent.MEMORY_ENABLED = original_memory
         os.chdir(original_cwd)
         registry._active.clear()
         registry._active.update(saved_active)
@@ -415,7 +407,8 @@ def check_readonly_dedups_despite_other_mutation() -> list[str]:
     """c5. A read-only re-read still stubs even when a DIFFERENT file changed between reads."""
     import agent
     import tools.registry as registry
-    from evals._stub import _StubClient
+    from evals._stub import _StubClient, disable_memory_hooks
+    disable_memory_hooks()
     from session import Session
 
     failures: list[str] = []
@@ -424,10 +417,8 @@ def check_readonly_dedups_despite_other_mutation() -> list[str]:
     registry.activate("create_file")  # read_file is PINNED
 
     original_cwd = os.getcwd()
-    original_memory = agent.MEMORY_ENABLED
     tmp = tempfile.mkdtemp(prefix="repeat-dedup-otherfile-")
     os.chdir(tmp)
-    agent.MEMORY_ENABLED = False
     try:
         with open(os.path.join(tmp, "readme.txt"), "w", encoding="utf-8") as fh:
             fh.write("hello world\n")
@@ -464,7 +455,6 @@ def check_readonly_dedups_despite_other_mutation() -> list[str]:
                 f"the read-only stub still carried the full body: {rows[1]!r}"
             )
     finally:
-        agent.MEMORY_ENABLED = original_memory
         os.chdir(original_cwd)
         registry._active.clear()
         registry._active.update(saved_active)

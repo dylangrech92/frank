@@ -35,8 +35,7 @@ sys.modules.setdefault("main", sys.modules[__name__])
 def register_catalog_provider() -> None:
     """Register the tool-catalog system-message block (deferred tool loading).
 
-    Memory-independent — the model cannot load tools without it, so it runs
-    even under ``--no-memory``.
+    Memory-independent — the model cannot load tools without it.
     """
     try:
         from session import CONTEXT_PROVIDERS
@@ -295,15 +294,6 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--no-memory",
-        action="store_true",
-        help=(
-            "Skip all long-term-memory work (orientation, rules provider, "
-            "end-of-session consolidation) for the fastest possible "
-            "run — useful for ephemeral one-shot subagent calls"
-        ),
-    )
-    parser.add_argument(
         "--json",
         action="store_true",
         help=(
@@ -353,12 +343,7 @@ def main() -> None:
     exit_code = 0
     try:
         register_catalog_provider()
-        if args.no_memory:
-            import agent as agent_module
-
-            agent_module.MEMORY_ENABLED = False
-        else:
-            session_start_jobs(session)
+        session_start_jobs(session)
 
         global MANAGER
         manager = LSPManager(cfg.language_servers, project_root)
@@ -501,8 +486,7 @@ def main() -> None:
         if DEBUG_MANAGER is not None and DEBUG_MANAGER.active:
             DEBUG_MANAGER.stop()
 
-        if not args.no_memory:
-            session_end_jobs(session, client)
+        session_end_jobs(session, client)
     finally:
         session.close()
 

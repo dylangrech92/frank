@@ -57,11 +57,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-from evals._stub import _final_answer_response, _same_call_response, _StubClient
+from evals._stub import _final_answer_response, _same_call_response, _StubClient, disable_memory_hooks
 
 
 def check_escalation() -> list[str]:
     """A. Same blocked call forever -> harness force-finalizes the turn."""
+    disable_memory_hooks()
     import agent
     from session import STEER_PREFIX, Session
 
@@ -80,7 +81,7 @@ def check_escalation() -> list[str]:
         client = _StubClient([_same_call_response("list_files", {"path": "."})])
 
         # Record the end-of-turn consolidation hook at the module seam
-        # (it is called unconditionally; MEMORY_ENABLED only gates its body), so
+        # (it is called unconditionally), so
         # the check is independent of memory config and does not touch memory.
         # This is a force-finalized turn: it must still reach the hook exactly
         # once, proving the escalation give-up path routes through the choke
@@ -144,6 +145,7 @@ def _drive_giveup(tmp_prefix: str, prefix_script: list):
     no-op so the check never touches memory. chdir's into a throwaway temp dir
     (create_file / list_files resolve against cwd) and restores cwd afterward.
     """
+    disable_memory_hooks()
     import agent
     from session import Session
     from tools import registry
@@ -323,6 +325,7 @@ def check_verified_tristate_contract() -> list[str]:
 
 def check_reset_no_premature_escalation() -> list[str]:
     """B. A real dispatch between blocks resets the streak -> normal termination."""
+    disable_memory_hooks()
     import agent
     from session import Session
 

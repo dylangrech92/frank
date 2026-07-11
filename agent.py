@@ -145,11 +145,6 @@ def diagnostics_inject_summary(session: Session) -> None:
         print(f"diagnostics-inject-error: {exc}", file=sys.stderr, flush=True)
 
 
-# Master switch for long-term-memory work inside the turn loop (orientation
-# seeding + consolidation). main.py flips it off under --no-memory.
-MEMORY_ENABLED: bool = True
-
-
 def orientation_maybe_seed(session: Session) -> None:
     """Task-start memory orientation injection seam.
 
@@ -160,8 +155,6 @@ def orientation_maybe_seed(session: Session) -> None:
     injection by the orientation context provider. Never persisted to the
     transcript. Never raises.
     """
-    if not MEMORY_ENABLED:
-        return
     try:
         import memory.orientation as orientation
 
@@ -183,8 +176,6 @@ def consolidation_maybe_extract(session: Session, client: LLMClient) -> None:
     final turn is guaranteed to finish before the process exits without being
     consolidated twice.
     """
-    if not MEMORY_ENABLED:
-        return
     try:
         import memory.consolidation as consolidation
     except Exception:

@@ -308,12 +308,12 @@ explicitly deferred by the owner.
 
 **Gap:** the harness has exactly one context window. Every file read to answer
 a broad question burns the parent's context, while P18 already made concurrent
-one-shot instances safe (pid-unique sessions, WAL memory db, advisory locks,
-`--no-memory`) — the fan-out capability exists but no tool exposes it.
+one-shot instances safe (pid-unique sessions, WAL memory db, advisory locks)
+— the fan-out capability exists but no tool exposes it.
 
 **Mechanism:** new `spawn_agents` tool: accepts a list of `{prompt, cwd?}`
 specs (cwd defaults to the project root), launches each as a child one-shot
-(`python3 <install_dir>/main.py --no-memory -p -`, prompt on stdin) via
+(`python3 <install_dir>/main.py -p -`, prompt on stdin) via
 subprocess, all children concurrent up to `subagents.max_concurrent` (config,
 default 4), bounded per-child timeout (`subagents.timeout_s`, default 600).
 Returns per-child: answer (stdout), exit code, stderr tail on failure.

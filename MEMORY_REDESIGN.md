@@ -212,11 +212,9 @@ at `session_end_jobs` (already the pattern, `main.py:199`).
 3. **Anchor + record** (§5): attach path/symbol/hash/commit to each atom; route
    genuine "why"/reversals to graph `record_decision`/`record_pivot`.
 
-Constraint resolved: a spawned subagent runs `--no-memory`, but `--no-memory`
-disables only the *automatic* providers/sweeps — **the `recall`/`remember`/
-`record_*` tools still write `memory.db`** (fresh store per call against cwd,
-`tools/recall.py:65`, `tools/record_decision.py:58`). So consolidation may run
-either **in-process** (like `extract_facts` today — preferred, simplest) *or* as a
+Subagents and one-shot children now always run with memory enabled (the
+former `--no-memory` flag has been removed). Consolidation may run either
+**in-process** (like `extract_facts` today — preferred, simplest) *or* as a
 memory-writing child. The explorer subagent (§6.3) likewise persists via these tools.
 
 ---
