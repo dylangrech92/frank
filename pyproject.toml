@@ -1,0 +1,13 @@
+[project]
+name = "coding-agent"
+version = "0.1.0"
+description = "Local LLM coding agent with LSP, DAP, profiling, and MCP integration"
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "mcp",
+    "psutil",
+]
+
+[tool.uv]
+package = false
