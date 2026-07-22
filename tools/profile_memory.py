@@ -1,9 +1,9 @@
-"""Profile-hotspot tool: per-function CPU profiling for python, node, and php."""
+"""Profile-memory tool: per-allocation-site memory profiling for python, node, and php."""
 
 from __future__ import annotations
 
+import json
 import os
-import pstats
 import shlex
 import shutil
 import tempfile
@@ -11,13 +11,15 @@ from pathlib import Path
 from typing import Any
 
 from runtime.profiling import (
+    fmt_bytes,
     fmt_seconds,
-    php_xdebug_status,
     parse_cachegrind,
-    parse_cpuprofile,
+    parse_heapprofile,
+    php_xdebug_status,
     render_top_table,
     run_measured,
     which_interpreter,
+    write_python_bootstrap,
 )
 from tools._sandbox import resolve_in_root
 from tools._snapshot import publish_snapshot_diff, render_mutation_line, snapshot_tree
@@ -66,197 +68,186 @@ def _resolve_target(
     return resolved, target
 
 
-def _render_python_hotspots(
-    profile_path: str, top: int, focus: str | None,
-) -> str:
-    """Render pstats output for the given profile file.
+def _render_python_memory(
+    result_path: str, top: int,
+) -> str | None:
+    """Render tracemalloc result JSON into a top-N table.
 
-    Returns a string containing the top-N table, and (if *focus* is given) the
-    callers/callees section for the named function.
+    Returns a string containing the header, current/peak summary, and the
+    top-N table, or None on read/parse failure.
     """
-    # pstats.Stats builds .stats/.all_callees dynamically — typeshed doesn't
-    # declare them, so keep the variable untyped for the checker.
-    stats: Any = pstats.Stats(profile_path)
-    stats.sort_stats('tottime')
+    try:
+        with open(result_path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
 
-    # Top-N rows of (ncalls, tottime, cumtime, file:line:name).
-    # pstats tuple: (cc, nc, tottime, cumtime, callers_dict).
+    current_bytes = data.get('current_bytes', 0)
+    peak_bytes = data.get('peak_bytes', 0)
+    top_entries = data.get('top', [])
+    target_error = data.get('target_error')
+
+    lines: list[str] = []
+    lines.append(f'Current: {fmt_bytes(current_bytes)}, Peak: {fmt_bytes(peak_bytes)}')
+    lines.append('')
+
+    # Render top-N table.
     rows: list[tuple] = []
-    for func_key, (_cc, nc, tottime, cumtime, _callers) in stats.stats.items():
-        # func_key is (file, line, name).
-        file_, line, name = func_key
-        label = f'{file_}:{line}:{name}'
+    for entry in top_entries:
+        file_ = entry.get('file', '')
+        line = entry.get('line', 0)
+        size = entry.get('size_bytes', 0)
+        count = entry.get('count', 0)
+        site = f'{file_}:{line}'
         rows.append((
-            str(nc),
-            f'{tottime:.4f}',
-            f'{cumtime:.4f}',
-            label,
+            fmt_bytes(size),
+            str(count),
+            site,
         ))
 
-    headers = ['ncalls', 'tottime', 'cumtime', 'function']
+    headers = ['size', 'count', 'site']
+    table = render_top_table(headers, rows, top, 'sites')
+    if table:
+        lines.append(table)
+
+    if target_error:
+        lines.append('')
+        lines.append(f'target raised: {target_error}')
+
+    return '\n'.join(lines)
+
+
+def _render_node_memory(
+    artifact_dir: str, top: int,
+) -> str:
+    """Parse all *.heapprofile files in *artifact_dir* and render a top-N table.
+
+    Returns a string containing the top-N table and a note about sampling.
+    """
+    import glob  # noqa: PLC0415 — stdlib, allowed here.
+
+    files = sorted(glob.glob(os.path.join(artifact_dir, '*.heapprofile')))
+    if not files:
+        return ''
+
+    merged: list[dict] = []
+    seen: set[tuple[str, str, int]] = set()
+    for path in files:
+        try:
+            items = parse_heapprofile(path)
+        except ValueError:
+            continue
+        for item in items:
+            key = (
+                item.get('function', ''),
+                item.get('file', ''),
+                item.get('line', 0),
+            )
+            if key not in seen:
+                merged.append(item)
+                seen.add(key)
+            else:
+                # Sum self/total bytes for duplicate function names.
+                for existing in merged:
+                    if (
+                        existing['function'] == item['function']
+                        and existing['file'] == item['file']
+                        and existing['line'] == item['line']
+                    ):
+                        existing['self_bytes'] += item['self_bytes']
+                        existing['total_bytes'] += item['total_bytes']
+                        break
+
+    merged.sort(key=lambda r: r['self_bytes'], reverse=True)
+
+    rows: list[tuple] = []
+    for item in merged:
+        rows.append((
+            fmt_bytes(item.get('self_bytes', 0)),
+            fmt_bytes(item.get('total_bytes', 0)),
+            item.get('function', '(anonymous)'),
+        ))
+
+    headers = ['self_bytes', 'total_bytes', 'function']
     table = render_top_table(headers, rows, top, 'functions')
 
     lines: list[str] = []
     if table:
         lines.append(table)
-
-    if focus is not None:
-        matches = [k for k in stats.stats if k[2] == focus]
-        if matches:
-            lines.append('')
-            for match_key in matches:
-                m_file, m_line, m_name = match_key
-                m_label = f'{m_file}:{m_line}:{m_name}'
-                # Callers of this match.
-                callers_of = stats.stats[match_key][4]  # type: ignore[index]
-                lines.append(f'Callers of "{focus}" (from {m_label}):')
-                caller_rows: list[tuple] = []
-                for caller_key, call_data in callers_of.items():
-                    c_file, c_line, c_name = caller_key
-                    c_label = f'{c_file}:{c_line}:{c_name}'
-                    # call_data is (cc, nc, tottime, cumtime).
-                    caller_rows.append((
-                        str(call_data[1]),
-                        f'{call_data[2]:.4f}',
-                        f'{call_data[3]:.4f}',
-                        c_label,
-                    ))
-                caller_headers = ['ncalls', 'tottime', 'cumtime', 'caller']
-                caller_table = render_top_table(
-                    caller_headers, caller_rows, top, 'callers',
-                )
-                if caller_table:
-                    lines.append(caller_table)
-
-                # Callees of this match.
-                stats.calc_callees()
-                callees_of = stats.all_callees.get(match_key, {})
-                lines.append(f'Callees of "{focus}" (from {m_label}):')
-                callee_rows: list[tuple] = []
-                for callee_key, call_data in callees_of.items():
-                    c_file, c_line, c_name = callee_key
-                    c_label = f'{c_file}:{c_line}:{c_name}'
-                    # call_data is (cc, nc, tottime, cumtime).
-                    callee_rows.append((
-                        str(call_data[1]),
-                        f'{call_data[2]:.4f}',
-                        f'{call_data[3]:.4f}',
-                        c_label,
-                    ))
-                callee_headers = ['ncalls', 'tottime', 'cumtime', 'callee']
-                callee_table = render_top_table(
-                    callee_headers, callee_rows, top, 'callees',
-                )
-                if callee_table:
-                    lines.append(callee_table)
-        else:
-            lines.append('')
-            lines.append(f'Function "{focus}" not found in profile.')
+    lines.append('')
+    lines.append(
+        'Note: V8 --heap-prof data is allocation-sampling-based and '
+        'approximate, unlike python exact counts.'
+    )
 
     return '\n'.join(lines)
 
 
-def _render_node_hotspots(
-    artifact_dir: str,
-) -> list[dict]:
-    """Parse all *.cpuprofile files in *artifact_dir* and merge into a single
-    sorted list. Returns the merged list of dicts.
-    """
-    import glob  # noqa: PLC0415 — stdlib, allowed here.
-
-    files = sorted(glob.glob(os.path.join(artifact_dir, '*.cpuprofile')))
-    merged: list[dict] = []
-    seen: set[str] = set()
-    for path in files:
-        try:
-            items = parse_cpuprofile(path)
-        except ValueError:
-            continue
-        for item in items:
-            key = item.get('function', '')
-            if key not in seen:
-                merged.append(item)
-                seen.add(key)
-            else:
-                # Sum self/total/hits for duplicate function names.
-                for existing in merged:
-                    if existing['function'] == key:
-                        existing['self_s'] += item['self_s']
-                        existing['total_s'] += item['total_s']
-                        existing['hits'] += item['hits']
-                        break
-    merged.sort(key=lambda r: r['self_s'], reverse=True)
-    return merged
-
-
-def _render_node_table(
-    merged: list[dict], top: int,
-) -> str:
-    """Render the merged V8 profile data into a fixed-width table."""
-    rows: list[tuple] = []
-    for item in merged:
-        rows.append((
-            str(item.get('hits', 0)),
-            f'{item.get("self_s", 0.0):.4f}',
-            f'{item.get("total_s", 0.0):.4f}',
-            item.get('function', '(anonymous)'),
-        ))
-    headers = ['hits', 'self_s', 'total_s', 'function']
-    return render_top_table(headers, rows, top, 'functions')
-
-
-def _render_php_hotspots(
+def _render_php_memory(
     artifact_dir: str, top: int,
 ) -> str:
     """Parse the cachegrind output file in *artifact_dir* and render the
-    top-N table ranked by self Time.
+    Memory event column as a top-N table.
+
+    Returns a string containing the top-N table, or empty string if no
+    cachegrind artifact is found.
     """
     import glob  # noqa: PLC0415
 
     files = sorted(glob.glob(os.path.join(artifact_dir, 'cachegrind.out.*')))
     if not files:
         return ''
+
     data = parse_cachegrind(files[0])
-    events = data.get('events', ['Time'])
-    first_event = events[0] if events else 'Time'
+    events = data.get('events', [])
+
+    # Find the Memory event (case-insensitive prefix match).
+    memory_event = None
+    for event in events:
+        if event.lower().startswith('memory'):
+            memory_event = event
+            break
+
+    if memory_event is None:
+        return ''
 
     rows: list[tuple] = []
     for func in data.get('functions', []):
         name = func.get('function', '(unknown)')
         file_ = func.get('file', '')
-        self_cost = func.get('self', {}).get(first_event, 0)
-        inc_cost = func.get('inclusive', {}).get(first_event, 0)
+        self_cost = func.get('self', {}).get(memory_event, 0)
+        inc_cost = func.get('inclusive', {}).get(memory_event, 0)
         calls = func.get('calls', 0)
         label = f'{file_}:{name}' if file_ else name
         rows.append((
             str(calls),
-            str(self_cost),
-            str(inc_cost),
+            fmt_bytes(self_cost),
+            fmt_bytes(inc_cost),
             label,
         ))
 
-    headers = ['calls', f'self {first_event}', f'inclusive {first_event}', 'function']
+    headers = ['calls', f'self {memory_event}', f'inclusive {memory_event}', 'function']
     return render_top_table(headers, rows, top, 'functions')
 
 
-class ProfileHotspots(Tool):
-    """Per-function CPU hotspot profiling for python, node, and php.
+class ProfileMemory(Tool):
+    """Per-allocation-site memory profiling for python, node, and php.
 
-    Profiles a target script (or snippet) and renders a top-N table of hot
-    functions with measured self/cumulative times.  Supports python (cProfile),
-    node (V8 --cpu-prof), and php (Xdebug cachegrind).
+    Profiles a target script (or snippet) and renders a top-N table of memory
+    allocations.  Supports python (tracemalloc), node (V8 --heap-prof), and
+    php (Xdebug cachegrind with Memory event).
     """
 
-    name = 'profile_hotspots'
-    summary = 'Per-function CPU hotspot profiling for python, node, and php.'
+    name = 'profile_memory'
+    summary = 'Per-allocation-site memory profiling for python, node, and php.'
     description = (
         'Profiles a target script (or snippet) and renders a top-N table of '
-        'hot functions with measured self/cumulative times.  Supports python '
-        '(cProfile), node (V8 --cpu-prof), and php (Xdebug cachegrind).  A '
+        'memory allocations.  Supports python (tracemalloc), node (V8 '
+        '--heap-prof), and php (Xdebug cachegrind with Memory event).  A '
         'NONZERO exit with an artifact present is still reported as success.'
     )
-    action = 'profile the hotspots'
-    oversize_hint = 'lower top or focus on a specific function'
+    action = 'profile the memory usage'
+    oversize_hint = 'lower top or focus on a specific allocation site'
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {
@@ -293,17 +284,10 @@ class ProfileHotspots(Tool):
                     'Python only: run target with -m as a module name.'
                 ),
             },
-            'focus': {
-                'type': 'string',
-                'description': (
-                    'Python only: a function name — additionally show its '
-                    'callers/callees from pstats data.'
-                ),
-            },
             'top': {
                 'type': 'integer',
                 'description': (
-                    'Number of top functions to show. Range 1-50. Default 15.'
+                    'Number of top entries to show. Range 1-50. Default 15.'
                 ),
             },
             'timeout': {
@@ -318,7 +302,7 @@ class ProfileHotspots(Tool):
     }
 
     def run(self, **kwargs: Any) -> ToolResult:
-        """Execute the profile-hotspots tool.
+        """Execute the profile-memory tool.
 
         Args:
             language: One of 'python', 'node', 'php' (required).
@@ -326,12 +310,11 @@ class ProfileHotspots(Tool):
             snippet: Source code to profile (optional).
             args: Arguments forwarded to the profiled program (optional).
             is_module: Python only: run target with -m (optional).
-            focus: Python only: function name for callers/callees (optional).
-            top: Number of top functions to show (optional, default 15).
+            top: Number of top entries to show (optional, default 15).
             timeout: Max seconds to wait (optional, default 120).
 
         Returns:
-            A ``ToolResult`` with the top-N hotspot table, stdout/stderr tails,
+            A ``ToolResult`` with the top-N memory table, stdout/stderr tails,
             and any file mutations the profiled program produced.
         """
         language_raw = kwargs.get('language')
@@ -344,8 +327,6 @@ class ProfileHotspots(Tool):
         args: list[str] = args_raw if isinstance(args_raw, list) else []
         is_module_raw = kwargs.get('is_module')
         is_module = is_module_raw if isinstance(is_module_raw, bool) else False
-        focus_raw = kwargs.get('focus')
-        focus = focus_raw if isinstance(focus_raw, str) else None
         top_raw = kwargs.get('top')
         top: int = top_raw if isinstance(top_raw, int) else 15
         timeout_raw = kwargs.get('timeout')
@@ -387,11 +368,11 @@ class ProfileHotspots(Tool):
                 hint='Set timeout to a positive integer (seconds).',
             )
 
-        if language != 'python' and (is_module or focus):
+        if language != 'python' and is_module:
             return ToolResult.err(
-                'is_module and focus are only valid for python.',
+                'is_module is only valid for python.',
                 code='bad-arguments',
-                hint='Set language to "python" to use is_module or focus.',
+                hint='Set language to "python" to use is_module.',
             )
 
         if is_module and snippet:
@@ -436,7 +417,7 @@ class ProfileHotspots(Tool):
         else:
             # Snippet path: write to a temp file outside the project tree.
             suffix = _SNIPPET_SUFFIXES.get(language, '')
-            fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix='profile_hotspots_')
+            fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix='profile_memory_')
             try:
                 with os.fdopen(fd, 'w', encoding='utf-8') as fh:
                     fh.write(snippet)
@@ -452,6 +433,7 @@ class ProfileHotspots(Tool):
                     code='bad-arguments',
                     hint='The snippet content may be invalid.',
                 )
+
         # --- Create artifacts directory ---
         artifact_dir = tempfile.mkdtemp(prefix='perf_profile_')
 
@@ -461,26 +443,23 @@ class ProfileHotspots(Tool):
 
             # --- Build command ---
             if language == 'python':
-                if is_module:
-                    cmd = shlex.join([
-                        interpreter, '-m', 'cProfile', '-o',
-                        os.path.join(artifact_dir, 'prof.out'),
-                        '-m', script_path,
-                    ] + args)
-                else:
-                    cmd = shlex.join([
-                        interpreter, '-m', 'cProfile', '-o',
-                        os.path.join(artifact_dir, 'prof.out'),
-                        script_path,
-                    ] + args)
-                artifact_pattern = os.path.join(artifact_dir, 'prof.out')
+                result_path = os.path.join(artifact_dir, 'memory_result.json')
+                config = {
+                    'target': script_path,
+                    'is_module': is_module,
+                    'args': args,
+                    'result_path': result_path,
+                }
+                bootstrap_path = write_python_bootstrap('tracemalloc', config, artifact_dir)
+                cmd = shlex.join([interpreter, bootstrap_path])
+                artifact_pattern = result_path
 
             elif language == 'node':
                 cmd = shlex.join([
-                    interpreter, '--cpu-prof', '--cpu-prof-dir',
+                    interpreter, '--heap-prof', '--heap-prof-dir',
                     artifact_dir, script_path,
                 ] + args)
-                artifact_pattern = os.path.join(artifact_dir, '*.cpuprofile')
+                artifact_pattern = os.path.join(artifact_dir, '*.heapprofile')
 
             else:  # php
                 xdebug_status = php_xdebug_status(interpreter)
@@ -532,7 +511,11 @@ class ProfileHotspots(Tool):
             # --- Check for artifact ---
             import glob as _glob  # noqa: PLC0415
             if language == 'python':
-                has_artifact = os.path.isfile(artifact_pattern)
+                # The python result file is handled by _render_python_memory,
+                # which returns None (-> profile-result-missing) for both an
+                # absent and an unparseable result. Skip the artifact-missing
+                # pre-check so python never reports 'profile-artifact-missing'.
+                has_artifact = True
             elif language == 'node':
                 has_artifact = bool(_glob.glob(artifact_pattern))
             else:
@@ -563,21 +546,43 @@ class ProfileHotspots(Tool):
             lines.append('')
 
             if language == 'python':
-                table = _render_python_hotspots(artifact_pattern, top, focus)
+                table = _render_python_memory(artifact_pattern, top)
+                if table is None:
+                    stderr_tail = _stderr_tail(result.stderr)
+                    lines = [
+                        'Failed to read memory profile result.',
+                        f'--- stderr ---\n{stderr_tail}',
+                    ]
+                    if mutation_line:
+                        lines.append(mutation_line)
+                    return ToolResult.err(
+                        '\n'.join(lines),
+                        code='profile-result-missing',
+                        hint='The tracer produced a result file but it could not be parsed.',
+                    )
                 lines.append(table)
 
             elif language == 'node':
-                merged = _render_node_hotspots(artifact_dir)
-                table = _render_node_table(merged, top)
+                table = _render_node_memory(artifact_dir, top)
                 lines.append(table)
-                lines.append('')
-                lines.append(
-                    'Note: V8 --cpu-prof data is sampling-based and '
-                    'approximate, unlike python/php exact counts.'
-                )
 
             else:  # php
-                table = _render_php_hotspots(artifact_dir, top)
+                table = _render_php_memory(artifact_dir, top)
+                if not table:
+                    stderr_tail = _stderr_tail(result.stderr)
+                    lines = [
+                        'Xdebug cachegrind artifact present, but this build '
+                        'records no Memory events — only Time/Cache events are '
+                        'available.',
+                        f'--- stderr ---\n{stderr_tail}',
+                    ]
+                    if mutation_line:
+                        lines.append(mutation_line)
+                    return ToolResult.err(
+                        '\n'.join(lines),
+                        code='profile-artifact-missing',
+                        hint='This Xdebug build does not record memory allocation events.',
+                    )
                 lines.append(table)
 
             if mutation_line:

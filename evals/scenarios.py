@@ -417,6 +417,17 @@ SCENARIOS: list[dict] = [
         "inline": "verify_tool_wiring.py",
     },
     {
+        "name": "profile_tools_contract",
+        "description": (
+            "Dispatch-level check (no LLM): the four profiling tools "
+            "(profile_command, profile_hotspots, profile_memory, trace_execution) "
+            "each honor their documented contracts — valid invocations succeed, "
+            "bad arguments are rejected with appropriate error codes, and the "
+            "tools respect their read-only or measurement-only constraints."
+        ),
+        "inline": "profile_tools_contract.py",
+    },
+    {
         "name": "activate_tools_wiring",
         "description": (
             "Dispatch-level check (no LLM): the --activate-tools CLI flag "
