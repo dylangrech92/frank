@@ -251,6 +251,38 @@ def _build_envelope(
 # =============================================================================
 
 
+def _activate_cli_tools(spec: str) -> list[str]:
+    """Validate and activate each comma-separated tool name; raises ValueError naming any unknown tool.
+
+    Splits on commas, strips whitespace, skips empty entries. For each name,
+    verifies it exists in the registry via ``get_tool`` (which returns ``None``
+    for an unknown name, in which case this raises ``ValueError`` naming the bad
+    name), then calls ``activate`` to add it to the active set.
+
+    Args:
+        spec: The raw ``--activate-tools`` value, e.g. ``"run_command,run_tests"``.
+
+    Returns:
+        The list of tool names that were activated, in input order.
+
+    Raises:
+        ValueError: If any name is not in the registry, naming that name.
+    """
+    from tools.registry import activate, get_tool
+
+    names: list[str] = []
+    for raw in spec.split(","):
+        name = raw.strip()
+        if not name:
+            continue
+        tool = get_tool(name)
+        if tool is None:
+            raise ValueError(f"unknown tool in --activate-tools: {name!r}")
+        activate(name)
+        names.append(name)
+    return names
+
+
 def main() -> None:
     """Parse args, load config, build client and session, then run the REPL or one-shot task."""
     parser = argparse.ArgumentParser(description="Coding agent CLI")
@@ -301,6 +333,16 @@ def main() -> None:
             "stderr and exit codes are unchanged."
         ),
     )
+    parser.add_argument(
+        "--activate-tools",
+        default=None,
+        metavar="NAMES",
+        help=(
+            "Comma-separated tool names to pre-activate into the request tools "
+            "array (as if load_tool had been called), e.g. "
+            "--activate-tools run_command,run_tests"
+        ),
+    )
     args = parser.parse_args()
     if args.json and args.prompt is None:
         parser.error("--json requires -p/--prompt")
@@ -329,6 +371,13 @@ def main() -> None:
     print(ui.telemetry(f"config: {os.path.abspath(args.config)}"), file=sys.stderr)
 
     discover()
+    if args.activate_tools:
+        try:
+            activated = _activate_cli_tools(args.activate_tools)
+        except ValueError as exc:
+            print(ui.error(str(exc)), file=sys.stderr)
+            sys.exit(2)
+        print(ui.telemetry(f"activated tools: {', '.join(activated)}"), file=sys.stderr)
     client = LLMClient(cfg.llm)
     try:
         if args.session:

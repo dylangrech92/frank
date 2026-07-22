@@ -357,9 +357,13 @@ def _loop_guard_check(
 # Single source of truth for the verification-tool names. The repeat-cap
 # exemption, the verification_runs recording branch, and _activate_verification_tools
 # all read this one set so the list cannot drift across the file.
+#
+# Profiling tools are repeat-cap exempt because a measure -> edit -> re-measure
+# loop legitimately re-issues identical calls, but they are NOT verification tools.
 _VERIFICATION_TOOLS = frozenset({"run_command", "run_tests", "verify_scratch"})
+_PROFILING_TOOLS = frozenset({"profile_command", "profile_hotspots", "profile_memory", "trace_execution"})
 _REPEAT_CALL_CAP = 3
-_REPEAT_CAP_EXEMPT = _VERIFICATION_TOOLS
+_REPEAT_CAP_EXEMPT = _VERIFICATION_TOOLS | _PROFILING_TOOLS
 
 
 def _activate_verification_tools() -> None:

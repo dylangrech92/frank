@@ -6,7 +6,7 @@ wraps the prompt with a mode-specific instruction block, invokes the coding
 agent as a one-shot subprocess (``main.py -p - --json``), parses the JSON
 envelope, and returns the result.
 
-The three tools:
+The four tools:
 
 - ``research`` — read-only investigation (LSP, search, navigation).  Returns
   natural-language findings.
@@ -14,6 +14,7 @@ The three tools:
   with files-changed, verification status, and a summary.
 - ``test`` — run tests and debug (test runner, commands, DAP).  Returns JSON
   with verification runs and findings.
+- ``performance_debug`` — profile runtime performance and report hotspots.
 
 The mode instruction block is prepended to the user message — the agent's own
 SYSTEM_PROMPT is never altered.
@@ -128,10 +129,53 @@ messages, stack traces, assertion failures).
 [end: MODE]\
 """
 
+PERFORMANCE_DEBUG_MODE = """\
+[MODE: PERFORMANCE_DEBUG — MEASURE AND LOCATE BOTTLENECKS]
+
+You are operating in performance-debug mode.  Measure how the project's code
+actually performs, find the bottlenecks, and report where improvements can be
+gained.  Measure first — never guess, and never optimize here.
+
+Tools to use:
+- profile_command to run any command under resource measurement: wall time,
+  user/sys CPU, peak RSS, and a sampled timeline of the whole process tree.
+  Use repeats=3 when you need stable wall times.
+- profile_hotspots for per-function CPU profiles — self/cumulative time and
+  call counts (Python cProfile, Node --cpu-prof, PHP Xdebug).  Use focus= to
+  expand one function's callers and callees.
+- profile_memory for allocation profiles — top allocation sites and peak
+  usage (Python tracemalloc, Node --heap-prof, PHP Xdebug memory events).
+- trace_execution (Python) for exact call counts, per-line hit counts in a
+  chosen file, and max stack depth — the tool for hidden iteration blow-ups
+  and deep recursion.
+- read_file / find_symbol / find_references to read the code behind every
+  hotspot before you explain it.
+
+Constraints:
+- DO NOT modify project files.  Profiled code may itself write files — the
+  tool results name any files a run touched; report them.
+- Profile a bounded, realistic workload that exits on its own; state the
+  exact command or entry point you measured.
+- Ground every claim in measured numbers from a tool result — never report a
+  bottleneck you did not observe.
+
+Return a performance report: what was measured (with wall/CPU/memory numbers),
+the ranked hotspots with their numbers, and concrete improvement opportunities
+tied to specific files and functions.
+[end: MODE]\
+"""
+
 MODE_INSTRUCTIONS: dict[str, str] = {
     "research": RESEARCH_MODE,
     "code": CODE_MODE,
     "test": TEST_MODE,
+    "performance_debug": PERFORMANCE_DEBUG_MODE,
+}
+
+# tools a mode pre-activates in the agent subprocess so every tool its
+# instruction block names is guaranteed callable (passed via --activate-tools).
+MODE_TOOLS: dict[str, list[str]] = {
+    "performance_debug": ["profile_command", "profile_hotspots", "profile_memory", "trace_execution"],
 }
 
 
@@ -159,6 +203,7 @@ async def _run_agent(
     working_dir: str,
     timeout_s: int = DEFAULT_TIMEOUT_S,
     ctx: Context | None = None,
+    extra_args: list[str] | None = None,
 ) -> dict:
     """Invoke the coding agent as a subprocess and return the parsed JSON envelope.
 
@@ -168,12 +213,13 @@ async def _run_agent(
     ``timeout_s`` without the client giving up.
 
     Args:
-        mode: One of ``"research"``, ``"code"``, ``"test"`` — selects the
+        mode: One of ``"research"``, ``"code"``, ``"test"``, ``"performance_debug"`` — selects the
             instruction block prepended to the prompt.
         prompt: The orchestrator's natural-language direction.
         working_dir: The target project root (becomes the agent's CWD).
         timeout_s: Wall-clock timeout for the subprocess.
         ctx: Optional MCP context for progress notifications.
+        extra_args: Extra argv args to splice after ``--json`` (e.g. ``--activate-tools``).
 
     Returns:
         The parsed JSON envelope dict from the agent's ``--json`` output.
@@ -190,7 +236,7 @@ async def _run_agent(
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(MAIN_PY), "-p", "-", "--json",
+            sys.executable, str(MAIN_PY), "-p", "-", "--json", *(extra_args or []),
             cwd=str(working_path),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -232,9 +278,13 @@ async def _run_agent(
     stderr_text = stderr_bytes.decode("utf-8", errors="replace")
 
     if proc.returncode != 0:
+        # A nonzero exit usually still carries the real failure reason in the
+        # stdout JSON envelope (main.py exits 1 on a status=error envelope) —
+        # include its head so the caller sees the cause, not just telemetry.
         tail = _stderr_tail(stderr_text)
         raise RuntimeError(
             f"coding agent exited with code {proc.returncode}.\n"
+            f"stdout (first 500 chars): {stdout_text[:500]}\n"
             f"stderr (tail):\n{tail}"
         )
 
@@ -273,6 +323,17 @@ def _format_test_result(envelope: dict) -> str:
         "error": envelope.get("error"),
         "answer": envelope.get("answer"),
         "verification_runs": envelope.get("verification_runs", []),
+    }, indent=2)
+
+
+def _format_perf_result(envelope: dict) -> str:
+    """Format the envelope for performance_debug mode as a focused JSON string."""
+    return json.dumps({
+        "status": envelope.get("status"),
+        "error": envelope.get("error"),
+        "answer": envelope.get("answer"),
+        "files_changed": envelope.get("files_changed", []),
+        "duration_s": envelope.get("duration_s"),
     }, indent=2)
 
 
@@ -356,6 +417,39 @@ async def test(prompt: str, working_dir: str, ctx: Context) -> str:
         return json.dumps({"status": "error", "error": str(exc)}, indent=2)
 
     return _format_test_result(envelope)
+
+
+@app.tool()
+async def performance_debug(prompt: str, working_dir: str, ctx: Context) -> str:
+    """Profile a project's runtime performance and report where improvements
+    can be gained.  Measures wall time, CPU, memory, per-function hotspots,
+    call counts, and stack depth using native profiling tools (Python/Node/PHP).
+    Returns a measured performance report plus any files the profiled runs
+    touched.
+
+    Does NOT modify code — use the 'code' tool for changes.
+
+    Use for: finding performance bottlenecks, measuring wall/CPU/memory costs,
+    identifying hot functions, profiling memory allocations, tracing call counts
+    and recursion depth.
+
+    Args:
+        prompt: Natural-language profiling direction, e.g. "Profile
+            scripts/import.py and find why it is slow".
+        working_dir: Absolute path to the target project root.
+    """
+    try:
+        envelope = await _run_agent(
+            "performance_debug",
+            prompt,
+            working_dir,
+            ctx=ctx,
+            extra_args=["--activate-tools", ",".join(MODE_TOOLS["performance_debug"])],
+        )
+    except RuntimeError as exc:
+        return json.dumps({"status": "error", "error": str(exc)}, indent=2)
+
+    return _format_perf_result(envelope)
 
 
 # ---------------------------------------------------------------------------

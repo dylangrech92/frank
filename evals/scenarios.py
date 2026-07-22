@@ -417,6 +417,19 @@ SCENARIOS: list[dict] = [
         "inline": "verify_tool_wiring.py",
     },
     {
+        "name": "activate_tools_wiring",
+        "description": (
+            "Dispatch-level check (no LLM): the --activate-tools CLI flag "
+            "correctly activates profiling tools into the schemas array, "
+            "raises ValueError for unknown names, rejects unknown names via "
+            "subprocess with nonzero exit and stderr mentioning the bad name "
+            "before any LLM call, keeps the MCP MODE_INSTRUCTIONS and MODE_TOOLS "
+            "in sync, and confirms all four profiling tools are in the "
+            "repeat-cap exemption frozenset."
+        ),
+        "inline": "activate_tools_wiring.py",
+    },
+    {
         "name": "envelope_net_changes",
         "description": (
             "End-to-end check (stub LLM, no network): the result envelope's "
