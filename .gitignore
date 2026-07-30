@@ -11,6 +11,7 @@ config.json
 # Stats / telemetry
 stats.json
 stats.js
+issues.md
 
 # Ruff
 .ruff_cache/

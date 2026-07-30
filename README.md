@@ -130,6 +130,7 @@ Frank treats every IDE operation as an LLM-driveable tool. Every launch declares
 - **Memory**: `remember`, `recall`, `forget`, `record`
 - **Subagents**: `spawn_agents` (fan out independent tasks)
 - **Search**: `find` (ripgrep), `find_files`, `list_files`
+- **Harness feedback**: `report_issue` (log a tool or harness failure for the maintainer)
 
 **Per-project memory** lives in `<project>/.coding_agent/memory.db` — a SQLite store with vector search (sqlite-vec) and full-text search (FTS5). It records knowledge atoms (facts anchored to code with content hashes for staleness detection), plus a typed graph of decisions, rules, specs, and pivots. A local `gte-modernbert-base` ONNX model provides embeddings offline; if it can't load, recall degrades to FTS-only.
 

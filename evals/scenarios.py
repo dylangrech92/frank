@@ -468,6 +468,23 @@ SCENARIOS: list[dict] = [
         ),
         "inline": "envelope_net_changes.py",
     },
+    {
+        "name": "report_issue_contract",
+        "description": (
+            "Dispatch-level check (no LLM): report_issue reaches all four modes; "
+            "appends YAML-parseable entries to the install-dir log, creating it "
+            "when absent and preserving earlier entries byte-for-byte; multi-line "
+            "text becomes an indented '|2' block scalar so an embedded '---' line "
+            "cannot split the log, while ambiguous single-line text round-trips "
+            "quoted; the entry is stamped with the activated mode; filing a report "
+            "emits ZERO mutation events (never pollutes files_changed or arms the "
+            "verification gate); blank/missing/non-string input errors with a "
+            "kebab-case code and writes nothing; oversize text is capped and "
+            "flagged truncated; and the tool is neither parallel_safe nor exempt "
+            "from the repeat-call cap. Skips if PyYAML is absent."
+        ),
+        "inline": "report_issue_contract.py",
+    },
 ]
 
 

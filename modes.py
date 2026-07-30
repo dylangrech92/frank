@@ -27,6 +27,10 @@ class Mode:
 # model's manual memory channel while the automatic writes continued — a
 # false read-only guarantee. "Read-only" means the user's project tree, not
 # the agent's own sidecar database.
+#
+# report_issue is in every mode for the same reason: any mode's tools can fail,
+# so the channel for reporting a failure has to exist wherever the failure can
+# happen. It writes only to the install-dir issue log, never the project tree.
 _COMMON_TOOLS: tuple[str, ...] = (
     "read_file",
     "find",
@@ -38,6 +42,7 @@ _COMMON_TOOLS: tuple[str, ...] = (
     "remember",
     "record",
     "forget",
+    "report_issue",
 )
 
 RESEARCH_MODE = """\

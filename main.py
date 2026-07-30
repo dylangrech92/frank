@@ -182,6 +182,11 @@ SYSTEM_PROMPT = (
     "- When a tool call errors, fix the specific problem named in the error before "
     "retrying; never resend identical arguments. If the same call fails twice, "
     "change approach or tell the user.\n"
+    "- Your tools sometimes fail: a call reports success but nothing changed, a "
+    "result is empty or wrong, an instruction here contradicts another, or a "
+    "message names a tool you do not have. When you hit one, call report_issue "
+    "describing what you were doing and what went wrong, then carry on with the "
+    "task.\n"
     "- Tool outputs from earlier turns are pruned from your context; restate "
     "load-bearing paths, values, and excerpts in your replies so they survive.\n"
     "- Once you have what you need, stop calling tools and answer. When you change "
@@ -203,6 +208,10 @@ MANAGER: LSPManager | None = None
 
 # Module-level handle to the DAP debug manager so tools/repl can drive debugging.
 DEBUG_MANAGER: DAPManager | None = None
+
+# Module-level handle to the live session so tools can stamp which run they ran
+# in (project, model, session id) without it being passed through every call.
+SESSION: Session | None = None
 
 
 def _build_envelope(
@@ -359,6 +368,9 @@ def main() -> None:
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(ui.error(str(exc)), file=sys.stderr)
         sys.exit(1)
+
+    global SESSION
+    SESSION = session
 
     exit_code = 0
     try:
