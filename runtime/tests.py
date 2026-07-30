@@ -121,18 +121,6 @@ def detect_framework(
     return (None, "no test framework markers found")
 
 
-def _make_zeroed() -> dict:
-    """Return a zero-filled pytest result dict."""
-    return {
-        "framework": "pytest",
-        "degraded": True,
-        "tests": [],
-        "summary": {"passed": 0, "failed": 0, "skipped": 0, "errors": 0, "total": 0},
-        "output_tail": "",
-        "note": "internal error",
-    }
-
-
 def run_framework(
     framework: str,
     target_dir: str,
