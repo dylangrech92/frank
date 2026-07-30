@@ -170,7 +170,10 @@ def main() -> int:
     try:
         os.chdir(tmp)
         registry.discover()
-        registry.activate("record")  # tool must be loaded before dispatch will run it
+        # 'record' is a _COMMON_TOOLS member (modes.py) — present in every
+        # mode, so any mode makes dispatch() accept it; 'research' is the
+        # narrowest.
+        registry.activate_mode("research")
 
         ctx = get_memory(tmp)  # builds the throwaway store under tmp/.coding_agent
         conn = getattr(ctx.store, "conn")

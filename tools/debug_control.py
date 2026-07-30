@@ -37,7 +37,6 @@ class DebugControl(Tool):
     """Resume or step a paused debug session: continue, step_over, step_into, step_out, or pause."""
 
     name = "debug_control"
-    summary = 'Resume or step a paused debug session.'
     description = (
         'Resume or step a paused debug session: continue, step_over, step_into, step_out, or pause. '
         'Reports where execution stops next (or program termination).'

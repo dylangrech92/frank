@@ -19,7 +19,6 @@ class ReadOutput(Tool):
     """
 
     name = 'read_output'
-    summary = 'Drain the buffered stdout of a background process.'
     description = (
         'Drains the buffered stdout of a background process and returns it '
         'along with its running state and exit code. Output is cleared from '

@@ -65,6 +65,13 @@ def check_escalation() -> list[str]:
     disable_memory_hooks()
     import agent
     from session import STEER_PREFIX, Session
+    from tools import registry
+
+    # list_files is a _COMMON_TOOLS member (modes.py) — present in every
+    # mode — but dispatch still requires SOME mode active. 'research' is the
+    # narrowest fit for this read-only scenario.
+    saved_mode = registry.current_mode()
+    registry.activate_mode("research")
 
     failures: list[str] = []
     cap = agent._REPEAT_CALL_CAP + agent._BLOCKED_STREAK_CAP + 2
@@ -76,8 +83,8 @@ def check_escalation() -> list[str]:
     consolidate_calls: list[tuple] = []
     try:
         session = Session(tmp, "test-model", "You are a test agent.")
-        # A single always-identical read-only call (list_files is PINNED and not
-        # in _REPEAT_CAP_EXEMPT, so it is subject to the hard cap).
+        # A single always-identical read-only call (list_files is in every
+        # mode and not in _REPEAT_CAP_EXEMPT, so it is subject to the hard cap).
         client = _StubClient([_same_call_response("list_files", {"path": "."})])
 
         # Record the end-of-turn consolidation hook at the module seam
@@ -132,6 +139,8 @@ def check_escalation() -> list[str]:
     finally:
         agent.consolidation_maybe_extract = original_consolidate
         os.chdir(original_cwd)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     return failures
 
@@ -150,11 +159,11 @@ def _drive_giveup(tmp_prefix: str, prefix_script: list):
     from session import Session
     from tools import registry
 
-    # create_file / run_command are catalog tools (not PINNED), so dispatch would
-    # reject them not-loaded — activate them exactly as a real session would after
-    # a load_tool call, so the prefix genuinely mutates and verifies.
-    registry.activate("create_file")
-    registry.activate("run_command")
+    # create_file / run_command are both declared by 'code' mode (modes.py);
+    # list_files is a _COMMON_TOOLS member present in every mode too, so
+    # 'code' covers the whole prefix + trailing escalation call.
+    saved_mode = registry.current_mode()
+    registry.activate_mode("code")
 
     original_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix=tmp_prefix)
@@ -174,6 +183,8 @@ def _drive_giveup(tmp_prefix: str, prefix_script: list):
     finally:
         agent.consolidation_maybe_extract = original_consolidate
         os.chdir(original_cwd)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
 
 def check_giveup_verified_work() -> list[str]:

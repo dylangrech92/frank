@@ -239,7 +239,6 @@ class ProfileMemory(Tool):
     """
 
     name = 'profile_memory'
-    summary = 'Per-allocation-site memory profiling for python, node, and php.'
     description = (
         'Profiles a target script (or snippet) and renders a top-N table of '
         'memory allocations.  Supports python (tracemalloc), node (V8 '

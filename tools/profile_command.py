@@ -44,7 +44,6 @@ class ProfileCommand(Tool):
     """
 
     name = 'profile_command'
-    summary = 'Run a shell command under resource measurement.'
     description = (
         'Runs a shell command under measurement and reports wall time, user/sys '
         'CPU, peak RSS, sampled process-tree RSS/CPU, and process count. '

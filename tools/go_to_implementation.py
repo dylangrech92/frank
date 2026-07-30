@@ -24,7 +24,6 @@ class GoToImplementation(Tool):
 
     name = 'go_to_implementation'
     parallel_safe = True  # read-only LSP query; doc-sync is lock-guarded (F3)
-    summary = 'Jump to the implementation of the symbol at a position.'
     description = (
         'Navigate to the implementation of the symbol at a position in a file. '
         'Requires path, line (1-based), and column (1-based).'

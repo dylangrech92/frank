@@ -20,7 +20,6 @@ class CodeActions(Tool):
     """
 
     name = 'code_actions'
-    summary = 'List/apply code actions (quick fixes, refactorings).'
     description = (
         'List code actions (quick fixes, organize imports, refactorings) '
         'available for a file or line range, or apply one by passing its '

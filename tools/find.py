@@ -26,7 +26,6 @@ class Find(Tool):
     """
 
     name = 'find'
-    summary = 'Search file contents across the project (ripgrep).'
     description = (
         'Searches file CONTENTS across the project using ripgrep, returning matching '
         'lines with file and line number. Use find_files to search by filename/glob; '

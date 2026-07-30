@@ -1,18 +1,19 @@
 """Dispatch-level contract eval for the four profiling tools (no LLM).
 
 Drives the real production hot path — ``tools.registry.dispatch`` — exactly as
-``handle_user_message`` does per tool call, exercising the not-loaded/PINNED
-gate, argument validation, real subprocess execution, and the shared
-``tools._snapshot`` mutation-truthfulness machinery together, not any tool
-class in isolation. Zero mocks: every snippet below is written to a real OS
-temp file (or passed inline) and executed by a real ``sys.executable`` /
-``node`` / ``php`` subprocess against the real project root as cwd, exactly as
-a live model turn would.
+``handle_user_message`` does per tool call, exercising the mode gate, argument
+validation, real subprocess execution, and the shared ``tools._snapshot``
+mutation-truthfulness machinery together, not any tool class in isolation.
+Zero mocks: every snippet below is written to a real OS temp file (or passed
+inline) and executed by a real ``sys.executable`` / ``node`` / ``php``
+subprocess against the real project root as cwd, exactly as a live model turn
+would.
 
 Covers, for ``profile_command``, ``profile_hotspots``, ``profile_memory``, and
 ``trace_execution``:
 
-    1. the ``not-loaded`` gate rejects a call before ``load_tool`` activation;
+    1. the ``not-in-mode`` gate rejects a call before any mode is active
+       (run before ``registry.activate_mode()`` is ever called this process);
     2. ``profile_command``'s happy path, deny-list, and timeout contracts;
     3. ``profile_hotspots`` python: exact ``ncalls`` for a hot function;
     4. ``profile_memory`` python: a ``Peak:`` summary and a per-site table;
@@ -147,18 +148,18 @@ _PHP_HOTSPOTS_SNIPPET = (
 
 
 # ---------------------------------------------------------------------------
-# 1. not-loaded gate
+# 1. not-in-mode gate
 # ---------------------------------------------------------------------------
 
 
-def check_not_loaded_gate() -> list[str]:
-    """Before any activation, profile_command must be rejected with code='not-loaded'."""
+def check_not_in_mode_gate() -> list[str]:
+    """Before any mode is active, profile_command must be rejected with code='not-in-mode'."""
     failures: list[str] = []
     result = _dispatch('profile_command', {'cmd': f'{PY} -c "print(1)"'})
     if result.status != 'error':
-        failures.append(f"not-loaded gate: expected status='error', got {result.status!r}")
-    if result.code != 'not-loaded':
-        failures.append(f"not-loaded gate: expected code='not-loaded', got {result.code!r}")
+        failures.append(f"not-in-mode gate: expected status='error', got {result.status!r}")
+    if result.code != 'not-in-mode':
+        failures.append(f"not-in-mode gate: expected code='not-in-mode', got {result.code!r}")
     return failures
 
 
@@ -476,9 +477,7 @@ def main() -> int:
     # invoke this script directly.
     os.chdir(REPO_ROOT)
 
-    from tools.registry import activate, discover
-
-    discover()
+    from tools import registry
 
     all_failures: list[str] = []
 
@@ -492,11 +491,10 @@ def main() -> int:
         else:
             print(f"PASS: {description}")
 
-    # 1. not-loaded gate, then activate all four tools (mirrors a real model
-    # turn: load_tool.run() -> registry.activate()).
-    _run("not-loaded gate rejects profile_command before activation", check_not_loaded_gate)
-    for name in ('profile_command', 'profile_hotspots', 'profile_memory', 'trace_execution'):
-        activate(name)
+    # 1. not-in-mode gate (no mode active yet), then activate 'performance_debug'
+    # — the mode that declares all four profiling tools (modes.py).
+    _run("not-in-mode gate rejects profile_command before any mode is active", check_not_in_mode_gate)
+    registry.activate_mode('performance_debug')
 
     # 2. profile_command
     _run("profile_command happy path reports wall/cpu/peak rss", check_profile_command_happy)

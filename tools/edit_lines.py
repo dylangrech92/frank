@@ -25,7 +25,6 @@ class EditLines(Tool):
     """
 
     name = 'edit_lines'
-    summary = 'Replace a 1-based inclusive line range of a file with new text.'
     description = (
         'Replaces lines start_line..end_line (1-based, inclusive) of a file with new_text. '
         'To INSERT text before an existing line N without deleting anything, set start_line=N '

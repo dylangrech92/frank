@@ -41,7 +41,6 @@ class Record(Tool):
     """Record one typed node (rule/decision/pivot/spec) into the project data graph."""
 
     name = "record"
-    summary = "Record a rule/decision/pivot/spec into the project graph memory."
     description = (
         "Record durable project knowledge as one typed node. kind is one of:\n"
         "- rule: an always-enforced constraint (title = name, body = the constraint); "

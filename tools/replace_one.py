@@ -24,7 +24,6 @@ class ReplaceOne(Tool):
     """
 
     name = 'replace_one'
-    summary = 'Replace one unique occurrence of a literal string in a file.'
     description = (
         'Replaces exactly one occurrence of a literal string in a single file. '
         'Refuses when the match is not unique. The search string must be the raw file text — '

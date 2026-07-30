@@ -78,10 +78,15 @@ _CANNED_SUMMARY = (
 
 _FINAL_ANSWER = "Consolidated analysis complete: the fixture helpers compose cleanly."
 
-# A digest larger than any tiny test window — the "useless summarizer" installs
-# it so no amount of folding can bring the assembled context under the cap,
-# forcing the thrash guard and then the free force_fold last resort.
-_OVERSIZED_SUMMARY = _FILLER * 6
+# A digest larger than any cap this scenario uses, on its own — the "useless
+# summarizer" installs it so no amount of folding can bring the assembled
+# context under the cap (the digest alone already exceeds it), forcing the
+# thrash guard and then the free force_fold last resort. Sized well above
+# check_force_fold_overflow's cap (measured ~8x margin at the constants
+# below), not just relative to _FILLER, since tool-schema overhead is now a
+# large fixed part of every estimate and only the message-side of the budget
+# is what compaction can ever shrink.
+_OVERSIZED_SUMMARY = _FILLER * 16
 
 
 def _make_fixtures(project_dir: Path, n: int) -> list[str]:
@@ -150,10 +155,27 @@ def check_normal_fold() -> list[str]:
     disable_memory_hooks()
     import agent
     import compaction
+    import tools.registry as registry
     from session import Session
 
+    # agent.handle_user_message dispatches read_file through the real
+    # registry, which requires an active mode (registry.schemas() raises
+    # RuntimeError otherwise). 'research' is the narrowest mode that still
+    # contains read_file (a _COMMON_TOOLS member present in every mode) —
+    # this scenario is read-only by construction.
+    saved_mode = registry.current_mode()
+    registry.activate_mode("research")
+
     failures: list[str] = []
-    window = 4000
+    # Tool schemas are counted in every context estimate (compaction.py:
+    # "Tool schemas are always counted — they occupy real context on every
+    # call"), and mode-gating now loads a mode's *entire* declared tool set
+    # for the whole process rather than a small catalog-selected subset —
+    # 'research' alone is already several thousand tokens of schema. window
+    # must clear that fixed floor with real room to spare for several filler
+    # turns, or the very first cap check fails before the scenario's
+    # intended flow (several turns, then a fold) ever runs.
+    window = 12000
     comp_cfg = {
         "reserve_ratio": 0.1,
         "reserve_min_tokens": 500,
@@ -224,6 +246,8 @@ def check_normal_fold() -> list[str]:
             )
     finally:
         os.chdir(original_cwd)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     return failures
 
@@ -232,14 +256,21 @@ def check_force_fold_overflow() -> list[str]:
     """A useless summarizer thrashes, force_fold engages, and the turn still ends."""
     disable_memory_hooks()
     import agent
+    import tools.registry as registry
     from session import Session
+
+    # See check_normal_fold: agent.handle_user_message needs an active mode
+    # to dispatch read_file. 'research' matches this scenario's read-only shape.
+    saved_mode = registry.current_mode()
+    registry.activate_mode("research")
 
     failures: list[str] = []
     # A larger window than the normal scenario so several full turns accumulate
     # (transcript length past keep_recent) before the cap is crossed — otherwise
     # compaction would trigger with too few messages to fold and the summarizer
-    # loop would never run.
-    window = 6500
+    # loop would never run. Also needs the same fixed-schema-floor headroom as
+    # check_normal_fold (see its comment) on top of that.
+    window = 18000
     # keep_recent (6) deliberately larger than force_keep_recent (2): the normal
     # fold leaves a tail force_fold can still shrink, so the free last resort has
     # room to engage after the summarizer loop thrashes.
@@ -291,6 +322,8 @@ def check_force_fold_overflow() -> list[str]:
             )
     finally:
         os.chdir(original_cwd)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     return failures
 

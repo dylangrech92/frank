@@ -108,7 +108,6 @@ class Git(Tool):
     """
 
     name = 'git'
-    summary = 'Run an allow-listed git subcommand in the project.'
     description = (
         'Runs a restricted set of git subcommands inside the project root. '
         'Only whitelisted subcommands are allowed; destructive operations (reset, clean, '

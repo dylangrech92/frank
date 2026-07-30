@@ -27,7 +27,6 @@ class ReplaceMany(Tool):
     """
 
     name = 'replace_many'
-    summary = 'Replace every occurrence of a literal string across the project.'
     description = (
         'Replaces every occurrence of a literal string across the project and reports '
         'per-file replacement counts. When a ``glob`` pattern is provided, only file names '

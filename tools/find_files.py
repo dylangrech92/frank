@@ -35,7 +35,6 @@ class FindFiles(Tool):
     """
 
     name = 'find_files'
-    summary = 'Find files by name/glob pattern (gitignore-aware).'
     description = (
         'Find files by NAME/glob pattern (gitignore-aware), returning paths '
         'relative to the project root. Use find to search file contents, '

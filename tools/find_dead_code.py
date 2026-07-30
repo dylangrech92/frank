@@ -74,7 +74,6 @@ class FindDeadCode(Tool):
 
     name = 'find_dead_code'
     parallel_safe = True  # spawns a read-only subprocess
-    summary = 'Sweep a Python file/project for unused/unreachable code (vulture).'
     description = (
         'Sweeps a Python file or the whole project for dead code using vulture. '
         'Findings are reported as potentially dead — verify before deleting. '

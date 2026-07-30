@@ -7,6 +7,17 @@ Each entry in ``SCENARIOS`` is a plain dict:
     description: one-line human summary, printed in --list output.
     turns:       list of single-line prompt strings piped to the agent's
                  stdin, one per line, in order (EOF after the last one).
+    mode:        required alongside 'turns' — one of modes.mode_names(),
+                 passed as the child process's --mode. --mode is mandatory
+                 for every agent-launching run, so a live (non-inline)
+                 scenario without a valid 'mode' fails loudly at import time
+                 (see run.py's _validate_scenarios) rather than silently
+                 defaulting or crashing main.py's argv parsing at run time.
+                 Choose the mode that actually carries the tool(s) the
+                 scenario's turns exercise (e.g. a scenario that creates
+                 files needs 'code'; a pure read needs any mode, since
+                 read_file is common — 'research' is the safe read-only
+                 default; web_search/web_read exist only in 'research').
     config:      'default' to run unmodified against the repo's config.json,
                  or a dict deep-merged on top of it (e.g. to shrink
                  llm.context_limit so compaction/oversize paths trigger).
@@ -66,17 +77,6 @@ def is_even(n):
 
 SCENARIOS: list[dict] = [
     {
-        "name": "load_tool_gate",
-        "description": (
-            "dispatch-level gate contract: a catalog tool is rejected with "
-            "code=not-loaded until load_tool activates it; PINNED tools are "
-            "callable immediately and load_tool on one is benign (inline — "
-            "a protocol-following model loads before calling, so the "
-            "rejection never appears on a live transcript)."
-        ),
-        "inline": "load_tool_gate.py",
-    },
-    {
         "name": "json_multiline",
         "description": (
             "Multi-line file content in a tool call survives JSON parsing "
@@ -88,6 +88,7 @@ SCENARIOS: list[dict] = [
             'blank line and the attribution "- qwen". Then read it back '
             "to confirm the contents.",
         ],
+        "mode": "code",
         "config": "default",
         "setup": {},
         "checks": [
@@ -106,6 +107,7 @@ SCENARIOS: list[dict] = [
             "Use the run_command tool to run exactly this shell command: "
             "cat bigfile.py — then tell me what happened.",
         ],
+        "mode": "code",
         "config": {
             "llm": {"context_limit": 9000},
             "compaction": {"reserve_ratio": 0.1, "reserve_min_tokens": 500},
@@ -130,6 +132,7 @@ SCENARIOS: list[dict] = [
             "Read bigfile.py in full and tell me what the module does "
             "overall in 2-3 sentences.",
         ],
+        "mode": "research",
         "config": {
             "llm": {"context_limit": 9000},
             "compaction": {"reserve_ratio": 0.1, "reserve_min_tokens": 500},
@@ -165,6 +168,7 @@ SCENARIOS: list[dict] = [
             "Plan me a three-course dinner menu for six guests this "
             "weekend, with a shopping list.",
         ],
+        "mode": "research",
         "config": "default",
         "setup": {},
         "checks": [
@@ -189,6 +193,7 @@ SCENARIOS: list[dict] = [
             "simplify mathlib.py. Keep it strictly relevant to this "
             "codebase.",
         ],
+        "mode": "research",
         "config": "default",
         "setup": {"mathlib.py": MATHLIB_PY},
         "checks": [
@@ -405,14 +410,16 @@ SCENARIOS: list[dict] = [
     {
         "name": "verify_tool_wiring",
         "description": (
-            "End-to-end check (stub LLM, no network): when the reproduce-before-"
-            "edit steer fires, the harness activates the verification tool it "
-            "names, so a scripted model can call run_command DIRECTLY the next "
-            "round (no load_tool) and it dispatches — recorded in "
-            "verification_runs status=success, never a not-loaded error; a "
-            "read-only turn never fires the steer and leaves run_command "
-            "inactive; and activating the verification tools twice never "
-            "duplicates a schema entry."
+            "End-to-end check (stub LLM, no network): every steer the harness "
+            "can fire names only tools present in the active mode — code "
+            "mode's post-mutation reproduce-before-edit nudge never names "
+            "run_tests (absent from code mode by design); "
+            "agent._available_verification_tools() returns exactly the "
+            "verification tools each mode actually carries (research: none, "
+            "code: run_command+verify_scratch, test: "
+            "run_command+run_tests+verify_scratch, performance_debug: "
+            "run_command); and a mode carrying zero verification tools never "
+            "fires the nudge at all rather than naming a tool it cannot call."
         ),
         "inline": "verify_tool_wiring.py",
     },
@@ -428,17 +435,24 @@ SCENARIOS: list[dict] = [
         "inline": "profile_tools_contract.py",
     },
     {
-        "name": "activate_tools_wiring",
+        "name": "mode_wiring",
         "description": (
-            "Dispatch-level check (no LLM): the --activate-tools CLI flag "
-            "correctly activates profiling tools into the schemas array, "
-            "raises ValueError for unknown names, rejects unknown names via "
-            "subprocess with nonzero exit and stderr mentioning the bad name "
-            "before any LLM call, keeps the MCP MODE_INSTRUCTIONS and MODE_TOOLS "
-            "in sync, and confirms all four profiling tools are in the "
-            "repeat-cap exemption frozenset."
+            "Dispatch-level check (no LLM): the --mode CLI flag is mandatory — "
+            "missing or unknown values fail fast, before any LLM call; "
+            "activate_mode(m) + schemas() is exactly mode m's declared tool set "
+            "for every mode, no extras or duplicates; dispatch() of an "
+            "out-of-mode tool returns code=not-in-mode and never executes "
+            "(proven by a real absent side-effect file); each mode's prose "
+            "recommendations are a subset of its declared tools while its "
+            "explicitly forbidden tools (e.g. code mode's run_tests) are "
+            "absent from that mode's tools, and mcp_server.py's four literal "
+            "mode strings are valid modes.MODES keys; spawn_agents propagates "
+            "the PARENT's own active mode to each child's --mode argv (a real "
+            "subprocess, not assumed); every live scenario's constructed argv "
+            "carries a valid --mode; and each mode's schema token cost is "
+            "reported."
         ),
-        "inline": "activate_tools_wiring.py",
+        "inline": "mode_wiring.py",
     },
     {
         "name": "envelope_net_changes",

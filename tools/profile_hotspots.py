@@ -248,7 +248,6 @@ class ProfileHotspots(Tool):
     """
 
     name = 'profile_hotspots'
-    summary = 'Per-function CPU hotspot profiling for python, node, and php.'
     description = (
         'Profiles a target script (or snippet) and renders a top-N table of '
         'hot functions with measured self/cumulative times.  Supports python '

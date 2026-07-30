@@ -135,12 +135,12 @@ def _run(project: Path, events: list[dict]) -> None:
 
 def main() -> int:
     from tools import _sandbox
-    from tools.registry import activate, discover
+    from tools import registry
 
-    discover()
-    # dispatch() refuses tools that are not PINNED or loaded via load_tool;
-    # activate() is the exact production call load_tool.run() makes.
-    activate('run_command')
+    # run_command is declared by 'code' mode (modes.py) — dispatch() refuses
+    # any tool outside the active mode's fixed set.
+    saved_mode = registry.current_mode()
+    registry.activate_mode('code')
 
     events: list[dict] = []
 
@@ -167,6 +167,8 @@ def main() -> int:
             _sandbox.MUTATION_SUBSCRIBERS.remove(_recorder)
         os.chdir(prev_cwd)
         shutil.rmtree(tmp, ignore_errors=True)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     print("PASS: run_command publishes snapshot-diff mutation events for created/changed/deleted files, prunes dotdirs and caches, stays silent on reads, and fires on the timeout path")
     return 0

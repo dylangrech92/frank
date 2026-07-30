@@ -21,7 +21,6 @@ class WebRead(Tool):
     """
 
     name = "web_read"
-    summary = 'Fetch a public URL and return its readable text.'
     description = (
         "Fetch a public http(s) URL and return its readable text content "
         "(HTML is cleaned and extracted). Private and internal addresses are blocked."

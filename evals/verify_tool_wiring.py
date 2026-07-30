@@ -1,47 +1,49 @@
-"""Verify-tool wiring check, end-to-end through the real turn loop.
+"""Verify-tool wiring check: harness steers name only tools the active mode carries.
 
 Two harness steers tell the model to verify its edits by name — the reproduce-
-before-edit steer names ``run_command``; the H1 verification nudge names
-``verify_scratch`` / ``run_tests`` / ``run_command``. Those tools are catalog-
-gated: they only enter the request's tools array once activated via ``load_tool``.
-Before this change a steer fired without activating them, demanding a tool the
-model could not call. The wiring connects the two fire sites to ``agent._activate_
-verification_tools()`` so the very next round's ``schemas()`` carries the tools.
+before-edit steer names ``run_command`` directly; the H1 post-mutation
+verification nudge names whichever subset of run_command/run_tests/
+verify_scratch the active mode's ``agent._available_verification_tools()``
+reports. Tools are now a static per-mode set fixed for the life of the process
+(``registry.activate_mode``, ``modes.py``) — there is no more load_tool-style
+dynamic activation, so a steer naming a tool absent from the active mode would
+hand the model an uncallable instruction with no rescue path. This script
+proves the opposite: every steer only ever names tools the active mode
+actually carries, and the tool it does name is genuinely callable end to end.
 
 This script drives the *real* production hot path (``agent.handle_user_message``
-with a stub LLM client, no network) and asserts:
+with a stub LLM client, no network) plus direct calls into the real
+``agent``/``tools.registry`` module functions, and asserts:
 
-a. Steer-fire activates — a scripted model that edits a file with NO prior
-   verification run gets the reproduce-before-edit steer, and can then call
-   ``run_command`` DIRECTLY in the next round with no ``load_tool`` in between:
-   the call dispatches (verification_runs records it status=success, not a
-   not-loaded error). run_command is NOT pre-activated in this scenario's setup —
-   the point is that the steer fire activates it.
+a. ``agent._available_verification_tools()`` returns exactly the documented
+   per-mode set: research -> [] (no mutating tools, nothing to verify); code
+   -> ['run_command', 'verify_scratch'] (code mode's own instructions forbid
+   running the suite, so never run_tests); test ->
+   ['run_command', 'run_tests', 'verify_scratch'] (all three); performance_debug
+   -> ['run_command'] (profiling tools are not verification tools).
 
-b. No-steer, no-activation — a turn that only reads a file (read_file is PINNED;
-   no mutation, so the repro steer never fires) leaves ``run_command`` inactive
-   afterward. The happy path is untouched.
+b. The H1 nudge text built from each mode's available list names exactly
+   those tools and nothing else — code mode's nudge never mentions run_tests
+   or run_tests' clause text; test mode's does; performance_debug's names only
+   run_command.
 
-c. Idempotence — calling ``agent._activate_verification_tools()`` twice raises
-   nothing and leaves each verification tool in ``schemas()`` exactly once (no
-   duplicate schema entries).
+c. End-to-end through the real turn loop, in 'code' mode: an edit with zero
+   prior verification runs fires the reproduce-before-edit steer, and the very
+   next round calls run_command DIRECTLY — it dispatches successfully
+   (verification_runs records status=success), proving the steer named a tool
+   that was already callable (mode-static from process start), not one that
+   needed a since-removed per-call activation step.
 
-Registry-reset mechanism: the tools registry is module-global and its active set
-(``tools.registry._active``) is the documented single-session home for loaded
-tools, with no public deactivate API. Inline evals already run each as their own
-subprocess (evals/run.py), so cross-scenario contamination cannot happen; but the
-three checks below share one process, and check (a) intentionally activates
-run_command. So each check first reaches into ``registry._active`` to clear the
-verification tools (mirroring how these evals already reach transcript internals
-like ``session._messages``), establishing a clean precondition, and restores the
-original active set in a finally. Check (a) additionally runs first for good
-measure. This is the clean mechanism the registry allows.
+d. A read-only turn in the same mode never fires the steer and never touches
+   verification_runs — the happy path is undisturbed.
 
 Exits 0 on success, prints ``FAIL: <reason>`` to stderr and exits 1 otherwise.
-Runs with the repo root on ``sys.path`` (evals/run.py inserts it before exec'ing
-this file); it chdir's into its own throwaway temp project dir (create_file and
-run_command resolve against cwd) and restores the cwd afterward, disables memory
-side effects for the run, and touches no repo files.
+Runs with the repo root on ``sys.path`` (evals/run.py inserts it before
+exec'ing this file); (c)/(d) chdir into their own throwaway temp project dir
+(create_file/run_command resolve against cwd) and restore the cwd afterward,
+disable memory side effects for the run, and touch no repo files. Each check
+restores whichever mode it found active in a finally, so the four checks
+sharing one process never contaminate each other's precondition.
 """
 
 from __future__ import annotations
@@ -81,29 +83,90 @@ def _final_answer_response(text: str):
     return factory
 
 
-def _reset_verification_tools(registry) -> set[str]:
-    """Clear the verification tools from the active set; return the prior set.
-
-    Establishes a clean precondition so a check's assertions do not observe a
-    verification tool another check activated earlier in this same process. The
-    caller restores the returned snapshot in a finally.
-    """
+def check_available_verification_tools_per_mode() -> list[str]:
+    """a. _available_verification_tools() matches the documented per-mode set."""
     import agent
+    import tools.registry as registry
 
-    saved = set(registry._active)
-    for name in agent._VERIFICATION_TOOLS:
-        registry._active.discard(name)
-    return saved
+    failures: list[str] = []
+    expected = {
+        "research": [],
+        "code": ["run_command", "verify_scratch"],
+        "test": ["run_command", "run_tests", "verify_scratch"],
+        "performance_debug": ["run_command"],
+    }
+
+    saved_mode = registry.current_mode()
+    try:
+        for mode_name, expected_tools in expected.items():
+            registry.activate_mode(mode_name)
+            available = agent._available_verification_tools()
+            if available != expected_tools:
+                failures.append(
+                    f"mode {mode_name!r}: expected _available_verification_tools() "
+                    f"== {expected_tools!r}, got {available!r}"
+                )
+    finally:
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
+
+    return failures
 
 
-def _restore_active(registry, saved: set[str]) -> None:
-    """Restore ``registry._active`` to the snapshot taken by _reset_verification_tools."""
-    registry._active.clear()
-    registry._active.update(saved)
+def check_nudge_names_only_available_tools() -> list[str]:
+    """b. The H1 nudge text names exactly the active mode's available tools."""
+    import agent
+    import tools.registry as registry
+
+    failures: list[str] = []
+    saved_mode = registry.current_mode()
+    try:
+        registry.activate_mode("code")
+        code_text = agent._verification_nudge_text(agent._available_verification_tools())
+        if "run_tests" in code_text:
+            failures.append(
+                f"code mode's H1 nudge names run_tests, which code mode does not "
+                f"carry: {code_text!r}"
+            )
+        if "run_command" not in code_text:
+            failures.append(f"code mode's H1 nudge does not name run_command: {code_text!r}")
+        if "verify_scratch" not in code_text:
+            failures.append(f"code mode's H1 nudge does not name verify_scratch: {code_text!r}")
+
+        registry.activate_mode("test")
+        test_text = agent._verification_nudge_text(agent._available_verification_tools())
+        if "run_tests" not in test_text:
+            failures.append(f"test mode's H1 nudge does not name run_tests: {test_text!r}")
+        if "run_command" not in test_text:
+            failures.append(f"test mode's H1 nudge does not name run_command: {test_text!r}")
+        if "verify_scratch" not in test_text:
+            failures.append(f"test mode's H1 nudge does not name verify_scratch: {test_text!r}")
+
+        registry.activate_mode("performance_debug")
+        perf_text = agent._verification_nudge_text(agent._available_verification_tools())
+        if "run_tests" in perf_text:
+            failures.append(
+                f"performance_debug mode's H1 nudge names run_tests, which it "
+                f"does not carry: {perf_text!r}"
+            )
+        if "verify_scratch" in perf_text:
+            failures.append(
+                f"performance_debug mode's H1 nudge names verify_scratch, which "
+                f"it does not carry: {perf_text!r}"
+            )
+        if "run_command" not in perf_text:
+            failures.append(
+                f"performance_debug mode's H1 nudge does not name run_command: {perf_text!r}"
+            )
+    finally:
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
+
+    return failures
 
 
-def check_steer_fire_activates() -> list[str]:
-    """a. The repro steer fire activates run_command so the next round can call it."""
+def check_repro_steer_fires_and_tool_is_callable() -> list[str]:
+    """c. In code mode, the repro steer fires and names a tool already callable."""
     import agent
     import tools.registry as registry
     from evals._stub import _StubClient, disable_memory_hooks
@@ -112,25 +175,20 @@ def check_steer_fire_activates() -> list[str]:
 
     failures: list[str] = []
 
-    saved = _reset_verification_tools(registry)
-    # create_file is a catalog tool; a live model activates it via load_tool
-    # before use. Do the same so the round-1 edit dispatches. run_command is
-    # deliberately NOT activated here — the steer fire must activate it.
-    registry.activate("create_file")
+    # create_file and run_command are both declared by 'code' mode (modes.py)
+    # from the start of the process — mode-gating has no per-tool activation
+    # step, so run_command is already callable in round 2 with nothing needing
+    # to fire at round 1's steer to unlock it.
+    saved_mode = registry.current_mode()
+    registry.activate_mode("code")
 
     original_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix="verify-wiring-fires-")
     os.chdir(tmp)
     try:
-        if registry.is_loaded("run_command"):
-            failures.append(
-                "precondition broken: run_command was already loaded before the "
-                "steer fired (reset mechanism failed)"
-            )
-
         session = Session(tmp, "test-model", "You are a test agent.")
-        # Round 1 edits (no run yet -> repro steer fires -> activates run_command);
-        # round 2 calls run_command DIRECTLY (no load_tool); round 3 ends the turn.
+        # Round 1 edits (no run yet -> repro steer fires); round 2 calls
+        # run_command DIRECTLY; round 3 ends the turn.
         script = [
             _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
             _tool_call_response("run_command", {"cmd": "echo verified"}),
@@ -147,47 +205,48 @@ def check_steer_fire_activates() -> list[str]:
 
         if "repro-steer: fired" not in stderr:
             failures.append(
-                "reproduce-before-edit steer did not fire — check (a) premise "
+                "reproduce-before-edit steer did not fire — check (c) premise "
                 "(an unverified edit steers) is not met"
             )
 
         # The direct run_command call must have dispatched: verification_runs
-        # records it with status success (a not-loaded rejection would record
+        # records it with status success (a not-in-mode rejection would record
         # status=error instead, because the recording branch still fires).
         runs = session.turn_report["verification_runs"]
         rc_runs = [r for r in runs if r.get("tool") == "run_command"]
         if not rc_runs:
             failures.append(
                 "run_command produced no verification_runs entry — the direct "
-                "call after the steer never reached dispatch"
+                "call named by the steer never reached dispatch"
             )
         elif not any(r.get("status") == "success" for r in rc_runs):
             failures.append(
                 f"run_command was called directly after the steer but did not "
                 f"succeed (statuses: {[r.get('status') for r in rc_runs]}) — the "
-                f"steer fire did not activate the tool it names"
+                f"steer named a tool that was not actually callable"
             )
 
-        # Belt-and-braces: no tool-result row may carry a not-loaded rejection.
+        # Belt-and-braces: no tool-result row may carry a not-in-mode rejection.
         rc_rows = [
             m
             for m in session._messages
             if m.get("role") == "tool" and m.get("name") == "run_command"
         ]
-        if any("not-loaded" in str(m.get("content", "")) for m in rc_rows):
+        if any("not-in-mode" in str(m.get("content", "")) for m in rc_rows):
             failures.append(
-                "a run_command tool result was a not-loaded rejection — the tool "
-                "was not activated by the steer fire"
+                "a run_command tool result was a not-in-mode rejection — the "
+                "steer named a tool outside the active mode"
             )
     finally:
         os.chdir(original_cwd)
-        _restore_active(registry, saved)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     return failures
 
 
-def check_no_steer_no_activation() -> list[str]:
-    """b. A read-only turn never fires the steer and leaves run_command inactive."""
+def check_no_steer_on_readonly_turn() -> list[str]:
+    """d. A read-only turn never fires the repro steer or touches verification_runs."""
     import agent
     import tools.registry as registry
     from evals._stub import _StubClient, disable_memory_hooks
@@ -196,13 +255,13 @@ def check_no_steer_no_activation() -> list[str]:
 
     failures: list[str] = []
 
-    saved = _reset_verification_tools(registry)
+    saved_mode = registry.current_mode()
+    registry.activate_mode("code")
 
     original_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix="verify-wiring-noop-")
     os.chdir(tmp)
     try:
-        # A real file to read so read_file (PINNED, no activation needed) succeeds.
         with open(os.path.join(tmp, "readme.txt"), "w", encoding="utf-8") as fh:
             fh.write("hello\n")
 
@@ -225,48 +284,15 @@ def check_no_steer_no_activation() -> list[str]:
                 "reproduce-before-edit steer fired on a read-only turn (no "
                 "mutation happened) — the happy path was disturbed"
             )
-        if registry.is_loaded("run_command"):
+        if session.turn_report["verification_runs"]:
             failures.append(
-                "run_command became active after a read-only turn — verification "
-                "tools must only activate when a verify steer fires"
+                f"verification_runs is non-empty after a read-only turn: "
+                f"{session.turn_report['verification_runs']!r}"
             )
     finally:
         os.chdir(original_cwd)
-        _restore_active(registry, saved)
-
-    return failures
-
-
-def check_idempotence() -> list[str]:
-    """c. Activating twice raises nothing and never duplicates a schema entry."""
-    import agent
-    import tools.registry as registry
-
-    failures: list[str] = []
-
-    saved = _reset_verification_tools(registry)
-    try:
-        agent._activate_verification_tools()
-        agent._activate_verification_tools()
-
-        names = [
-            s.get("function", {}).get("name")
-            for s in registry.schemas()
-        ]
-        for tool in sorted(agent._VERIFICATION_TOOLS):
-            count = names.count(tool)
-            if count != 1:
-                failures.append(
-                    f"{tool} appears {count} time(s) in the schemas array after "
-                    f"activating twice (expected exactly 1 — duplicate or missing)"
-                )
-    except Exception as exc:
-        failures.append(
-            f"_activate_verification_tools raised on repeat call: "
-            f"{type(exc).__name__}: {exc}"
-        )
-    finally:
-        _restore_active(registry, saved)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     return failures
 
@@ -274,9 +300,10 @@ def check_idempotence() -> list[str]:
 def main() -> int:
     all_failures: list[str] = []
     for label, fn in (
-        ("steer-fire-activates", check_steer_fire_activates),
-        ("no-steer-no-activation", check_no_steer_no_activation),
-        ("idempotence", check_idempotence),
+        ("available-verification-tools-per-mode", check_available_verification_tools_per_mode),
+        ("nudge-names-only-available-tools", check_nudge_names_only_available_tools),
+        ("repro-steer-fires-and-tool-is-callable", check_repro_steer_fires_and_tool_is_callable),
+        ("no-steer-on-readonly-turn", check_no_steer_on_readonly_turn),
     ):
         try:
             failures = fn()
@@ -289,9 +316,12 @@ def main() -> int:
     if all_failures:
         return 1
     print(
-        "PASS: a fired verify steer activates the tools it names (run_command "
-        "callable directly next round); a read-only turn leaves them inactive; "
-        "and activating twice never duplicates a schema entry"
+        "PASS: _available_verification_tools() matches the documented per-mode "
+        "set (research=[], code=[run_command,verify_scratch], "
+        "test=all three, performance_debug=[run_command]); the H1 nudge names "
+        "exactly a mode's available tools (code never names run_tests); the "
+        "repro steer fires and names a tool that is genuinely callable next "
+        "round; and a read-only turn never fires it"
     )
     return 0
 

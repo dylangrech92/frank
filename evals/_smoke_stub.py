@@ -3,10 +3,10 @@
 Prints hand-crafted stdout/stderr per scenario name so the runner's
 check-evaluation and table-rendering paths can be exercised end-to-end
 without ever spawning a real agent session or hitting a live LLM endpoint.
-Accepts (and ignores) the same ``--config`` flag main.py takes, plus a
-required ``--scenario`` flag naming which canned transcript to emit, and
-consumes stdin like main.py's REPL would (ignoring its contents — the
-canned output does not depend on what turns were "sent").
+Accepts (and ignores) the same ``--config`` and ``--mode`` flags main.py
+takes, plus a required ``--scenario`` flag naming which canned transcript
+to emit, and consumes stdin like main.py's REPL would (ignoring its
+contents — the canned output does not depend on what turns were "sent").
 
 For the json_multiline scenario it also writes haiku.txt into the current
 directory (the temp project dir), since that scenario's check asserts the
@@ -88,6 +88,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=None)
     parser.add_argument("--scenario", required=True)
+    parser.add_argument("--mode", default=None)
     args = parser.parse_args()
 
     # Consume stdin like the real REPL would, but ignore its contents — the

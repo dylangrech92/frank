@@ -1,11 +1,11 @@
 """Dispatch-level contract check for the find_dead_code tool (no LLM).
 
 Drives the real production hot path — ``tools.registry.dispatch`` — exactly as a
-live model turn does per tool call, so this exercises arg validation, the
-not-loaded/PINNED gate, and ``FindDeadCode.run`` together against a real vulture
-subprocess. Zero mocks: fixture files are written to a real temp project dir and
-scanned by the real vulture binary, with cwd chdir'd into that dir (the tool
-resolves paths against ``Path.cwd()``). Asserts:
+live model turn does per tool call, so this exercises arg validation, the mode
+gate, and ``FindDeadCode.run`` together against a real vulture subprocess. Zero
+mocks: fixture files are written to a real temp project dir and scanned by the
+real vulture binary, with cwd chdir'd into that dir (the tool resolves paths
+against ``Path.cwd()``). Asserts:
 
 a. a .py file with a genuinely dead module-level function -> result ok, body
    carries a ``path:line`` locator and ``% confidence``, structured ``count`` >= 1,
@@ -122,12 +122,12 @@ def main() -> int:
         print('SKIP: vulture is not installed on PATH; find_dead_code contract not exercised')
         return 0
 
-    from tools.registry import activate, discover
+    from tools import registry
 
-    discover()
-    # dispatch() refuses tools that are not PINNED or loaded via load_tool;
-    # activate() is the exact production call load_tool.run() makes.
-    activate('find_dead_code')
+    # find_dead_code is declared by 'research' mode (modes.py) — dispatch()
+    # refuses any tool outside the active mode's fixed set.
+    saved_mode = registry.current_mode()
+    registry.activate_mode('research')
 
     prev_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix='find_dead_code_contract_')
@@ -143,6 +143,8 @@ def main() -> int:
     finally:
         os.chdir(prev_cwd)
         shutil.rmtree(tmp, ignore_errors=True)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     print("PASS: find_dead_code flags dead Python via vulture, reports clean files, and errors on missing/non-Python targets")
     return 0

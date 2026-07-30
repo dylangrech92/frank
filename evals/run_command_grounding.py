@@ -151,12 +151,12 @@ def _run(root_str: str) -> None:
 
 
 def main() -> int:
-    from tools.registry import activate, discover
+    from tools import registry
 
-    discover()
-    # dispatch() refuses tools that are not PINNED or loaded via load_tool;
-    # activate() is the exact production call load_tool.run() makes.
-    activate('run_command')
+    # run_command is declared by 'code' mode (modes.py) — dispatch() refuses
+    # any tool outside the active mode's fixed set.
+    saved_mode = registry.current_mode()
+    registry.activate_mode('code')
 
     prev_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix='run_command_grounding_')
@@ -175,6 +175,8 @@ def main() -> int:
     finally:
         os.chdir(prev_cwd)
         shutil.rmtree(tmp, ignore_errors=True)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     print("PASS: run_command grounds a nonzero exit with the exit code and absolute working directory, stays silent on success and timeout, names files it creates/changes/deletes in a mutation note (and stays silent when nothing changed), and its description states both facts")
     return 0

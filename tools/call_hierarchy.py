@@ -26,7 +26,6 @@ class CallHierarchy(Tool):
 
     name = 'call_hierarchy'
     parallel_safe = True  # read-only LSP query; doc-sync is lock-guarded (F3)
-    summary = 'Inspect incoming/outgoing callers of a symbol.'
     description = (
         'Inspect the call hierarchy of a symbol at a position in a file. '
         'Requires path, line (1-based), column (1-based), and direction. '

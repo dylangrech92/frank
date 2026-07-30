@@ -83,9 +83,10 @@ def _drive_turn(task: str, script: list, tmp_prefix: str, seed: dict[str, str]):
     """Drive one scripted turn through the real turn loop; return the session.
 
     Materializes *seed* (relative path -> content) in a fresh temp project dir,
-    activates the catalog tools the scripts use, isolates cwd + memory, and
+    activates 'code' mode (the scripts use read_file/create_file/update_file/
+    run_command, all declared by that mode), isolates cwd + memory, and
     returns the session so the caller can read ``session.turn_report``. Restores
-    cwd/memory afterward. Touches no repo files.
+    cwd/memory/mode afterward. Touches no repo files.
     """
     import agent
     import tools.registry as registry
@@ -93,8 +94,11 @@ def _drive_turn(task: str, script: list, tmp_prefix: str, seed: dict[str, str]):
     disable_memory_hooks()
     from session import Session
 
-    for name in ("read_file", "create_file", "update_file", "run_command"):
-        registry.activate(name)
+    # read_file, create_file, update_file, run_command are all declared by
+    # 'code' mode (see modes.py) — the mode-gated equivalent of activating
+    # each tool individually under the old catalog.
+    saved_mode = registry.current_mode()
+    registry.activate_mode("code")
 
     original_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix=tmp_prefix)
@@ -113,6 +117,8 @@ def _drive_turn(task: str, script: list, tmp_prefix: str, seed: dict[str, str]):
         return session
     finally:
         os.chdir(original_cwd)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
 
 def _entry_for(session, suffix: str) -> dict | None:

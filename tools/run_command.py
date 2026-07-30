@@ -47,7 +47,6 @@ class RunCommand(Tool):
     """
 
     name = 'run_command'
-    summary = 'Run a shell command (foreground or background).'
     description = (
         'Runs a shell command. The default mode is foreground and waits for '
         'the result; set background=true to run it in the background and poll '

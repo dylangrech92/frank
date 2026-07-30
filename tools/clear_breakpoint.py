@@ -15,7 +15,6 @@ class ClearBreakpoint(Tool):
     """
 
     name = 'clear_breakpoint'
-    summary = 'Remove a breakpoint (one line or all in a file).'
     description = (
         'Remove a breakpoint at a file (a specific line, or all lines in that file when line is omitted).'
     )

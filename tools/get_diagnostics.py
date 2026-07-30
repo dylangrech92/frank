@@ -30,7 +30,6 @@ class GetDiagnostics(Tool):
     """
 
     name = 'get_diagnostics'
-    summary = 'Report current LSP diagnostics for a file or project.'
     description = (
         'Report current language-server diagnostics for the project or a single file. '
         'When path is given, restrict to diagnostics whose path ends with that string.'

@@ -8,6 +8,7 @@ import sys
 from importlib import import_module
 from typing import Any
 
+from modes import get_mode
 from tools.base import Tool
 from tools.result import ToolResult
 
@@ -128,34 +129,21 @@ def validate_arguments(tool: Tool, arguments: dict[str, Any]) -> str | None:
 # populated by discover() — one instance of each concrete tool class
 _registry: dict[str, "Tool"] = {}
 
-# Tools that are always in the ``tools`` array of every request regardless of the
-# active set.  ``load_tool`` is pinned so the model can always bootstrap more tools;
-# the read-only research primitives (``read_file``, ``find``, ``find_files``,
-# ``list_files``, ``find_symbol``, ``find_references``) are pinned because they are
-# the universal first-touch tools essentially every task reaches for — live
-# baselines show read_file/find_symbol/find_references dominating the first
-# ``load_tool`` calls, and ``find_files`` is the filename/glob primitive a task
-# reaches for just as instinctively.  Pinning them skips a ``load_tool`` round-trip
-# apiece, which on a slow local model is a full LLM call (seconds to minutes) saved
-# per task.  Write/heavy tools stay gated on purpose: the load step is deliberate
-# friction on destructive paths.
-PINNED: frozenset[str] = frozenset(
-    {"load_tool", "read_file", "find", "find_files", "list_files", "find_symbol", "find_references"}
-)
-
-# Names the model has loaded via ``load_tool`` this session.  Single-session app,
-# so a module-level set is the correct home (mirrors the existing module-global
-# pattern used for MANAGER / DEBUG_MANAGER).  ``schemas()`` reflects PINNED | this.
-_active: set[str] = set()
+# The currently active mode's name, and its fixed tool set. Single-session
+# app, so module-level state is the correct home (mirrors the existing
+# module-global pattern used for MANAGER / DEBUG_MANAGER). Set once per
+# process by ``activate_mode()``; ``None`` / empty until then.
+_active_mode: str | None = None
+_active_tools: frozenset[str] = frozenset()
 
 
 def is_loaded(name: str) -> bool:
-    """Return True when *name* is callable now — pinned or loaded via ``load_tool``.
+    """Return True when *name* is in the active mode's tool set.
 
-    Single source of truth for the load gate: ``schemas()`` exposes exactly these
-    tools and ``dispatch()`` refuses to run anything else.
+    Single source of truth for the mode gate: ``schemas()`` exposes exactly
+    these tools and ``dispatch()`` refuses to run anything else.
     """
-    return name in PINNED or name in _active
+    return name in _active_tools
 
 
 def _is_concrete_tool(cls: type) -> bool:
@@ -199,20 +187,65 @@ def discover() -> None:
             _registry[instance.name] = instance
 
 
-def schemas() -> list[dict[str, Any]]:
-    """Return the OpenAI Chat Completions tools array for the current request.
+def activate_mode(name: str) -> tuple[str, ...]:
+    """Activate mode *name*, replacing the active tool set wholesale.
 
-    One entry per registered tool with ``type=``function` and a ``function`` key
-    carrying ``name``, ``description``, and ``parameters``.
+    Auto-discovers if the registry has not been populated yet, then verifies
+    every tool the mode names actually resolves in ``_registry`` — an unknown
+    name raises ``ValueError`` naming both the mode and the bad name, since a
+    mode referencing a tool that does not exist is a harness bug, not a
+    runtime condition to degrade gracefully from. Idempotent: reactivating the
+    same (or another) mode simply recomputes the active set.
 
-    Only PINNED tools plus whatever the model has loaded via ``load_tool`` this
-    session are included — the full catalog rides in the system message instead
-    (see :func:`render_catalog_block`), keeping the per-request tools array small.
+    Args:
+        name: A key of ``modes.MODES``.
+
+    Returns:
+        The mode's tool names, in the order declared in ``modes.py``.
+
+    Raises:
+        ValueError: If *name* is not a known mode, or if the mode names a
+            tool that is not registered.
     """
     if not _registry:
         discover()
 
-    wanted = PINNED | _active
+    mode = get_mode(name)
+    unknown = [t for t in mode.tools if t not in _registry]
+    if unknown:
+        raise ValueError(
+            f"mode {name!r} names unknown tool(s): {', '.join(unknown)}"
+        )
+
+    global _active_mode, _active_tools
+    _active_mode = mode.name
+    _active_tools = frozenset(mode.tools)
+    return mode.tools
+
+
+def current_mode() -> str | None:
+    """Return the active mode's name, or ``None`` when no mode has been activated."""
+    return _active_mode
+
+
+def schemas() -> list[dict[str, Any]]:
+    """Return the OpenAI Chat Completions tools array for the active mode.
+
+    One entry per tool in the active mode's tool set, with ``type="function"``
+    and a ``function`` key carrying ``name``, ``description``, and
+    ``parameters`` — exactly that mode's tools, full schemas, nothing else.
+
+    Raises:
+        RuntimeError: If no mode is active. A modeless process is a bug, not
+            a degraded mode to serve schemas for.
+    """
+    if _active_mode is None:
+        raise RuntimeError(
+            "no mode is active — call registry.activate_mode(name) before schemas()"
+        )
+    if not _registry:
+        discover()
+
     return [
         {
             "type": "function",
@@ -222,76 +255,8 @@ def schemas() -> list[dict[str, Any]]:
                 "parameters": t.parameters,
             },
         }
-        for name, t in _registry.items() if name in wanted
+        for name, t in _registry.items() if name in _active_tools
     ]
-
-
-def activate(name: str) -> bool:
-    """Add *name* to the active set so it appears in the next request's tools array.
-
-    Returns ``True`` when *name* was newly activated, ``False`` when it was already
-    active, already pinned, unknown, or empty.  Auto-discovers if needed.
-    """
-    if not _registry:
-        discover()
-    if not name or is_loaded(name) or name not in _registry:
-        return False
-    _active.add(name)
-    return True
-
-
-def _signature(t: Tool) -> str:
-    """Derive a terse ``param, param?`` signature string from *t*'s parameters schema.
-
-    Each property name from ``parameters.properties`` is listed in schema order,
-    suffixed with ``?`` when it is not present in ``parameters.required``.
-    """
-    properties: dict[str, Any] = t.parameters.get("properties", {}) or {}
-    required: set[str] = set(t.parameters.get("required", []) or [])
-    parts: list[str] = []
-    for param_name in properties:
-        parts.append(param_name if param_name in required else f"{param_name}?")
-    return ", ".join(parts)
-
-
-def catalog() -> list[dict[str, str]]:
-    """Return ``[{name, sig, summary}]`` for every loadable (non-pinned) tool.
-
-    Used to render the catalog block in the system message so the model knows what
-    it can ask ``load_tool`` for.  ``sig`` is derived programmatically from the
-    tool's JSON Schema ``parameters`` (see ``_signature``).  Falls back to
-    ``description`` when a tool has no ``summary`` attribute.
-    """
-    if not _registry:
-        discover()
-    entries: list[dict[str, str]] = []
-    for name, t in _registry.items():
-        if name in PINNED:
-            continue
-        summary = getattr(t, "summary", None) or t.description
-        entries.append({"name": name, "sig": _signature(t), "summary": summary})
-    return entries
-
-
-def render_catalog_block() -> str:
-    """Render the tool catalog as a system-message block for the model.
-
-    Lists every loadable tool as ``name(sig): summary`` — where ``sig`` is a
-    comma-separated list of parameter names with optional ones suffixed ``?`` —
-    and instructs the model to call ``load_tool`` to bring one into context
-    before using it.
-    """
-    entries = catalog()
-    preloaded = ", ".join(sorted(PINNED))
-    lines = [
-        f"Tool catalog — pre-loaded tools you can call directly: {preloaded}. "
-        "Each entry below is listed as `name(params): summary`, with optional "
-        "params suffixed `?`, and must first be loaded with `load_tool(name)` "
-        "before you can call it; once loaded, it is immediately callable — no "
-        "need to wait for the next turn.",
-    ]
-    lines.extend(f"- {e['name']}({e['sig']}): {e['summary']}" for e in entries)
-    return "\n".join(lines)
 
 
 def get_tool(name: str) -> Tool | None:
@@ -309,9 +274,9 @@ def get_tool(name: str) -> Tool | None:
 def dispatch(name: str, arguments: dict[str, Any]) -> ToolResult:
     """Look up tool *name*, validate and call ``run(**arguments)``, and return the result.
 
-    Validation proceeds in stages before execution: (0) the tool must be PINNED or
-    already loaded via ``load_tool`` — an unloaded tool is rejected with a
-    ``not-loaded`` error rather than executed; (1) unknown parameter keys are
+    Validation proceeds in stages before execution: (0) the tool must be in the
+    active mode's tool set — a tool outside the active mode is rejected with a
+    ``not-in-mode`` error rather than executed; (1) unknown parameter keys are
     rejected, (2) missing required keys are rejected, and (3) each value is checked
     against the declared JSON Schema type.  Any validation failure returns an error
     immediately without calling ``run``.
@@ -355,14 +320,18 @@ def dispatch(name: str, arguments: dict[str, Any]) -> ToolResult:
             ),
         )
 
-    # Gate: the model must have loaded this tool (or it must be PINNED) before
-    # it can be dispatched — mirrors the schemas() contract so a tool never
-    # executes without the model having seen its full definition.
+    # Gate: the tool must be in the active mode's tool set before it can be
+    # dispatched — mirrors the schemas() contract so a tool never executes
+    # without the model having seen its full definition this run. There is no
+    # rescue path: the active mode's tool set is fixed for the life of the
+    # process.
     if not is_loaded(name):
+        mode_label = _active_mode if _active_mode is not None else "(no mode active)"
+        mode_tools = ", ".join(sorted(_active_tools)) if _active_tools else "(none)"
         return ToolResult.err(
-            f"tool {name!r} is not loaded",
-            code="not-loaded",
-            hint=f"Call load_tool(name={name!r}) first; its full definition then becomes available immediately.",
+            f"tool {name!r} is not in the active mode {mode_label!r}",
+            code="not-in-mode",
+            hint=f"Mode {mode_label!r} has: {mode_tools}",
         )
 
     # Validate arguments against the tool's JSON Schema before execution

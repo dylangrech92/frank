@@ -18,7 +18,6 @@ class FindSymbol(Tool):
 
     name = 'find_symbol'
     parallel_safe = True  # read-only LSP query; client-map read is lock-guarded (F3)
-    summary = 'Fuzzy-search symbols by name across the workspace.'
     description = (
         'Fuzzy-search symbols by name across the whole workspace (like an IDE\'s '
         'ctrl+T). Searches all open documents in all language servers. Prefer this '

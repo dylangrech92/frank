@@ -85,7 +85,6 @@ class MoveFile(Tool):
     """
 
     name = 'move_file'
-    summary = 'Move or rename a file/directory (updates imports via LSP).'
     description = (
         'Moves or renames a file or directory inside the project (plain filesystem move, '
         'updates imports via the language server where supported). Paths must be relative to the project root.'

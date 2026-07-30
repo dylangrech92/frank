@@ -45,12 +45,15 @@ d. The extracted ``_repeat_render`` is driven directly (read-only class) with a
    full render (not the stub) and the stamp is re-stamped at the new count
    (condition (e)); the matching-count control returns the stub.
 
-Registry-reset mechanism: several checks activate catalog-gated write /
-verification tools (``update_file`` / ``create_file`` / ``run_command``). The tools
-registry is module-global with no public deactivate API, so each such check
-snapshots ``tools.registry._active`` and restores it in a finally (mirroring
-verify_tool_wiring.py's ``_active`` snapshot pattern). ``read_file`` is PINNED and
-needs no activation.
+Registry-reset mechanism: dispatch requires an active mode (mode-gated tool
+registry, ``modes.py``) — there is no PINNED-outside-mode carve-out, so even a
+``read_file``-only check must activate a mode first. The registry is
+module-global with no deactivate API, so each check snapshots
+``tools.registry.current_mode()`` and restores it in a finally. 'code' mode
+covers every write/verification tool these checks use (update_file,
+create_file, run_command); 'research' mode is used for the read_file-only
+check since it's the narrowest mode that still declares it (read_file is a
+``_COMMON_TOOLS`` member, present in every mode).
 
 Exits 0 on success, prints ``FAIL: <reason>`` to stderr and exits 1 otherwise.
 Runs with the repo root on ``sys.path`` (evals/run.py inserts it before exec'ing
@@ -112,11 +115,17 @@ def _tool_rows(session, name: str) -> list[str]:
 def check_identical_read_stubbed() -> list[str]:
     """a. Two identical successful reads: first body shown, second stubbed."""
     import agent
+    import tools.registry as registry
     from evals._stub import _StubClient, disable_memory_hooks
     disable_memory_hooks()
     from session import Session
 
     failures: list[str] = []
+
+    # read_file is a _COMMON_TOOLS member (modes.py) — present in every mode,
+    # so dispatch() accepts it under any active mode; 'research' is narrowest.
+    saved_mode = registry.current_mode()
+    registry.activate_mode("research")
 
     original_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix="repeat-dedup-read-")
@@ -159,6 +168,8 @@ def check_identical_read_stubbed() -> list[str]:
             )
     finally:
         os.chdir(original_cwd)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     return failures
 
@@ -173,8 +184,9 @@ def check_reread_after_edit_full_body() -> list[str]:
 
     failures: list[str] = []
 
-    saved_active = set(registry._active)
-    registry.activate("update_file")  # catalog-gated write tool
+    # update_file is declared by 'code' mode (modes.py).
+    saved_mode = registry.current_mode()
+    registry.activate_mode("code")
 
     original_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix="repeat-dedup-edit-")
@@ -222,8 +234,8 @@ def check_reread_after_edit_full_body() -> list[str]:
             )
     finally:
         os.chdir(original_cwd)
-        registry._active.clear()
-        registry._active.update(saved_active)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     return failures
 
@@ -238,8 +250,9 @@ def check_verify_nochange_stubbed() -> list[str]:
 
     failures: list[str] = []
 
-    saved_active = set(registry._active)
-    registry.activate("run_command")
+    # run_command is declared by 'code' mode (modes.py).
+    saved_mode = registry.current_mode()
+    registry.activate_mode("code")
 
     original_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix="repeat-dedup-cmd-")
@@ -279,8 +292,8 @@ def check_verify_nochange_stubbed() -> list[str]:
             )
     finally:
         os.chdir(original_cwd)
-        registry._active.clear()
-        registry._active.update(saved_active)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     return failures
 
@@ -295,9 +308,9 @@ def check_verify_remutate_then_restub() -> list[str]:
 
     failures: list[str] = []
 
-    saved_active = set(registry._active)
-    registry.activate("run_command")
-    registry.activate("create_file")
+    # run_command and create_file are both declared by 'code' mode (modes.py).
+    saved_mode = registry.current_mode()
+    registry.activate_mode("code")
 
     original_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix="repeat-dedup-remutate-")
@@ -348,8 +361,8 @@ def check_verify_remutate_then_restub() -> list[str]:
             )
     finally:
         os.chdir(original_cwd)
-        registry._active.clear()
-        registry._active.update(saved_active)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     return failures
 
@@ -413,8 +426,10 @@ def check_readonly_dedups_despite_other_mutation() -> list[str]:
 
     failures: list[str] = []
 
-    saved_active = set(registry._active)
-    registry.activate("create_file")  # read_file is PINNED
+    # create_file is declared by 'code' mode (modes.py); read_file is a
+    # _COMMON_TOOLS member so the same mode covers both.
+    saved_mode = registry.current_mode()
+    registry.activate_mode("code")
 
     original_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix="repeat-dedup-otherfile-")
@@ -456,8 +471,8 @@ def check_readonly_dedups_despite_other_mutation() -> list[str]:
             )
     finally:
         os.chdir(original_cwd)
-        registry._active.clear()
-        registry._active.update(saved_active)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     return failures
 

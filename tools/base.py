@@ -16,8 +16,7 @@ class Tool(ABC):
     """
 
     name: str  # unique tool name, set by subclass
-    summary: str  # one-line description shown in the catalog (before a tool is loaded)
-    description: str  # full LLM-facing description (shown once the tool is loaded)
+    description: str  # full LLM-facing description, shown in the tool's schema
     parameters: dict  # JSON Schema describing arguments
 
     # Optional attributes used to render an oversize-result error (see

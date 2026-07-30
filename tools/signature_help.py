@@ -24,7 +24,6 @@ class SignatureHelp(Tool):
 
     name = 'signature_help'
     parallel_safe = True  # read-only LSP query; doc-sync is lock-guarded (F3)
-    summary = 'Get parameter hints for a function call at a position.'
     description = (
         'Get parameter hints for a function call at a position '
         '(line/column 1-based, typically placed inside the call parentheses).'

@@ -18,7 +18,6 @@ class CreateFolder(Tool):
     """
 
     name = 'create_folder'
-    summary = 'Create a new directory (and parents).'
     description = (
         'Creates a directory inside the project. '
         'The path must be relative to the project root.'

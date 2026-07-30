@@ -79,7 +79,6 @@ class ListFiles(Tool):
     """
 
     name = 'list_files'
-    summary = 'List the project file tree (gitignore-aware).'
     description = (
         'Lists the project file tree while respecting gitignore rules.'
     )

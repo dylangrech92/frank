@@ -2,10 +2,10 @@
 
 Drives the real production hot path — ``tools.registry.dispatch`` — exactly as
 ``handle_user_message`` does per tool call, so this exercises arg validation,
-the not-loaded/PINNED gate, and ``VerifyScratch.run`` together, not the tool
-class in isolation. Zero mocks: every snippet below is written to a real OS
-temp file and executed by a real subprocess (real python/sh interpreter),
-against the real project root as cwd, exactly as a live model turn would.
+the mode gate, and ``VerifyScratch.run`` together, not the tool class in
+isolation. Zero mocks: every snippet below is written to a real OS temp file
+and executed by a real subprocess (real python/sh interpreter), against the
+real project root as cwd, exactly as a live model turn would.
 
 Asserts the documented contract from ``tools/verify_scratch.py``:
 
@@ -166,13 +166,11 @@ def main() -> int:
     # invoke this script directly.
     os.chdir(REPO_ROOT)
 
-    from tools.registry import activate, discover
+    from tools import registry
 
-    discover()
-    # dispatch() refuses tools that are not PINNED or loaded via load_tool;
-    # activate() is the exact production call load_tool.run() makes, so this
-    # mirrors a real "model called load_tool('verify_scratch')" turn.
-    activate("verify_scratch")
+    # verify_scratch is declared by 'test' mode (modes.py) — dispatch()
+    # refuses any tool outside the active mode's fixed set.
+    registry.activate_mode("test")
 
     all_failures: list[str] = []
     for description, check in CHECKS:

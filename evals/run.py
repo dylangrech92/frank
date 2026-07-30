@@ -33,9 +33,46 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 EVALS_DIR = Path(__file__).resolve().parent
 
 sys.path.insert(0, str(EVALS_DIR))
+sys.path.insert(0, str(REPO_ROOT))
 from scenarios import SCENARIOS  # noqa: E402
 
 DEFAULT_TIMEOUT = 420
+
+
+def _validate_scenarios(scenarios: list[dict]) -> None:
+    """Fail loudly at import time if a live (non-inline) scenario has no valid mode.
+
+    A live scenario launches main.py, which now requires ``--mode`` for every
+    agent-launching run (research/code/test/performance_debug fix the exact
+    tool set for the whole process — see modes.py). A scenario missing
+    ``mode`` would otherwise either crash main.py's argv parsing at run time
+    with an error far from its cause, or — worse, if a blanket default were
+    used instead — silently hand the scenario the wrong toolset and change
+    what it measures without anyone noticing. Refusing to run at all is
+    strictly better than guessing, so this runs unconditionally on import
+    (including under --list), not just before a live run.
+    """
+    from modes import mode_names
+
+    valid_modes = set(mode_names())
+    problems: list[str] = []
+    for s in scenarios:
+        if s.get("inline"):
+            continue
+        mode = s.get("mode")
+        if mode is None:
+            problems.append(f"scenario {s['name']!r} is live (has 'turns', no 'inline') but has no 'mode' key")
+        elif mode not in valid_modes:
+            problems.append(
+                f"scenario {s['name']!r} has mode {mode!r}, not one of modes.mode_names() {sorted(valid_modes)}"
+            )
+    if problems:
+        for p in problems:
+            print(f"FATAL: {p}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+_validate_scenarios(SCENARIOS)
 
 
 # =============================================================================
@@ -180,6 +217,36 @@ def run_checks(
 # =============================================================================
 
 
+def build_live_cmd(scenario: dict, cfg_path: Path, smoke: bool) -> list[str]:
+    """Build the child-process argv for one live (non-inline) scenario run.
+
+    Every live scenario must declare a ``mode`` (validated at import time by
+    ``_validate_scenarios``); that mode is threaded through as ``--mode`` for
+    both the smoke-stub branch and the real ``main.py`` branch so the two
+    stay symmetric and neither path can silently launch modeless.
+    """
+    mode = scenario["mode"]
+    if smoke:
+        return [
+            sys.executable,
+            str(EVALS_DIR / "_smoke_stub.py"),
+            "--config",
+            str(cfg_path),
+            "--scenario",
+            scenario["name"],
+            "--mode",
+            mode,
+        ]
+    return [
+        sys.executable,
+        str(REPO_ROOT / "main.py"),
+        "--config",
+        str(cfg_path),
+        "--mode",
+        mode,
+    ]
+
+
 def run_live_scenario(scenario: dict, timeout: int, smoke: bool) -> dict:
     """Run one non-inline scenario in a fresh temp project dir and score it."""
     project_dir = Path(tempfile.mkdtemp(prefix=f"evalproj-{scenario['name']}-"))
@@ -192,17 +259,7 @@ def run_live_scenario(scenario: dict, timeout: int, smoke: bool) -> dict:
 
         stdin_text = "\n".join(scenario["turns"]) + "\n"
 
-        if smoke:
-            cmd = [
-                sys.executable,
-                str(EVALS_DIR / "_smoke_stub.py"),
-                "--config",
-                str(cfg_path),
-                "--scenario",
-                scenario["name"],
-            ]
-        else:
-            cmd = [sys.executable, str(REPO_ROOT / "main.py"), "--config", str(cfg_path)]
+        cmd = build_live_cmd(scenario, cfg_path, smoke)
 
         timed_out = False
         try:

@@ -36,7 +36,6 @@ class Lint(Tool):
     """
 
     name = 'lint'
-    summary = 'Run configured linters (ruff/eslint/phpstan) over a file or the project.'
     description = (
         'Run configured static-analysis linters over a single file or the whole '
         'project. Defaults: ruff for Python, eslint for JavaScript/TypeScript, '

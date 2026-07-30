@@ -23,7 +23,6 @@ class DocumentSymbols(Tool):
 
     name = 'document_symbols'
     parallel_safe = True  # read-only LSP query; doc-sync is lock-guarded (F3)
-    summary = 'Get the outline (classes/functions) of a file.'
     description = (
         'Returns the outline (classes, functions, methods) of a file. '
         'Requires path relative to the project root.'

@@ -28,8 +28,8 @@ def main() -> int:
     from tools.registry import dispatch
     from agent import render_tool_result
 
-    # 'read_file' is a real registered tool that is never loaded here, so
-    # dispatch() always returns the same not-loaded error — a stable,
+    # 'read_file' is a real registered tool, but no mode is activated here, so
+    # dispatch() always returns the same not-in-mode error — a stable,
     # reproducible (name, rendered) pair for the loop-guard counter.
     name = "read_file"
     arguments = {"path": "does_not_matter.py"}

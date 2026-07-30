@@ -32,7 +32,6 @@ class ReadFile(Tool):
     """
 
     name = 'read_file'
-    summary = 'Read a file\u2019s contents with optional line-range paging.'
     description = (
         'Reads a file inside the project returning its contents with optional line range. '
         'Output is cat -n style: every line is prefixed with its true 1-based file line number '

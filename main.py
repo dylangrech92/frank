@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 
+import modes
 import ui
 from agent import handle_user_message
 from config import Config, load as config_load
@@ -19,7 +20,7 @@ from lsp.manager import LSPManager, LSPUnavailableError
 from llm import LLMClient
 from session import Session, list_sessions
 from runtime.process import reap_all
-from tools.registry import discover
+from tools.registry import activate_mode, discover
 from diagnostics import STORE
 
 # When run as a script this module is "__main__"; alias it as "main" so that
@@ -32,18 +33,20 @@ sys.modules.setdefault("main", sys.modules[__name__])
 # =============================================================================
 
 
-def register_catalog_provider() -> None:
-    """Register the tool-catalog system-message block (deferred tool loading).
+def register_mode_provider() -> None:
+    """Register the active mode's instruction block as a system-message context block.
 
-    Memory-independent — the model cannot load tools without it.
+    Same ``CONTEXT_PROVIDERS`` seam the old catalog provider used, but injects
+    the active mode's ``instructions`` instead of a tool catalog. Unlike that
+    provider, failure here is NOT swallowed: a mode that fails to load must
+    kill the process rather than silently producing a modeless agent that
+    cannot see its own tool-use instructions.
     """
-    try:
-        from session import CONTEXT_PROVIDERS
-        from tools.registry import render_catalog_block
+    from session import CONTEXT_PROVIDERS
+    from tools.registry import current_mode
 
-        CONTEXT_PROVIDERS.append(lambda _session: render_catalog_block())
-    except Exception:
-        pass
+    mode = modes.get_mode(current_mode())
+    CONTEXT_PROVIDERS.append(lambda _session: mode.instructions)
 
 
 def session_start_jobs(session: Session) -> None:
@@ -160,12 +163,11 @@ def session_end_jobs(session: Session, client: LLMClient) -> None:
 # =============================================================================
 
 SYSTEM_PROMPT = (
-    "You are a coding agent operating on the user's project through tools. Only "
-    "`load_tool` is loaded by default; the system message lists every other tool "
-    "as name(params): summary — call load_tool(name) and that tool becomes "
-    "callable immediately. You are a software engineering agent: if a request is "
-    "unrelated to this project or software work, say so briefly and decline "
-    "rather than pursuing it.\n"
+    "You are a coding agent operating on the user's project through tools. The "
+    "tools in this request are the complete toolset for your declared mode — "
+    "there is no way to load more. You are a software engineering agent: if a "
+    "request is unrelated to this project or software work, say so briefly and "
+    "decline rather than pursuing it.\n"
     "\n"
     "Working rules:\n"
     "- Ground claims in tool results; if you have not looked, look before answering.\n"
@@ -251,38 +253,6 @@ def _build_envelope(
 # =============================================================================
 
 
-def _activate_cli_tools(spec: str) -> list[str]:
-    """Validate and activate each comma-separated tool name; raises ValueError naming any unknown tool.
-
-    Splits on commas, strips whitespace, skips empty entries. For each name,
-    verifies it exists in the registry via ``get_tool`` (which returns ``None``
-    for an unknown name, in which case this raises ``ValueError`` naming the bad
-    name), then calls ``activate`` to add it to the active set.
-
-    Args:
-        spec: The raw ``--activate-tools`` value, e.g. ``"run_command,run_tests"``.
-
-    Returns:
-        The list of tool names that were activated, in input order.
-
-    Raises:
-        ValueError: If any name is not in the registry, naming that name.
-    """
-    from tools.registry import activate, get_tool
-
-    names: list[str] = []
-    for raw in spec.split(","):
-        name = raw.strip()
-        if not name:
-            continue
-        tool = get_tool(name)
-        if tool is None:
-            raise ValueError(f"unknown tool in --activate-tools: {name!r}")
-        activate(name)
-        names.append(name)
-    return names
-
-
 def main() -> None:
     """Parse args, load config, build client and session, then run the REPL or one-shot task."""
     parser = argparse.ArgumentParser(description="Coding agent CLI")
@@ -334,18 +304,21 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--activate-tools",
+        "--mode",
         default=None,
-        metavar="NAMES",
+        choices=modes.mode_names(),
         help=(
-            "Comma-separated tool names to pre-activate into the request tools "
-            "array (as if load_tool had been called), e.g. "
-            "--activate-tools run_command,run_tests"
+            "Tool mode for this run — fixes the exact tool set available for "
+            "the whole process (research/code/test/performance_debug). "
+            "Required for every launch that starts an agent (REPL or one-shot "
+            "alike); not required with --list-sessions, which never launches one."
         ),
     )
     args = parser.parse_args()
     if args.json and args.prompt is None:
         parser.error("--json requires -p/--prompt")
+    if not args.list_sessions and args.mode is None:
+        parser.error(f"--mode is required (choices: {', '.join(modes.mode_names())})")
     ui.enable(args.pretty)
 
     project_root: str = os.getcwd()
@@ -371,13 +344,12 @@ def main() -> None:
     print(ui.telemetry(f"config: {os.path.abspath(args.config)}"), file=sys.stderr)
 
     discover()
-    if args.activate_tools:
-        try:
-            activated = _activate_cli_tools(args.activate_tools)
-        except ValueError as exc:
-            print(ui.error(str(exc)), file=sys.stderr)
-            sys.exit(2)
-        print(ui.telemetry(f"activated tools: {', '.join(activated)}"), file=sys.stderr)
+    try:
+        activate_mode(args.mode)
+    except ValueError as exc:
+        print(ui.error(str(exc)), file=sys.stderr)
+        sys.exit(2)
+    print(ui.telemetry(f"mode: {args.mode}"), file=sys.stderr)
     client = LLMClient(cfg.llm)
     try:
         if args.session:
@@ -390,7 +362,7 @@ def main() -> None:
 
     exit_code = 0
     try:
-        register_catalog_provider()
+        register_mode_provider()
         session_start_jobs(session)
 
         global MANAGER

@@ -113,10 +113,9 @@ def check_fires_and_one_shot() -> list[str]:
     disable_memory_hooks()
     from session import Session
 
-    # create_file / run_command are catalog tools (not PINNED); a live model
-    # activates them via load_tool before use. Do the same so dispatch runs them.
-    registry.activate("create_file")
-    registry.activate("run_command")
+    # create_file and run_command are both declared by 'code' mode (modes.py).
+    saved_mode = registry.current_mode()
+    registry.activate_mode("code")
 
     failures: list[str] = []
 
@@ -164,6 +163,8 @@ def check_fires_and_one_shot() -> list[str]:
             )
     finally:
         os.chdir(original_cwd)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     return failures
 
@@ -176,10 +177,9 @@ def check_suppressed_after_run() -> list[str]:
     disable_memory_hooks()
     from session import Session
 
-    # create_file / run_command are catalog tools (not PINNED); a live model
-    # activates them via load_tool before use. Do the same so dispatch runs them.
-    registry.activate("create_file")
-    registry.activate("run_command")
+    # create_file and run_command are both declared by 'code' mode (modes.py).
+    saved_mode = registry.current_mode()
+    registry.activate_mode("code")
 
     failures: list[str] = []
 
@@ -218,6 +218,8 @@ def check_suppressed_after_run() -> list[str]:
             )
     finally:
         os.chdir(original_cwd)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     return failures
 
@@ -225,9 +227,10 @@ def check_suppressed_after_run() -> list[str]:
 def _drive_turn(task: str, script: list, tmp_prefix: str):
     """Drive one scripted turn through the real turn loop; return (session, stderr).
 
-    Activates the catalog tools the scripts use, isolates cwd + memory, and
-    captures stderr so the caller can assert on both transcript rows and
-    telemetry. Restores cwd/memory afterward. Touches no repo files.
+    Activates 'code' mode (the scripts use create_file/run_command, both
+    declared by it), isolates cwd + memory, and captures stderr so the caller
+    can assert on both transcript rows and telemetry. Restores cwd/memory/mode
+    afterward. Touches no repo files.
     """
     import agent
     import tools.registry as registry
@@ -235,8 +238,8 @@ def _drive_turn(task: str, script: list, tmp_prefix: str):
     disable_memory_hooks()
     from session import Session
 
-    registry.activate("create_file")
-    registry.activate("run_command")
+    saved_mode = registry.current_mode()
+    registry.activate_mode("code")
 
     original_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix=tmp_prefix)
@@ -252,6 +255,8 @@ def _drive_turn(task: str, script: list, tmp_prefix: str):
         return session, buf.getvalue()
     finally:
         os.chdir(original_cwd)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
 
 def check_no_failure_steer_fires() -> list[str]:

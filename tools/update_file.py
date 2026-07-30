@@ -17,7 +17,6 @@ class UpdateFile(Tool):
     """
 
     name = 'update_file'
-    summary = 'Overwrite an existing file with new content (full overwrite).'
     description = (
         'Overwrites an existing file with entirely new content (full overwrite, not a patch) — '
         'use it for a full rewrite of a small file. For a targeted change to part of a file prefer '

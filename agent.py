@@ -32,7 +32,7 @@ from typing import Callable
 
 from llm import ChatResponse, LLMClient, OverCapError, ToolCall
 from session import Session
-from tools.registry import dispatch, get_tool, schemas
+from tools.registry import dispatch, get_tool, is_loaded, schemas
 from tools.result import ToolResult
 
 
@@ -355,8 +355,9 @@ def _loop_guard_check(
 # repeating an identical build/test inside an edit→verify→edit cycle is legitimate.
 #
 # Single source of truth for the verification-tool names. The repeat-cap
-# exemption, the verification_runs recording branch, and _activate_verification_tools
-# all read this one set so the list cannot drift across the file.
+# exemption, the verification_runs recording branch, and
+# _available_verification_tools all read this one set so the list cannot
+# drift across the file.
 #
 # Profiling tools are repeat-cap exempt because a measure -> edit -> re-measure
 # loop legitimately re-issues identical calls, but they are NOT verification tools.
@@ -366,23 +367,20 @@ _REPEAT_CALL_CAP = 3
 _REPEAT_CAP_EXEMPT = _VERIFICATION_TOOLS | _PROFILING_TOOLS
 
 
-def _activate_verification_tools() -> None:
-    """Idempotently activate the verification tools the verify steers name.
+def _available_verification_tools() -> list[str]:
+    """Sorted verification tools the active mode actually carries.
 
-    Both reactive verify steers (reproduce-before-edit, H1) tell the model to run
-    a verification tool by name, but those tools are catalog-gated — they are only
-    in the request's tools array once activated. Firing a steer without activating
-    them demands a tool the model cannot call. This puts every verification tool
-    into the active set so the next round's ``schemas()`` (re-derived per round in
-    ``handle_user_message``) carries them and the guidance is actionable.
-
-    ``registry.activate`` is a no-op for a tool already active/pinned/unknown, so
-    this is safe to call repeatedly and never raises.
+    Tools are now a static per-mode set fixed at launch (``registry.activate_mode``)
+    — there is nothing left to dynamically activate. The verify steers still need
+    to name real, callable tools, so this reports the intersection of
+    ``_VERIFICATION_TOOLS`` with the active mode via ``registry.is_loaded`` (which
+    now means "in the active mode"), letting each steer name exactly what the
+    model can call: all three in test mode, ``run_command`` + ``verify_scratch``
+    in code mode (never ``run_tests`` — code mode's own instructions forbid
+    running the suite), and ``run_command`` alone in performance_debug. Empty in
+    research mode, which has no verification tools and no way to mutate.
     """
-    from tools.registry import activate
-
-    for name in _VERIFICATION_TOOLS:
-        activate(name)
+    return sorted(name for name in _VERIFICATION_TOOLS if is_loaded(name))
 
 
 def _verification_run_passed(name: str, result: ToolResult) -> bool:
@@ -549,6 +547,55 @@ _NO_FAILURE_OBSERVED_STEER = (
     "revert your edit and state in your final answer that the reported problem "
     "could not be reproduced."
 )
+
+# Per-tool clause for the H1 post-mutation verification nudge below, keyed by
+# name so the nudge names exactly the verification tools the active mode
+# carries (see _available_verification_tools) instead of hard-coding all
+# three — code mode has no run_tests, performance_debug has neither run_tests
+# nor verify_scratch.
+_VERIFICATION_TOOL_CLAUSE = {
+    "run_command": "run_command against a separate script",
+    "run_tests": "run_tests",
+    "verify_scratch": "verify_scratch (a throwaway snippet, no file pollution)",
+}
+
+
+def _join_with_or(items: list[str]) -> str:
+    """Join *items* with commas and a trailing "or", oxford-comma style."""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} or {items[1]}"
+    return ", ".join(items[:-1]) + f", or {items[-1]}"
+
+
+def _verification_nudge_text(available: list[str]) -> str:
+    """Build the H1 post-mutation verification nudge from the mode's actual tools.
+
+    ``available`` is ``_available_verification_tools()`` — a sorted, non-empty
+    subset of ``_VERIFICATION_TOOLS`` — so this only ever names tools the model
+    can actually call in the active mode. Wording is preserved verbatim from
+    the original hard-coded steer; only which tools are named, and the
+    singular/plural framing of the closing sentence, vary with the list.
+    """
+    tools_text = _join_with_or([_VERIFICATION_TOOL_CLAUSE[name] for name in available])
+    toolset_sentence = (
+        "This tool is loaded into your toolset now — call it directly."
+        if len(available) == 1
+        else "These tools are loaded into your toolset now — call one directly."
+    )
+    return (
+        "You modified files this turn but ran nothing to verify the "
+        f"change. Verify it now with {tools_text} — never by adding "
+        "repro/test code to a production file or repurposing its "
+        "`if __name__ == \"__main__\"` block. "
+        f"{toolset_sentence} Or state explicitly "
+        "in your answer that the change is unverified. Either way, end "
+        "your answer with a one-line verification breakdown: what "
+        "you checked (tests, commands, diagnostics) and what it "
+        "showed."
+    )
+
 
 # Word/phrase lexicon (case-insensitive substring) that marks a user request as a
 # bug report rather than a pure feature task. Gates the no-failure-observed steer:
@@ -1592,16 +1639,16 @@ def _maybe_graph_memory_nudge(session: Session, state: "_TurnState") -> None:
 
 
 def _arm_verify_steer(state: "_TurnState", flag_attr: str, telemetry: str) -> None:
-    """Arm one first-mutation verify steer: flip its one-shot flag, load the
-    verification tools it names, and emit its telemetry line.
+    """Arm one first-mutation verify steer: flip its one-shot flag and emit its
+    telemetry line.
 
     The shared mechanics behind both first-mutation steers so the two conditions
-    in ``_maybe_arm_first_mutation_steer`` read declaratively. Activating the
-    verification tools here keeps the steer's directive actionable in the very
-    next round (the tool set is re-derived from the registry per round).
+    in ``_maybe_arm_first_mutation_steer`` read declaratively. Both steers' text
+    names ``run_command``, which every mode capable of mutating files also
+    carries (see ``_REPRO_BEFORE_EDIT_STEER``), so there is no tool set to
+    activate here — the tool is already in the request's static per-mode set.
     """
     setattr(state, flag_attr, True)
-    _activate_verification_tools()
     print(ui.telemetry(telemetry), file=sys.stderr)
 
 
@@ -2035,30 +2082,28 @@ def _finalize_answer(
     # H1 — post-mutation verification nudge: the model is about to end the turn
     # having mutated files without running anything to verify the change. Inject
     # a harness steer and do one more loop iteration instead of returning. Fires
-    # at most once per turn.
+    # at most once per turn, and only names verification tools the active mode
+    # actually carries (_available_verification_tools). If none are available —
+    # unreachable in practice, since every mode with a mutating tool also carries
+    # run_command — there is nothing truthful to steer with, so this falls
+    # straight through to the S3 gate below instead of bouncing on a toolless
+    # nudge.
     if state.needs_verification and not state.verification_nudge_fired:
         state.verification_nudge_fired = True
-        # Load the verification tools this nudge names so the next round's
-        # schemas() carries them and the guidance is actionable.
-        _activate_verification_tools()
+        available = _available_verification_tools()
+        if available:
+            print(
+                ui.telemetry("verification-nudge: fired (unverified file mutation)"),
+                file=sys.stderr,
+            )
+            session.append_steer(_verification_nudge_text(available))
+            return None
         print(
-            ui.telemetry("verification-nudge: fired (unverified file mutation)"),
+            ui.telemetry(
+                "verification-nudge: skipped (no verification tool in active mode)"
+            ),
             file=sys.stderr,
         )
-        session.append_steer(
-            "You modified files this turn but ran nothing to verify the "
-            "change. Verify it now with verify_scratch (a throwaway "
-            "snippet, no file pollution), run_tests, or run_command "
-            "against a separate script — never by adding repro/test code "
-            "to a production file or repurposing its "
-            "`if __name__ == \"__main__\"` block. These tools are loaded "
-            "into your toolset now — call one directly. Or state explicitly "
-            "in your answer that the change is unverified. Either way, end "
-            "your answer with a one-line verification breakdown: what "
-            "you checked (tests, commands, diagnostics) and what it "
-            "showed."
-        )
-        return None
 
     # S3 — hard verify gate: this is the SECOND final answer of the turn (the
     # bounce above already fired and needs_verification is still set — a
@@ -2225,9 +2270,10 @@ def handle_user_message(
     # function's docstring for the three exit paths.
     answer: str
     while True:
-        # Recomputed every iteration so a mid-turn load_tool call is reflected in
-        # the very next client.chat — a stale pre-loop snapshot would otherwise
-        # withhold the just-loaded tool's schema until the following user turn.
+        # Recomputed every iteration for symmetry with the rest of the loop, but
+        # the result is constant for the life of the process: the active mode's
+        # tool set is fixed at launch (registry.activate_mode) and nothing
+        # mid-turn can add to or remove from it.
         tool_schemas = schemas()
 
         # Compaction ladder + one chat call (with OverCapError retry). Returns

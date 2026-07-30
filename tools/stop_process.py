@@ -19,7 +19,6 @@ class StopProcess(Tool):
     """
 
     name = 'stop_process'
-    summary = 'Stop a tracked background process.'
     description = (
         'Stops a tracked background process by sending SIGTERM (escalating to '
         'SIGKILL if needed) and drains its final output.'

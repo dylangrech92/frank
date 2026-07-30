@@ -50,7 +50,6 @@ class SpawnAgents(Tool):
     """
 
     name = 'spawn_agents'
-    summary = 'Fan out independent subtasks to concurrent one-shot subagents.'
     description = (
         'Fan out independent subtasks to concurrent one-shot subagent '
         'children of this same harness. Use this to delegate independent read/research '
@@ -151,6 +150,15 @@ class SpawnAgents(Tool):
                 hint='handle this subtask directly instead of calling spawn_agents again',
             )
 
+        from tools import registry  # pylint: disable=import-outside-toplevel
+
+        mode = registry.current_mode()
+        if mode is None:
+            raise RuntimeError(
+                'spawn_agents: no mode is active in this process — refusing to '
+                'spawn a modeless child'
+            )
+
         max_concurrent, timeout_s = _subagent_config()
         install_dir = Path(__file__).resolve().parent.parent
         main_py = install_dir / 'main.py'
@@ -161,7 +169,7 @@ class SpawnAgents(Tool):
         results: list[dict[str, Any]] = [{} for _ in parsed_specs]
 
         def _run_child(idx: int, spec: dict[str, str]) -> tuple[int, dict[str, Any]]:
-            return idx, _spawn_one(main_py, spec, child_env, timeout_s)
+            return idx, _spawn_one(main_py, spec, child_env, timeout_s, mode)
 
         workers = max(1, min(max_concurrent, len(parsed_specs)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -226,15 +234,21 @@ def _spawn_one(
     spec: dict[str, str],
     child_env: dict[str, str],
     timeout_s: float,
+    mode: str,
 ) -> dict[str, Any]:
     """Run one child one-shot subprocess and return a normalized outcome dict.
+
+    The child is launched with ``--mode`` set to the parent's own active mode
+    (never a different one) — the child's toolset is exactly the parent's, so
+    a read-only research parent cannot escalate a child into an edit-capable
+    mode.
 
     Returns a dict with keys ``exit_code`` (int or None), ``timed_out`` (bool),
     ``spawn_error`` (bool), ``stdout`` (str), ``stderr`` (str).
     """
     try:
         proc = subprocess.run(
-            ['python3', str(main_py), '-p', '-'],
+            ['python3', str(main_py), '-p', '-', '--mode', mode],
             cwd=spec['cwd'],
             input=spec['prompt'],
             capture_output=True,

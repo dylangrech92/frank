@@ -18,7 +18,7 @@ Python 3.10+ is required. Dependencies are managed with [uv](https://docs.astral
 uv sync
 ```
 
-This creates a `.venv` and installs the pinned dependencies (`requests`, `mcp`, `psutil`) from the committed `uv.lock`. Run the agent with `uv run python main.py`, or activate `.venv` and run `python main.py` directly.
+This creates a `.venv` and installs the pinned dependencies (`requests`, `mcp`, `psutil`) from the committed `uv.lock`. Run the agent with `uv run python main.py --mode <mode>`, or activate `.venv` and run `python main.py --mode <mode>` directly — see [Run directly from the CLI](#3b-run-directly-from-the-cli) for the available modes.
 
 Optional packages (the agent degrades gracefully without each one):
 
@@ -94,19 +94,21 @@ Or in Claude Desktop (`claude_desktop_config.json`):
 
 ### 3b. Run directly from the CLI
 
+`--mode` is required for every launch that talks to an LLM — it selects the tool set (`research`, `code`, `test`, or `performance_debug`) loaded into the request from turn 0.
+
 ```bash
 # Interactive REPL
-uv run python main.py
+uv run python main.py --mode code
 
 # One-shot task (final answer to stdout, telemetry to stderr)
-uv run python main.py -p "Find all uses of the deprecated API and list the files"
+uv run python main.py --mode research -p "Find all uses of the deprecated API and list the files"
 
 # One-shot with JSON result envelope (for scripting / piping)
-echo "Add a docstring to foo()" | uv run python main.py -p - --json
+echo "Add a docstring to foo()" | uv run python main.py --mode code -p - --json
 
 # Resume a previous session
 uv run python main.py --list-sessions
-uv run python main.py --session 2026-07-11T14-30-00-12345
+uv run python main.py --mode test --session 2026-07-11T14-30-00-12345
 ```
 
 Run from inside the target project directory — the launch CWD becomes the sandboxed project root.
@@ -115,7 +117,7 @@ Run from inside the target project directory — the launch CWD becomes the sand
 
 ## How it works
 
-Frank treats every IDE operation as an LLM-driveable tool. Only `load_tool` is loaded by default; the system message advertises every other tool as `name(params): summary`, and the LLM calls `load_tool(name)` to activate what it needs. This keeps context lean on any given turn.
+Frank treats every IDE operation as an LLM-driveable tool. Every launch declares a mode — `research`, `code`, `test`, or `performance_debug` — and the LLM receives that mode's complete tool set with full schemas from turn 0. There is no discovery step and no way to load a tool outside the declared mode; each mode carries exactly the tools its task needs, which keeps context lean without making the model guess what's callable.
 
 **Tool categories:**
 - **Navigation**: `find_symbol`, `go_to_definition`, `find_references`, `call_hierarchy`, `hover`, `document_symbols`, `signature_help`
@@ -148,7 +150,7 @@ Frank's MCP server sends **progress heartbeats** every 10 seconds while the subp
 | **opencode** | Yes | Sets `resetTimeoutOnProgress: true` in its MCP client |
 | **Claude Desktop / Claude Code** | Likely not | Uses the MCP SDK default (`resetTimeoutOnProgress: false`). Known to timeout on long-running tools. |
 
-If your host doesn't reset on progress, the workaround is to use the CLI directly (`uv run python main.py -p - --json`) which has no timeout, or keep MCP tool calls small enough to finish within the host's window.
+If your host doesn't reset on progress, the workaround is to use the CLI directly (`uv run python main.py --mode code -p - --json`) which has no timeout, or keep MCP tool calls small enough to finish within the host's window.
 
 ---
 

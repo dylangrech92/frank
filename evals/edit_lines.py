@@ -38,17 +38,14 @@ _NUMBERED_LINE = re.compile(r'^\s*\d+\t', re.MULTILINE)
 
 
 def main() -> int:
-    from tools.registry import discover, dispatch
+    from tools import registry
+    from tools.registry import dispatch
 
-    discover()
     failures: list[str] = []
 
-    # edit_lines is gated (not pinned) on purpose — load it before dispatching,
-    # exactly as a protocol-following model would.
-    loaded = dispatch('load_tool', {'name': 'edit_lines'})
-    if loaded.status != 'success':
-        print(f'FAIL: load_tool(edit_lines) failed: {loaded.body!r}')
-        return 1
+    # edit_lines is declared by 'code' mode (modes.py) — activate it before
+    # dispatching, exactly as a protocol-following model's process would.
+    registry.activate_mode('code')
 
     def check(cond: bool, msg: str) -> None:
         if not cond:

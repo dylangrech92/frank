@@ -42,7 +42,6 @@ class DebugStart(Tool):
     """
 
     name = "debug_start"
-    summary = 'Start a debug session for a script, run to first breakpoint.'
     description = (
         'Start a debug session for a script at path (or a raw launch-config dict). '
         'Runs to the first breakpoint or program end and reports where execution stopped, '

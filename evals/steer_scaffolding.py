@@ -114,9 +114,9 @@ def check_e2e_scaffolding_survives() -> list[str]:
     disable_memory_hooks()
     from session import Session
 
-    # create_file is a catalog tool (read_file is PINNED); a live model activates
-    # it via load_tool before use, so do the same for dispatch to run it.
-    registry.activate("create_file")
+    # create_file and read_file are both declared by 'code' mode (modes.py).
+    saved_mode = registry.current_mode()
+    registry.activate_mode("code")
 
     failures: list[str] = []
 
@@ -180,6 +180,8 @@ def check_e2e_scaffolding_survives() -> list[str]:
                 )
     finally:
         os.chdir(original_cwd)
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
 
     return failures
 

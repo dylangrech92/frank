@@ -24,7 +24,6 @@ class FindReferences(Tool):
 
     name = 'find_references'
     parallel_safe = True  # read-only LSP query; doc-sync is lock-guarded (F3)
-    summary = 'Find all references to the symbol at a position.'
     description = (
         'Find all references to the symbol at a position in a file. '
         'Requires path, line (1-based), and column (1-based).'

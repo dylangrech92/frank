@@ -16,7 +16,6 @@ class SetBreakpoint(Tool):
     """
 
     name = 'set_breakpoint'
-    summary = 'Set a (optionally conditional) breakpoint at a file and line.'
     description = (
         'Set a breakpoint at a file and line, optionally conditional. '
         'Works before or during a debug session; mid-session breakpoints take effect immediately.'

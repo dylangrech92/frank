@@ -15,7 +15,6 @@ class Forget(Tool):
     """
 
     name = 'forget'
-    summary = 'Invalidate remembered fact(s) by key.'
     description = (
         'Invalidate/forget remembered fact(s) by key (optionally narrowed to a '
         'specific kind). Soft-deletes matching live atoms so they no longer '

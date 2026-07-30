@@ -93,7 +93,6 @@ class TraceExecution(Tool):
     """
 
     name = 'trace_execution'
-    summary = 'Python execution tracing: exact call counts, per-line hit counts, max stack depth.'
     description = (
         'Traces a target script (or snippet) with sys.settrace and reports '
         'exact call counts per function, per-line hit counts for an optional '

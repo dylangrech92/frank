@@ -42,7 +42,6 @@ class VerifyScratch(Tool):
     """
 
     name = 'verify_scratch'
-    summary = 'Run a throwaway snippet to verify a change, without adding a harness to the project.'
     description = (
         'Verifies a change end-to-end by running a THROWAWAY snippet against the '
         'real project. The harness itself is never written into the project '
