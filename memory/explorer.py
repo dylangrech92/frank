@@ -133,7 +133,7 @@ def _assistant_entry(text: str, tool_calls: list) -> dict[str, Any]:
 def _dispatch_call(call, last_read: dict[str, str]) -> str:
     """Execute one explorer tool call and render its result, tracking the last
     successfully-read file as a fallback anchor for bullets that omit one."""
-    from agent import render_tool_result
+    from turn.rendering import render_tool_result
     from tools.registry import activate, dispatch
 
     if call.name not in _READ_ONLY_TOOLS:
