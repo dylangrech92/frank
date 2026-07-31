@@ -8,6 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
+# The one spelling of a transcript's ``created_at`` timestamp. The writer below
+# formats with it and the reader parses with it; a second copy of this string is
+# exactly how the two halves drift apart without any error being raised.
+_CREATED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
 
 def _format_json(obj: Any) -> str:
     """Pretty-print *obj* as JSON with two-space indentation and trailing newline."""
@@ -102,7 +107,7 @@ def _load_transcript(
     created_at_raw = frontmatter.get("created_at")
     if created_at_raw:
         try:
-            created_at = datetime.strptime(created_at_raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+            created_at = datetime.strptime(created_at_raw, _CREATED_AT_FORMAT).replace(
                 tzinfo=timezone.utc
             )
         except ValueError:
@@ -189,7 +194,7 @@ def _write_transcript(
         f"session_id: {session_id}",
         f"cwd: {str(project_root)}",
         f"model: {model}",
-        f"created_at: {created_at.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        f"created_at: {created_at.strftime(_CREATED_AT_FORMAT)}",
         "---",
     ]
 
