@@ -28,13 +28,29 @@ _INTERPRETER_SUFFIXES: dict[str, str] = {
     'sh': '.sh',
 }
 
+# Running the snippet with the project root as cwd is not enough to make project
+# imports work: an interpreter handed a script path puts the SCRIPT's directory on
+# the module search path, and this script deliberately lives in the system temp
+# dir. Observed live — a snippet opening with `from calc import add` against a
+# project whose calc.py sat right there in the working directory died on
+# ModuleNotFoundError, and the model, having been promised by this tool's own
+# description that imports resolve, burned two more calls inventing paths that did
+# not exist. The env var per interpreter puts the project root back on the search
+# path so the promise holds.
+_MODULE_PATH_VARS: dict[str, str] = {
+    'python': 'PYTHONPATH',
+    'python3': 'PYTHONPATH',
+    'node': 'NODE_PATH',
+}
+
 
 class VerifyScratch(Tool):
     """Runs a throwaway snippet against the real project without writing it into the tree.
 
     The snippet itself is written to a temporary file outside the project tree
     (never under the project root) and executed with the project root as the
-    working directory, so imports and relative paths resolve exactly as they
+    working directory *and* on the interpreter's module search path (see
+    ``_MODULE_PATH_VARS``), so imports and relative paths resolve exactly as they
     would for the real code. The temp file is deleted after the run regardless
     of outcome. Because the working directory is the project root, the snippet
     still has write access to project files — it just isn't one itself, so it
@@ -130,8 +146,14 @@ class VerifyScratch(Tool):
             with os.fdopen(fd, 'w', encoding='utf-8') as fh:
                 fh.write(snippet)
 
+            project_root = str(Path.cwd())
             cmd = f'{interpreter} {shlex.quote(tmp_path)}'
-            result = run_one_shot(cmd, str(Path.cwd()), timeout_seconds=timeout)
+            path_var = _MODULE_PATH_VARS.get(interpreter)
+            if path_var is not None:
+                # Prepend rather than replace: an inherited value stays usable.
+                quoted_root = shlex.quote(project_root)
+                cmd = f'{path_var}={quoted_root}${{{path_var}:+:${path_var}}} {cmd}'
+            result = run_one_shot(cmd, project_root, timeout_seconds=timeout)
 
             if result['timed_out']:
                 partial = result['stdout']
