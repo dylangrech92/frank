@@ -7,6 +7,28 @@ import compaction
 from tools.registry import get_tool
 from tools.result import ToolResult
 
+# Error codes where the harness itself refused the call or could not route it at
+# all: an unknown tool means the mode does not carry what the model reached for,
+# and a hard-cap block means the harness stopped work it had already started.
+# Neither is the model's arguments being wrong, so both are facts about this
+# harness and worth recording. Argument errors (bad-range, not-read-yet,
+# not-a-directory) are the model's to fix and never carry the line below.
+_HARNESS_FAULT_CODES = frozenset({"unknown-tool", "loop-guard-blocked"})
+
+# The one thing the model cannot observe for itself. Three sabotaged live-fire
+# runs diagnosed a broken tool exactly and then wrote the diagnosis into their
+# ANSWER: the model was not failing to notice the defect, it believed describing
+# it was reporting it. Stated here, on the failing result, rather than only once
+# in the system prompt at turn 0 — a passive brief is not in front of the model
+# at the moment the tool actually fails. One directive, and no outcome named, so
+# there is nothing to game.
+_REPORT_ISSUE_FACT = (
+    "[report_issue] Describing this in your answer does not record it anywhere — "
+    "report_issue is the only channel that reaches the people who maintain these "
+    "tools. Call it when the harness rather than your own arguments is at fault, "
+    "then carry on with the task."
+)
+
 
 def render_tool_result(name: str, result: ToolResult) -> str:
     """Render a ``ToolResult`` value as plain text for a tool message content slot.
@@ -55,6 +77,9 @@ def render_tool_result(name: str, result: ToolResult) -> str:
     hint_text = result.hint
     if hint_text is not None and hint_text:
         lines.append(f"hint: {hint_text}")
+
+    if result.status == "error" and result.code in _HARNESS_FAULT_CODES:
+        lines.append(_REPORT_ISSUE_FACT)
 
     return "\n".join(lines)
 

@@ -9,5 +9,14 @@ dependencies = [
     "psutil",
 ]
 
+[dependency-groups]
+# PyYAML is not imported by the agent itself — only by the eval that parses the
+# report_issue log back. Declared here so `uv run` always has it: without it the
+# contract check silently skipped every one of its assertions and still reported
+# a pass.
+dev = [
+    "pyyaml",
+]
+
 [tool.uv]
 package = false

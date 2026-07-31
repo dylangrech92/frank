@@ -167,6 +167,14 @@ class ReadFile(Tool):
         # (numbering is display-only, so it must not count against the cap).
         lines = content.splitlines()
         total_lines = len(lines)
+        # Guard: start_line beyond the end of a non-empty file must fail loudly.
+        if total_lines > 0 and start_line > total_lines:
+            return ToolResult.err(
+                f'Invalid line range: start_line={start_line}, file has {total_lines} lines. '
+                'start_line must not exceed the file length.',
+                code='bad-range',
+            )
+
         sliced = lines[(start_line - 1): end_line]  # type: ignore[index]
         returned = '\n'.join(sliced)
         MAX_CHARACTERS = 50000

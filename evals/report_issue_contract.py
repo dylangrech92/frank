@@ -435,11 +435,21 @@ CHECKS = (
 def main() -> int:
     global LOG
 
+    # PyYAML is a declared dev dependency (pyproject.toml), so its absence is a
+    # broken environment rather than a reason to pass. Every check below parses
+    # the log back with it: skipping all ten and returning 0 reported a gate that
+    # never ran as a gate that passed, which is how the whole contract sat
+    # unexercised while smoke counted it green.
     try:
         import yaml  # noqa: F401
     except ImportError:
-        print('SKIP: PyYAML is not installed; report_issue log format not exercised')
-        return 0
+        print(
+            'FAIL: PyYAML is not importable, so no check in this contract ran. '
+            'Run the evals under `uv run` so the declared dev dependencies are '
+            'present.',
+            file=sys.stderr,
+        )
+        return 1
 
     from tools import registry, report_issue
 
