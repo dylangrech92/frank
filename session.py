@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
+import session_lock
 import stats
 from llm import ToolCall
 
@@ -59,7 +60,7 @@ class Session:
 
     Raises:
         RuntimeError: If another live process already holds the lock on this
-            session's transcript (see ``_acquire_lock``).
+            session's transcript (see ``session_lock.acquire``).
     """
 
     def __init__(
@@ -141,7 +142,7 @@ class Session:
         self._stats_output_tokens: int = int(prior.get("output", 0)) if prior else 0
         self._stats_run_started: float = time.monotonic()
 
-        self._acquire_lock()
+        session_lock.acquire(self._lock_path, self.session_id)
 
     @classmethod
     def resume(
@@ -414,46 +415,6 @@ class Session:
             f.write(file_contents)
         os.replace(tmp_path, self.transcript_path)
 
-    def _acquire_lock(self) -> None:
-        """Claim an advisory lock on this session's transcript.
-
-        Writes ``<transcript>.lock`` containing this process's pid. If a lock
-        file already exists and its pid is still alive, refuse to proceed —
-        two processes must never append to the same transcript concurrently.
-        A lock left behind by a dead process is treated as stale and replaced.
-
-        Raises:
-            RuntimeError: If another live process already holds the lock.
-        """
-        if self._lock_path.exists():
-            try:
-                existing_pid_text = self._lock_path.read_text(encoding="utf-8").strip()
-                existing_pid = int(existing_pid_text)
-            except (OSError, ValueError):
-                existing_pid = None
-
-            alive = False
-            if existing_pid is not None:
-                try:
-                    os.kill(existing_pid, 0)
-                    alive = True
-                except ProcessLookupError:
-                    alive = False
-                except PermissionError:
-                    # Process exists but we can't signal it — treat as alive.
-                    alive = True
-                except OSError:
-                    alive = False
-
-            if alive:
-                raise RuntimeError(
-                    f"session '{self.session_id}' is already active in process "
-                    f"{existing_pid} — resume it from that process or use a "
-                    f"different --session id"
-                )
-
-        self._lock_path.write_text(str(os.getpid()), encoding="utf-8")
-
     def record_llm_call(
         self,
         prompt_tokens: int | None,
@@ -486,8 +447,4 @@ class Session:
         never successfully acquired (e.g. constructor raised before writing
         it) — both cases are silently no-ops.
         """
-        try:
-            if self._lock_path.read_text(encoding="utf-8").strip() == str(os.getpid()):
-                self._lock_path.unlink()
-        except OSError:
-            pass
+        session_lock.release(self._lock_path)
