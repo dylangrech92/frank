@@ -134,14 +134,16 @@ def _dispatch_call(call, last_read: dict[str, str]) -> str:
     """Execute one explorer tool call and render its result, tracking the last
     successfully-read file as a fallback anchor for bullets that omit one."""
     from turn.rendering import render_tool_result
-    from tools.registry import activate, dispatch
+    from tools.registry import dispatch
 
     if call.name not in _READ_ONLY_TOOLS:
         return (
             f"[{call.name}(error code=not-allowed)]\n"
             f"only read-only exploration tools are available: {', '.join(_READ_ONLY_TOOLS)}"
         )
-    activate(call.name)  # idempotent; makes the tool dispatch-eligible this process
+    # No per-tool activation step any more: the run's mode is fixed at startup and
+    # every mode carries all three _READ_ONLY_TOOLS via modes._COMMON_TOOLS, so
+    # they are already dispatch-eligible here.
     try:
         result = dispatch(call.name, call.arguments)
     except Exception as exc:
