@@ -19,7 +19,7 @@ import session_lock
 import stats
 from llm import ToolCall
 
-from session_store import _load_transcript, _write_transcript, list_sessions  # noqa: F401
+from session_store import _load_transcript, _write_transcript, list_sessions
 
 
 # Module-level extension seam: add callables that accept a ``Session`` and

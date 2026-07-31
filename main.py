@@ -15,10 +15,11 @@ import modes
 import ui
 from agent import handle_user_message
 from config import Config, load as config_load
-from dap.manager import DAPManager, DebugUnavailableError
-from lsp.manager import LSPManager, LSPUnavailableError
+from dap.manager import DAPManager
+from lsp.manager import LSPManager
 from llm import LLMClient
-from session import Session, list_sessions
+from session import Session
+from session_store import list_sessions
 from runtime.process import reap_all
 from tools.registry import activate_mode, discover
 from diagnostics import STORE
