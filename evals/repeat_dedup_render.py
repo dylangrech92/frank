@@ -369,20 +369,20 @@ def check_verify_remutate_then_restub() -> list[str]:
 
 def check_verify_changed_output_full_body() -> list[str]:
     """c4. Direct-drive _repeat_render (verification): a changed fingerprint forces the full body."""
-    import agent
+    import turn.repeat_dedup as repeat_dedup
 
     failures: list[str] = []
 
     key: tuple[str, str] = ("run_command", '{"cmd": "report.py --csv"}')
     rendered_run1 = "[run_command(success)]\n--- stdout ---\nrows: 10\nexit_code: 0"
     rendered_run2 = "[run_command(success)]\n--- stdout ---\nrows: 11\nexit_code: 0"
-    fp1 = agent._render_fingerprint(rendered_run1)
+    fp1 = repeat_dedup._render_fingerprint(rendered_run1)
 
     # Same key, unchanged compaction (0) AND unchanged mutation count (0), but the
     # command's output changed since the last full render — condition (d) must
     # defeat the stub even though (e) and (m) are both satisfied.
     stamps: dict[tuple[str, str], tuple[str, int, int]] = {key: (fp1, 0, 0)}
-    out = agent._repeat_render(
+    out = repeat_dedup._repeat_render(
         "run_command", key, rendered_run2, stamps, 0, 0, verification=True
     )
     if _VERIFY_STUB_MARKER in out:
@@ -392,14 +392,14 @@ def check_verify_changed_output_full_body() -> list[str]:
         )
     if "rows: 11" not in out:
         failures.append(f"the changed output body was not re-emitted: {out!r}")
-    if stamps[key] != (agent._render_fingerprint(rendered_run2), 0, 0):
+    if stamps[key] != (repeat_dedup._render_fingerprint(rendered_run2), 0, 0):
         failures.append(
             f"stamp was not re-stamped at the new fingerprint: {stamps[key]!r}"
         )
 
     # Positive control: identical fingerprint AND unchanged compaction/mutation → stub.
     stamps2: dict[tuple[str, str], tuple[str, int, int]] = {key: (fp1, 0, 0)}
-    out2 = agent._repeat_render(
+    out2 = repeat_dedup._repeat_render(
         "run_command", key, rendered_run1, stamps2, 0, 0, verification=True
     )
     if _VERIFY_STUB_MARKER not in out2:
@@ -479,20 +479,20 @@ def check_readonly_dedups_despite_other_mutation() -> list[str]:
 
 def check_compaction_defeats_dedup() -> list[str]:
     """d. Direct-drive _repeat_render: a bumped compaction count forces a full body."""
-    import agent
+    import turn.repeat_dedup as repeat_dedup
 
     failures: list[str] = []
 
     key: tuple[str, str] = ("read_file", '{"path": "a.txt"}')
     rendered = "[read_file(success)]\n     1\tstable body\ntotal_lines: 1"
-    fingerprint = agent._render_fingerprint(rendered)
+    fingerprint = repeat_dedup._render_fingerprint(rendered)
 
     # (e) same key + same fingerprint, but a compaction happened since the last
     # full render (stamp says 0, current turn is at 1) -> the earlier result may
     # have been folded away, so the body must be re-emitted and re-stamped. The
     # mutation stamp is held constant here — read-only dedup never gates on it.
     stamps: dict[tuple[str, str], tuple[str, int, int]] = {key: (fingerprint, 0, 0)}
-    out = agent._repeat_render("read_file", key, rendered, stamps, 1, 0, verification=False)
+    out = repeat_dedup._repeat_render("read_file", key, rendered, stamps, 1, 0, verification=False)
     if _STUB_MARKER in out:
         failures.append(
             f"a compaction since the last full render did NOT defeat the stub — "
@@ -507,7 +507,7 @@ def check_compaction_defeats_dedup() -> list[str]:
 
     # Positive control: identical fingerprint AND unchanged compaction count -> stub.
     stamps2: dict[tuple[str, str], tuple[str, int, int]] = {key: (fingerprint, 3, 0)}
-    out2 = agent._repeat_render("read_file", key, rendered, stamps2, 3, 0, verification=False)
+    out2 = repeat_dedup._repeat_render("read_file", key, rendered, stamps2, 3, 0, verification=False)
     if _STUB_MARKER not in out2:
         failures.append(
             f"an unchanged body at an unchanged compaction count was not "
