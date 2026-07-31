@@ -3,7 +3,7 @@
 Two harness steers tell the model to verify its edits by name — the reproduce-
 before-edit steer names ``run_command`` directly; the H1 post-mutation
 verification nudge names whichever subset of run_command/run_tests/
-verify_scratch the active mode's ``agent._available_verification_tools()``
+verify_scratch the active mode's ``_available_verification_tools()``
 reports. Tools are now a static per-mode set fixed for the life of the process
 (``registry.activate_mode``, ``modes.py``) — there is no more load_tool-style
 dynamic activation, so a steer naming a tool absent from the active mode would
@@ -13,12 +13,12 @@ actually carries, and the tool it does name is genuinely callable end to end.
 
 This script drives the *real* production hot path (``agent.handle_user_message``
 with a stub LLM client, no network) plus direct calls into the real
-``agent``/``tools.registry`` module functions, and asserts:
+``turn``/``tools.registry`` module functions, and asserts:
 
-a. ``agent._available_verification_tools()`` returns exactly the documented
-   per-mode set: research -> [] (no mutating tools, nothing to verify); code
-   -> ['run_command', 'verify_scratch'] (code mode's own instructions forbid
-   running the suite, so never run_tests); test ->
+a. ``turn.verification._available_verification_tools()`` returns exactly the
+   documented per-mode set: research -> [] (no mutating tools, nothing to
+   verify); code -> ['run_command', 'verify_scratch'] (code mode's own
+   instructions forbid running the suite, so never run_tests); test ->
    ['run_command', 'run_tests', 'verify_scratch'] (all three); performance_debug
    -> ['run_command'] (profiling tools are not verification tools).
 
@@ -85,8 +85,8 @@ def _final_answer_response(text: str):
 
 def check_available_verification_tools_per_mode() -> list[str]:
     """a. _available_verification_tools() matches the documented per-mode set."""
-    import agent
     import tools.registry as registry
+    from turn.verification import _available_verification_tools
 
     failures: list[str] = []
     expected = {
@@ -100,7 +100,7 @@ def check_available_verification_tools_per_mode() -> list[str]:
     try:
         for mode_name, expected_tools in expected.items():
             registry.activate_mode(mode_name)
-            available = agent._available_verification_tools()
+            available = _available_verification_tools()
             if available != expected_tools:
                 failures.append(
                     f"mode {mode_name!r}: expected _available_verification_tools() "
@@ -115,14 +115,15 @@ def check_available_verification_tools_per_mode() -> list[str]:
 
 def check_nudge_names_only_available_tools() -> list[str]:
     """b. The H1 nudge text names exactly the active mode's available tools."""
-    import agent
     import tools.registry as registry
+    from turn.steering import _verification_nudge_text
+    from turn.verification import _available_verification_tools
 
     failures: list[str] = []
     saved_mode = registry.current_mode()
     try:
         registry.activate_mode("code")
-        code_text = agent._verification_nudge_text(agent._available_verification_tools())
+        code_text = _verification_nudge_text(_available_verification_tools())
         if "run_tests" in code_text:
             failures.append(
                 f"code mode's H1 nudge names run_tests, which code mode does not "
@@ -134,7 +135,7 @@ def check_nudge_names_only_available_tools() -> list[str]:
             failures.append(f"code mode's H1 nudge does not name verify_scratch: {code_text!r}")
 
         registry.activate_mode("test")
-        test_text = agent._verification_nudge_text(agent._available_verification_tools())
+        test_text = _verification_nudge_text(_available_verification_tools())
         if "run_tests" not in test_text:
             failures.append(f"test mode's H1 nudge does not name run_tests: {test_text!r}")
         if "run_command" not in test_text:
@@ -143,7 +144,7 @@ def check_nudge_names_only_available_tools() -> list[str]:
             failures.append(f"test mode's H1 nudge does not name verify_scratch: {test_text!r}")
 
         registry.activate_mode("performance_debug")
-        perf_text = agent._verification_nudge_text(agent._available_verification_tools())
+        perf_text = _verification_nudge_text(_available_verification_tools())
         if "run_tests" in perf_text:
             failures.append(
                 f"performance_debug mode's H1 nudge names run_tests, which it "

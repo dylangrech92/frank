@@ -38,7 +38,7 @@ from turn.lint_delta import (
 from turn.llm_call import _run_llm_with_compaction
 from turn.outcome import (
     _blocked_loop_giveup,
-    _stamp_turn_outcome,
+    _finalize_answer,
     _text_loop_giveup,
 )
 from turn.rendering import _guard_oversize_result, render_tool_result
@@ -61,11 +61,9 @@ from turn.steering import (
     _BLOCKED_STREAK_CAP,
     _NO_FAILURE_OBSERVED_STEER,
     _REPRO_BEFORE_EDIT_STEER,
-    _verification_nudge_text,
 )
 from turn.state import _TurnState
 from turn.verification import (
-    _available_verification_tools,
     _maybe_arm_first_mutation_steer,
     _record_verification_run,
     _REPEAT_CALL_CAP,
@@ -547,126 +545,6 @@ def _dispatch_round(
     # _maybe_arm_first_mutation_steer).
     if state.no_failure_steer_fired and not no_failure_fired_before:
         session.append_steer(_NO_FAILURE_OBSERVED_STEER)
-
-
-def _finalize_answer(
-    session: Session,
-    state: "_TurnState",
-    response: ChatResponse,
-    on_delta: Callable[[str], None] | None,
-) -> str | None:
-    """Run the no-tool-call gate cascade and return the turn's answer.
-
-    In order: bounce once on an empty answer (empty-answer nudge), bounce once
-    on an unverified file mutation (H1 verification nudge), then — on the second
-    pass through — mark the S3 verify gate, surface an empty-answer placeholder,
-    and deliver the answer through on_delta.
-
-    Returns the final answer string (terminal — the caller returns it), or
-    ``None`` when a nudge bounced (the caller loops again). ``append_assistant``
-    for this response has already run in ``handle_user_message`` before this
-    call, so the transcript holds the model's original, unprefixed text. The
-    end-of-turn consolidation hook is NOT fired here — ``handle_user_message``
-    owns it as the single choke point across every turn-exit path.
-    """
-    text = response.text or ""
-
-    # Empty-answer retry: the model ended the turn with no text and no tool
-    # calls — a common local-model failure mode (a bare stop token after
-    # consuming tool results) that REPL mode would silently swallow (it discards
-    # the return value and only on_delta delivers output, so an empty return
-    # leaves the user at a blank prompt with the tool calls having visibly run).
-    # Inject a harness steer and loop once more rather than re-rolling the
-    # identical request (which risks a deterministic re-collapse). Bounded to a
-    # single retry per turn; a second empty turn is surfaced via the placeholder
-    # below.
-    if not text.strip() and not state.empty_answer_nudge_fired:
-        state.empty_answer_nudge_fired = True
-        print(
-            ui.telemetry("empty-answer-nudge: fired (empty assistant turn)"),
-            file=sys.stderr,
-        )
-        session.append_steer(
-            "You produced no answer this turn. Respond now with a concise "
-            "summary of what you did or found, grounded in the tool results "
-            "above. Do not call more tools unless a result is genuinely missing."
-        )
-        return None
-
-    # H1 — post-mutation verification nudge: the model is about to end the turn
-    # having mutated files without running anything to verify the change. Inject
-    # a harness steer and do one more loop iteration instead of returning. Fires
-    # at most once per turn, and only names verification tools the active mode
-    # actually carries (_available_verification_tools). If none are available —
-    # unreachable in practice, since every mode with a mutating tool also carries
-    # run_command — there is nothing truthful to steer with, so this falls
-    # straight through to the S3 gate below instead of bouncing on a toolless
-    # nudge.
-    if state.needs_verification and not state.verification_nudge_fired:
-        state.verification_nudge_fired = True
-        available = _available_verification_tools()
-        if available:
-            print(
-                ui.telemetry("verification-nudge: fired (unverified file mutation)"),
-                file=sys.stderr,
-            )
-            session.append_steer(_verification_nudge_text(available))
-            return None
-        print(
-            ui.telemetry(
-                "verification-nudge: skipped (no verification tool in active mode)"
-            ),
-            file=sys.stderr,
-        )
-
-    # S3 — hard verify gate: this is the SECOND final answer of the turn (the
-    # bounce above already fired and needs_verification is still set — a
-    # run_tests/run_command/verify_scratch call never succeeded in between).
-    # Accept it, but mark it: prefix the *returned* text with a harness-side
-    # "[UNVERIFIED CHANGES] " so the caller sees the state, unless the model
-    # already declared the change unverified in its own words (case-insensitive
-    # match). The transcript already recorded the model's original, unprefixed
-    # text — only the return value / on_delta payload gets the marker.
-    final_text = text
-    # S4 — record the UNPREFIXED answer before any marker is layered on; this is
-    # the single source of truth the --json envelope reads back via
-    # session.turn_report.
-    state.turn_report["answer"] = final_text
-    if state.needs_verification and state.verification_nudge_fired:
-        state.turn_report["declared_unverified"] = "unverified" in final_text.lower()
-        if not state.turn_report["declared_unverified"]:
-            final_text = "[UNVERIFIED CHANGES] " + final_text
-            print(
-                ui.telemetry(
-                    "verification-gate: unresolved after bounce — "
-                    "marking [UNVERIFIED CHANGES]"
-                ),
-                file=sys.stderr,
-            )
-    # Net-change annotation + one shared formula for verified, both stamped in
-    # order at this single turn-exit choke point via _stamp_turn_outcome (shared
-    # with the give-up paths) so every exit reports the same truth the same way.
-    _stamp_turn_outcome(state)
-
-    # Empty-answer placeholder: if the model returned no text at all (the retry
-    # above already fired once and still came back empty), surface a transparent
-    # placeholder. Layered onto the return value / on_delta payload ONLY — the
-    # transcript and turn_report["answer"] already hold the real empty string as
-    # the source of truth. Uses the original response text (not the
-    # possibly-prefixed final_text) so it overrides a vacuous
-    # "[UNVERIFIED CHANGES] " prefix too.
-    if not text.strip():
-        final_text = "(no response from model)"
-        print(
-            ui.telemetry("empty-answer: no text after retry — surfacing placeholder"),
-            file=sys.stderr,
-        )
-
-    if on_delta is not None and final_text:
-        if state.streamed == 0:
-            on_delta(final_text)  # non-streaming / gated fallback: deliver whole
-        on_delta("\n")
-    return final_text
 
 
 # =============================================================================
