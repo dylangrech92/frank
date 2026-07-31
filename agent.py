@@ -1,16 +1,22 @@
-"""Core agent loop with four named extension hooks for lifecycle phases.
+"""The agent turn loop: dispatch rounds, the mutation bus, the lifecycle hooks.
 
 ``handle_user_message`` is the public entry point that drives the
-read-eval-print cycle between a Session transcript and an LLMClient. Its body is
-split into a per-turn ``_TurnState`` dataclass (the ~dozen mutable locals the
-turn threads through its LLM calls) plus three focused helpers along the natural
-seams: ``_run_llm_with_compaction`` (the compaction ladder + one chat call, with
-OverCapError retry), ``_dispatch_round`` (the tool-call dispatch loop and its
-guards), and ``_finalize_answer`` (the no-tool-call gate cascade: empty-answer
-bounce → H1 verification nudge → S3 gate marking → placeholder → return). Also
-here: three explicit hook no-op functions and the over-cap give-up seam.
+read-eval-print cycle between a Session transcript and an LLMClient. A turn's
+mutable locals live in a per-turn ``_TurnState`` dataclass, and each iteration
+splits at one seam: ``turn.llm_call`` makes the single chat call behind the
+compaction ladder, and ``_dispatch_round`` here runs whatever tool calls came
+back, under the guards that stop a round running away. How a turn ENDS — the
+no-tool-call gate cascade and the three give-up exits — lives in
+``turn.outcome``.
 
-Harness turn guidance (empty-answer bounce, H1 verification nudge) is injected
+What stays here besides the loop is what the loop cannot be lifted away from:
+the ``_TURN_MUTATIONS`` bus and the ``_mutate_tracker`` subscribed to it at
+import time (move that subscription somewhere nothing imports at module level
+and file tracking dies silently), plus the four lifecycle hooks — one of which
+drains the bus.
+
+Harness turn guidance issued from this file (the repeat-cap steer, the
+repro-before-edit steer, the no-failure-observed steer) is injected
 via ``Session.append_steer`` — a ``user``-role message flagged ``steer`` and
 content-prefixed with ``session.STEER_PREFIX`` (an explicit "automated message
 from the harness, NOT from the user" marker) — not as a plain user message, so the model,
@@ -72,7 +78,7 @@ from turn.verification import (
 
 
 # =============================================================================
-# Extension hooks — four named no-op seams for later phases
+# Extension hooks — four named lifecycle seams
 # =============================================================================
 
 # Module-level list tracking every mutation event since last ``diagnostics_inject_summary`` call.
@@ -236,9 +242,9 @@ def consolidation_maybe_extract(session: Session, client: LLMClient) -> None:
         print(f"consolidation-enqueue-error: {exc}", file=sys.stderr)
 
 
-# The fourth hook — over-cap handling — lives directly in the ``handle_user_message``
-# loop body as the OverCapError branch described by the contract below.  Its docstring
-# lives inline there and is noted under the return path.
+# The fourth hook — over-cap handling — lives in ``turn.llm_call``, which owns the
+# compaction ladder and the OverCapError retry that seam belongs to. It surfaces
+# here as the over-cap exit in the ``handle_user_message`` contract below.
 
 # =============================================================================
 # Helpers
