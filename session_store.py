@@ -1,4 +1,8 @@
-"""Helpers for reading and listing transcript files on disk."""
+"""Reading, writing and listing transcript files on disk.
+
+Both halves of the format live in this one module so the writer cannot drift
+from the reader that has to parse what it wrote.
+"""
 
 from __future__ import annotations
 
