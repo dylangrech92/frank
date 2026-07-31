@@ -46,8 +46,10 @@ from turn.repeat_dedup import (
 from turn.steering import (
     _BLOCKED_ROUND_STEER,
     _BLOCKED_STREAK_CAP,
+    _is_bug_report,
     _NO_FAILURE_OBSERVED_STEER,
     _REPRO_BEFORE_EDIT_STEER,
+    _verification_nudge_text,
 )
 from turn.state import _TurnState
 from turn.verification import (
@@ -272,88 +274,6 @@ def _loop_guard_check(
         f"user what error you are getting."
     )
     return rendered + steer
-
-
-def _is_bug_report(message: str) -> bool:
-    """True when the user's request reads as a bug report (case-insensitive).
-
-    A plain substring match against ``_BUG_REPORT_LEXICON``. Keeps the
-    no-failure-observed steer out of pure feature work — it only makes sense to
-    warn "you are fixing a failure you never saw fail" when the request actually
-    claims a failure.
-    """
-    low = message.lower()
-    return any(term in low for term in _BUG_REPORT_LEXICON)
-
-
-# Per-tool clause for the H1 post-mutation verification nudge below, keyed by
-# name so the nudge names exactly the verification tools the active mode
-# carries (see _available_verification_tools) instead of hard-coding all
-# three — code mode has no run_tests, performance_debug has neither run_tests
-# nor verify_scratch.
-_VERIFICATION_TOOL_CLAUSE = {
-    "run_command": "run_command against a separate script",
-    "run_tests": "run_tests",
-    "verify_scratch": "verify_scratch (a throwaway snippet, no file pollution)",
-}
-
-
-def _join_with_or(items: list[str]) -> str:
-    """Join *items* with commas and a trailing "or", oxford-comma style."""
-    if len(items) == 1:
-        return items[0]
-    if len(items) == 2:
-        return f"{items[0]} or {items[1]}"
-    return ", ".join(items[:-1]) + f", or {items[-1]}"
-
-
-def _verification_nudge_text(available: list[str]) -> str:
-    """Build the H1 post-mutation verification nudge from the mode's actual tools.
-
-    ``available`` is ``_available_verification_tools()`` — a sorted, non-empty
-    subset of ``_VERIFICATION_TOOLS`` — so this only ever names tools the model
-    can actually call in the active mode. Wording is preserved verbatim from
-    the original hard-coded steer; only which tools are named, and the
-    singular/plural framing of the closing sentence, vary with the list.
-    """
-    tools_text = _join_with_or([_VERIFICATION_TOOL_CLAUSE[name] for name in available])
-    toolset_sentence = (
-        "This tool is loaded into your toolset now — call it directly."
-        if len(available) == 1
-        else "These tools are loaded into your toolset now — call one directly."
-    )
-    return (
-        "You modified files this turn but ran nothing to verify the "
-        f"change. Verify it now with {tools_text} — never by adding "
-        "repro/test code to a production file or repurposing its "
-        "`if __name__ == \"__main__\"` block. "
-        f"{toolset_sentence} Or state explicitly "
-        "in your answer that the change is unverified. Either way, end "
-        "your answer with a one-line verification breakdown: what "
-        "you checked (tests, commands, diagnostics) and what it "
-        "showed."
-    )
-
-
-# Word/phrase lexicon (case-insensitive substring) that marks a user request as a
-# bug report rather than a pure feature task. Gates the no-failure-observed steer:
-# warning "you are fixing a failure you never saw fail" only makes sense when the
-# request actually claims a failure.
-_BUG_REPORT_LEXICON = (
-    "crash",
-    "error",
-    "exception",
-    "traceback",
-    "bug",
-    "broken",
-    "fails",
-    "failing",
-    "failure",
-    "regression",
-    "wrong output",
-    "incorrect",
-)
-
 
 
 def _call_signature(arguments: dict) -> str:
