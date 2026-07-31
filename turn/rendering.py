@@ -8,12 +8,14 @@ from tools.registry import get_tool
 from tools.result import ToolResult
 
 # Error codes where the harness itself refused the call or could not route it at
-# all: an unknown tool means the mode does not carry what the model reached for,
-# and a hard-cap block means the harness stopped work it had already started.
-# Neither is the model's arguments being wrong, so both are facts about this
-# harness and worth recording. Argument errors (bad-range, not-read-yet,
-# not-a-directory) are the model's to fix and never carry the line below.
-_HARNESS_FAULT_CODES = frozenset({"unknown-tool", "loop-guard-blocked"})
+# all: the tool does not exist, or exists but is not in this mode's fixed tool set
+# (registry.dispatch is explicit that there is no rescue path — the set is fixed
+# for the life of the process), or a hard-cap block stopped work already started.
+# None of the three is the model's arguments being wrong, so all three are facts
+# about this harness and worth recording. Argument errors (bad-range,
+# not-read-yet, not-a-directory) are the model's to fix and never carry the line
+# below.
+_HARNESS_FAULT_CODES = frozenset({"unknown-tool", "not-in-mode", "loop-guard-blocked"})
 
 # The one thing the model cannot observe for itself. Three sabotaged live-fire
 # runs diagnosed a broken tool exactly and then wrote the diagnosis into their
