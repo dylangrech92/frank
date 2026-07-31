@@ -323,3 +323,45 @@ def _repeat_call_check(
             verification=is_verification,
         )
     return rendered + _REPEAT_STEER_SUFFIX.format(name=name)
+
+
+def _web_search_focus_check(name: str, result: ToolResult, rendered: str, searches_without_read: int) -> tuple[str, int]:
+    """Nudge the model to stop paraphrase-searching and read a result instead.
+
+    Reactive, zero-cost-on-happy-path mechanism mirroring ``_loop_guard_check``:
+    tracks consecutive successful ``web_search`` calls (per turn) with no
+    intervening ``web_read``.  Only ``web_search`` and ``web_read`` participate —
+    every other tool passes through the counter untouched.  Failed ``web_search``
+    calls do not count (the loop-guard already owns repeated failures).
+
+    Args:
+        name: Registered tool name for this call.
+        result: The (possibly oversize-guard-substituted) ``ToolResult``.
+        rendered: The rendered result text for this call.
+        searches_without_read: Running per-turn count of consecutive successful
+            ``web_search`` calls since the last ``web_read``.
+
+    Returns:
+        ``(rendered, searches_without_read)`` — *rendered* gets a ``[focus]``
+        suffix appended when this is the 3rd+ consecutive successful
+        ``web_search`` without a ``web_read`` in between; the updated counter is
+        always returned.
+    """
+    if name == "web_read":
+        return rendered, 0
+
+    if name != "web_search" or result.status != "success":
+        return rendered, searches_without_read
+
+    searches_without_read += 1
+    if searches_without_read >= 3:
+        n = searches_without_read
+        focus = (
+            f"\n\n[focus] This is web search #{n} this turn without reading any "
+            f"result. Searching again is unlikely to add new information — pick "
+            f"the most relevant result and web_read it, or answer with what you "
+            f"already have."
+        )
+        rendered = rendered + focus
+
+    return rendered, searches_without_read
