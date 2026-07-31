@@ -35,12 +35,20 @@ from turn.lint_delta import (
     _lint_pre_snapshot,
     _lint_resolve_call_path,
 )
-from turn.outcome import _blocked_loop_giveup, _over_cap_giveup, _stamp_turn_outcome
+from turn.outcome import (
+    _blocked_loop_giveup,
+    _over_cap_giveup,
+    _stamp_turn_outcome,
+    _text_loop_giveup,
+)
 from turn.rendering import _guard_oversize_result, render_tool_result
 from turn.guards import (
-    _call_signature,
+    _batch_exceeds_repeat_cap,
     _loop_guard_check,
     _repeat_call_check,
+    _repeat_cap_block_count,
+    _round_abandoned_result,
+    _text_runaway_count,
 )
 from turn.mutations import (
     _capture_preimage,
@@ -59,7 +67,6 @@ from turn.state import _TurnState
 from turn.verification import (
     _available_verification_tools,
     _REPEAT_CALL_CAP,
-    _REPEAT_CAP_EXEMPT,
     _run_failure_is_environment_noise,
     _VERIFICATION_TOOLS,
     _verification_run_passed,
@@ -623,11 +630,14 @@ def _dispatch_sequential_call(
     The hard cap refuses an identical call once it has repeated
     ``_REPEAT_CALL_CAP`` times this turn (verification tools exempt — a
     rebuild/retest cycle legitimately repeats). The count is maintained
-    post-render by ``_repeat_call_check``; here we read the tally of *previous*
-    identical calls and block before dispatching, guaranteeing a stuck no-op loop
-    ends. A block increments ``state.blocked_streak`` (feeding the escalation
-    ladder in handle_user_message), while any real dispatch resets it to 0 —
-    consecutive blocks with no dispatch in between are the stuck signal.
+    post-render by ``_repeat_call_check``; here we ask ``_repeat_cap_block_count``
+    — the one enforcement reader, so ``_dispatch_round``'s parallel batch path
+    applies exactly the same cap rather than skipping it — for the tally of
+    *previous* identical calls, and block before dispatching, guaranteeing a
+    stuck no-op loop ends. A block increments ``state.blocked_streak`` (feeding
+    the escalation ladder in handle_user_message), while any real dispatch resets
+    it to 0 — consecutive blocks with no dispatch in between are the stuck
+    signal.
 
     Returns ``(result, lint_suffix)`` — the dispatched (or blocked) ToolResult
     and the reactive lint-delta suffix (empty unless a single-path write tool
@@ -653,9 +663,8 @@ def _dispatch_sequential_call(
     # read-only/non-path calls (they record nothing); files first mutated by
     # run_command have no path argument here and stay unknown.
     _capture_preimage(state, call, str(session.project_root))
-    _repeat_key = (call.name, _call_signature(call.arguments))
-    _repeat_n = state.seen_calls.get(_repeat_key, 0)
-    if call.name not in _REPEAT_CAP_EXEMPT and _repeat_n >= _REPEAT_CALL_CAP:
+    _repeat_n = _repeat_cap_block_count(call.name, call.arguments, state.seen_calls)
+    if _repeat_n is not None:
         result: ToolResult = ToolResult.err(
             f"{call.name} has already been called {_repeat_n} "
             f"times this turn with identical arguments. Repeating "
@@ -712,12 +721,21 @@ def _dispatch_round(
     """Dispatch this response's tool calls and record their results.
 
     Streams any intermediate assistant text once, dispatches the batch
-    (concurrently when every call is parallel_safe, else sequentially via
-    ``_dispatch_sequential_call`` with the per-call guards: loop-guard hard cap,
-    reactive lint-delta, and H1/H5/S4 mutation tracking), runs the shared
-    rendered-result pipeline on each result (oversize-result guard, loop-guard /
-    repeat-call / web-search-focus steers, reactive lint-delta suffix), appends
-    each to the transcript, then injects the LSP diagnostics summary.
+    (concurrently when every call is parallel_safe AND none is already at the
+    repeat cap, else sequentially via ``_dispatch_sequential_call`` with the
+    per-call guards: loop-guard hard cap, reactive lint-delta, and H1/H5/S4
+    mutation tracking), runs the shared rendered-result pipeline on each result
+    (oversize-result guard, loop-guard / repeat-call / web-search-focus steers,
+    reactive lint-delta suffix), appends each to the transcript, then injects the
+    LSP diagnostics summary.
+
+    The round is itself bounded: once ``state.blocked_streak`` reaches
+    ``_BLOCKED_STREAK_CAP`` mid-batch, the remaining calls are never dispatched —
+    each gets a ``round-abandoned`` result row so the transcript stays
+    wire-legal, and the escalation ladder in ``handle_user_message`` ends the
+    turn as soon as this returns. Without that bound a single assistant message
+    carrying thousands of identical calls is walked in full before the ladder is
+    ever consulted (measured: 2,555 calls in one message, 2,497 of them blocked).
 
     Two fold-surviving steers may be appended AFTER all tool results (never
     between an assistant tool_calls message and its results, which would break
@@ -740,9 +758,19 @@ def _dispatch_round(
     # Concurrent dispatch when the whole batch is read-only and thread-safe
     # (see Tool.parallel_safe). Any unsafe or unknown tool in the batch forces
     # the sequential path, preserving effect ordering.
+    #
+    # A batch that would breach the repeat cap takes the sequential path too, so
+    # its surplus calls meet the same block every other call meets: enforcement
+    # lives in _dispatch_sequential_call, which this branch skips entirely, and
+    # the branch then clears blocked_streak as proof of progress. Measured live,
+    # that combination let one turn issue the same read_file 102 times against a
+    # cap of 3 — and it is also why a burst arriving in a single message must be
+    # checked against the batch's own repeats, not just the turn's earlier ones.
     parallel_results: list[ToolResult] | None = None
-    if len(calls) > 1 and all(
-        getattr(get_tool(c.name), "parallel_safe", False) for c in calls
+    if (
+        len(calls) > 1
+        and all(getattr(get_tool(c.name), "parallel_safe", False) for c in calls)
+        and not _batch_exceeds_repeat_cap(calls, state.seen_calls)
     ):
         for call in calls:
             print(
@@ -764,6 +792,39 @@ def _dispatch_round(
     repro_fired_before = state.repro_steer_fired
     no_failure_fired_before = state.no_failure_steer_fired
     for i, call in enumerate(calls):
+        # In-round runaway bound. The hard cap refuses one call at a time, which
+        # bounds nothing when a single assistant message carries the whole loop:
+        # one measured turn arrived with 2,555 tool calls, 2,500 byte-identical,
+        # and every one was walked (2,497 blocked, a transcript row each) because
+        # the escalation ladder in handle_user_message only runs once this round
+        # RETURNS. So the round stops itself at the same cap the ladder uses, and
+        # the ladder then force-finalizes the turn on the very next statement
+        # after this function returns.
+        #
+        # Every remaining call still gets a result row: the wire protocol pairs
+        # one tool message to every id in the assistant's tool_calls, and a
+        # session is resumable, so a round that just stopped emitting would leave
+        # a transcript the next request cannot send. They are appended without
+        # dispatch, without the per-call guards, and without echoing each one to
+        # stderr — one telemetry line stands for the lot.
+        if state.blocked_streak >= _BLOCKED_STREAK_CAP:
+            remaining = calls[i:]
+            print(
+                ui.telemetry(
+                    f"loop-guard: round abandoned — {len(remaining)} undispatched "
+                    f"call(s) after {state.blocked_streak} consecutive blocks"
+                ),
+                file=sys.stderr,
+            )
+            abandoned = _round_abandoned_result(state.blocked_streak)
+            for skipped in remaining:
+                session.append_tool_result(
+                    skipped.id,
+                    skipped.name,
+                    render_tool_result(skipped.name, abandoned),
+                )
+            break
+
         # Only ever populated on the sequential path (parallel_safe tools never
         # mutate, so there is nothing to lint-delta there).
         if parallel_results is not None:
@@ -984,10 +1045,17 @@ def handle_user_message(
        c. **blocked-loop escalation exit** — after ``_dispatch_round`` leaves
           ``state.blocked_streak >= _BLOCKED_STREAK_CAP`` (the model kept
           re-issuing a hard-cap-blocked call), ``_blocked_loop_giveup``
-          force-finalizes the turn with a plain-text give-up answer.
+          force-finalizes the turn with a plain-text give-up answer. The round
+          itself stops dispatching at that same cap, so this fires within one
+          round rather than only between rounds.
+       d. **narration-runaway exit** — the model sent identical prose on
+          ``_TEXT_RUNAWAY_CAP`` tool-bearing rounds, a loop the call-level
+          tallies cannot see; ``_text_loop_giveup`` force-finalizes the turn.
+          Checked before the assistant row is appended, so the looping row is
+          dropped rather than left in the transcript without tool results.
     3. **single choke point** — after the loop breaks, the end-of-turn
        consolidation hook (``consolidation_maybe_extract``) fires exactly once,
-       on EVERY exit path, so a turn force-finalized by (a)/(c) is mined into
+       on EVERY exit path, so a turn force-finalized by (a)/(c)/(d) is mined into
        durable memory just like a normally-finalized (b) turn. It runs after the
        final answer / give-up message is settled and appended, so the transcript
        tail it snapshots includes it.
@@ -1020,7 +1088,9 @@ def handle_user_message(
         The final assistant text string — either a normal turn response, a
         consolidation pass-through, the over-cap sentinel message, the
         blocked-loop give-up message (the escalation ladder force-finalizing a
-        turn stuck at ``_BLOCKED_STREAK_CAP`` consecutive hard-cap blocks), or a
+        turn stuck at ``_BLOCKED_STREAK_CAP`` consecutive hard-cap blocks), the
+        narration-runaway give-up message (``_TEXT_RUNAWAY_CAP`` identical
+        assistant texts on tool-bearing rounds), or a
         turn response prefixed with "[UNVERIFIED CHANGES] " when the S3 hard
         verify gate bounced once and the follow-up answer still neither
         verified the mutation nor declared it unverified.
@@ -1063,7 +1133,7 @@ def handle_user_message(
     # Every turn-exit path assigns ``answer`` and breaks to the single choke
     # point below (the end-of-turn consolidation hook), so the turn is mined into
     # memory exactly once regardless of which path finalized it. See this
-    # function's docstring for the three exit paths.
+    # function's docstring for the four exit paths.
     answer: str
     while True:
         # Recomputed every iteration for symmetry with the rest of the loop, but
@@ -1087,6 +1157,20 @@ def handle_user_message(
         tool_calls: list[ToolCall] | None = (
             response.tool_calls if response.tool_calls else None
         )
+
+        # Narration-runaway exit: the model has sent identical prose on
+        # _TEXT_RUNAWAY_CAP tool-bearing rounds. Neither call-level guard can see
+        # this — it re-narrates the same plan while varying its calls just enough
+        # to stay under the identical-call tally — so without this the turn runs
+        # until an external timeout. Checked BEFORE append_assistant so the
+        # looping tool_calls row never enters the transcript without the tool
+        # results the wire protocol demands, and only on tool-bearing rounds: a
+        # final answer echoing earlier narration is an ending, not a loop.
+        if response.tool_calls:
+            emissions = _text_runaway_count(response.text or "", state.seen_texts)
+            if emissions:
+                answer = _text_loop_giveup(session, state, emissions, on_delta)
+                break
 
         # H5 nudge must run before append_assistant records this turn's answer
         # (it amends the last tool result, which append_assistant would displace).

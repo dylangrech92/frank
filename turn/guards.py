@@ -1,12 +1,21 @@
 """Per-turn guards that catch a model going in circles and steer it out.
 
-Three reactive, zero-cost-on-the-happy-path checks applied to a dispatched tool
-result: ``_loop_guard_check`` owns repeated identical *failures*,
-``_repeat_call_check`` owns repeated identical *successes*, and
-``_call_signature`` gives both a stable counting key. They belong together
-because they share the per-turn counting dicts and the ``[loop-guard]`` steer
-vocabulary, and stay separate from ``turn.repeat_dedup``, which owns only how a
-repeated render is stubbed or suffixed.
+Two layers, both scoped to a single turn.
+
+*Reactive steers* applied to a dispatched tool result: ``_loop_guard_check``
+owns repeated identical *failures*, ``_repeat_call_check`` owns repeated
+identical *successes*, and ``_call_signature`` gives both a stable counting key.
+
+*Runaway bounds* that end a turn the steers failed to break:
+``_repeat_cap_block_count`` is the one enforcement reader of the identical-call
+tally (both dispatch paths ask it, so the cap cannot apply on one and not the
+other), ``_round_abandoned_result`` stands in for the calls a bounded round
+never dispatches, and ``_text_runaway_count`` catches the loop no call-level
+tally can see — a model re-emitting identical narration round after round.
+
+They belong together because they share the per-turn counting dicts and the
+``[loop-guard]`` vocabulary, and stay separate from ``turn.repeat_dedup``, which
+owns only how a repeated render is stubbed or suffixed.
 """
 
 from __future__ import annotations
@@ -20,7 +29,22 @@ from turn.repeat_dedup import (
     _render_fingerprint,
     _repeat_render,
 )
-from turn.verification import _REPEAT_CAP_EXEMPT, _VERIFICATION_TOOLS
+from turn.verification import (
+    _REPEAT_CALL_CAP,
+    _REPEAT_CAP_EXEMPT,
+    _VERIFICATION_TOOLS,
+)
+
+# Hard cap on identical non-empty assistant texts emitted on TOOL-BEARING rounds
+# within one turn. A model can loop without ever repeating a tool call — it
+# re-narrates the same plan verbatim and re-issues calls that differ just enough
+# to slip the identical-call tally — so the call-level guards are blind to it.
+# Measured across this harness's own session logs: three turns looped on
+# identical narration (3x, 4x and 6x), every one of them carrying tool calls, and
+# none tripped any existing guard. Deliberately NOT applied to the terminal
+# no-tool-call round: a final answer that happens to echo earlier narration is a
+# legitimate ending, not a loop.
+_TEXT_RUNAWAY_CAP = 3
 
 
 def _loop_guard_check(
@@ -75,6 +99,119 @@ def _call_signature(arguments: dict) -> str:
         return json.dumps(arguments, sort_keys=True, default=str)
     except (TypeError, ValueError):
         return str(arguments)
+
+
+def _repeat_cap_block_count(
+    name: str,
+    arguments: dict,
+    seen_calls: dict[tuple[str, str], int],
+) -> int | None:
+    """The prior identical-call tally when this call is over the hard cap, else None.
+
+    The single ENFORCEMENT reader of ``seen_calls`` (``_repeat_call_check``
+    remains its single writer), shared by both dispatch paths so the cap cannot
+    apply on one and silently not the other. It previously lived inline on the
+    sequential path only, so an all-``parallel_safe`` batch — which skips that
+    path entirely — was never checked: one measured turn issued the same
+    ``read_file`` 102 times against a cap of 3, and the whole session recorded 8
+    blocks.
+
+    Args:
+        name: Registered tool name.
+        arguments: The call's parsed arguments.
+        seen_calls: The turn's ``(name, signature) -> count`` tally.
+
+    Returns:
+        ``None`` when the call may dispatch — either an exempt tool (a
+        build/test or measure/re-measure cycle legitimately repeats an identical
+        call) or fewer than ``_REPEAT_CALL_CAP`` identical calls so far.
+        Otherwise the count of previous identical calls, which the caller quotes
+        back in the block message.
+    """
+    if name in _REPEAT_CAP_EXEMPT:
+        return None
+    count = seen_calls.get((name, _call_signature(arguments)), 0)
+    return count if count >= _REPEAT_CALL_CAP else None
+
+
+def _batch_exceeds_repeat_cap(calls, seen_calls: dict[tuple[str, str], int]) -> bool:
+    """True when dispatching *calls* as one concurrent batch would breach the cap.
+
+    The concurrent path dispatches the whole batch before a single result is
+    tallied, so it cannot enforce a cap the way the sequential loop does — where
+    ``_repeat_call_check`` raises the count after each call and the next call
+    meets it. This replays that same call-by-call tally over the batch on a
+    private copy, and reports whether any call in it would have been refused.
+
+    That covers both ways a batch breaches the cap, and the second is the one a
+    per-call check alone misses: a call already at the cap from earlier rounds
+    (measured: 102 identical ``read_file`` calls in one turn against a cap of 3),
+    and a batch that repeats a call past the cap all by itself — the burst shape,
+    where the whole loop arrives in a single message and no earlier round exists
+    to have tallied anything.
+
+    A True answer sends the batch down the sequential path, which blocks the
+    surplus calls and lets the round bound end the turn. Losing concurrency there
+    is the point: a batch that repeats one call past the cap is a loop, not work.
+    """
+    tally = dict(seen_calls)
+    for call in calls:
+        if _repeat_cap_block_count(call.name, call.arguments, tally) is not None:
+            return True
+        if call.name not in _REPEAT_CAP_EXEMPT:
+            key = (call.name, _call_signature(call.arguments))
+            tally[key] = tally.get(key, 0) + 1
+    return False
+
+
+def _round_abandoned_result(blocked_streak: int) -> ToolResult:
+    """Stand-in result for a call a bounded round never dispatched.
+
+    The hard cap refuses one call at a time, which bounds nothing when a single
+    assistant message carries the whole loop: one measured turn arrived with
+    **2,555 tool calls**, 2,500 of them byte-identical, and the harness dutifully
+    walked all of them — 2,497 blocked, one transcript row each — because the
+    escalation ladder is only evaluated after the round returns. So the round
+    itself stops at ``_BLOCKED_STREAK_CAP`` and the remaining calls get this
+    instead of a dispatch.
+
+    Every remaining call still gets a result row: the wire protocol pairs one
+    tool message to every id in the assistant's ``tool_calls``, and a session is
+    resumable, so a round that simply stopped emitting would leave a transcript
+    the next request cannot send. Worded as a plain statement of fact with no
+    steer — the escalation ladder force-finalizes the turn the moment the round
+    returns, so no model ever reads this to act on it.
+    """
+    return ToolResult.err(
+        f"Not dispatched — the harness stopped this round after {blocked_streak} "
+        f"consecutive blocked calls and is ending the turn.",
+        code="round-abandoned",
+    )
+
+
+def _text_runaway_count(text: str, seen_texts: dict[str, int]) -> int:
+    """Tally one tool-bearing round's assistant text; report a runaway at the cap.
+
+    Companion to the call-level guards, which cannot see a model that loops on
+    prose (see ``_TEXT_RUNAWAY_CAP`` for the measured cases). Callers must invoke
+    this ONLY on rounds that carry tool calls — a terminal answer is allowed to
+    repeat earlier narration.
+
+    Args:
+        text: The round's assistant text (empty and whitespace-only are ignored,
+            since a tool-only round legitimately emits no prose every time).
+        seen_texts: The turn's ``stripped text -> count`` tally, mutated in place.
+
+    Returns:
+        ``0`` while the turn may continue; otherwise the emission count that
+        reached ``_TEXT_RUNAWAY_CAP``, for the caller to quote in its give-up.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return 0
+    seen_texts[stripped] = seen_texts.get(stripped, 0) + 1
+    count = seen_texts[stripped]
+    return count if count >= _TEXT_RUNAWAY_CAP else 0
 
 
 def _repeat_call_check(

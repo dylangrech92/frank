@@ -236,3 +236,40 @@ def _blocked_loop_giveup(
     return _finalize_giveup(
         session, state, reason, "rephrase or split the request and try again.", on_delta
     )
+
+
+def _text_loop_giveup(
+    session: Session,
+    state: "_TurnState",
+    emissions: int,
+    on_delta: Callable[[str], None] | None,
+) -> str:
+    """Terminal give-up when the model keeps re-emitting identical narration.
+
+    The third runaway bound, beside the repeat-call hard cap and its escalation
+    ladder: those two count *calls*, so a model that re-narrates the same plan
+    verbatim while varying its calls just enough to stay under the identical-call
+    tally slips both. ``_text_runaway_count`` catches that on tool-bearing rounds
+    only; this ends the turn the same way as the blocked-loop path — a truthful
+    synthesized answer recorded across transcript, ``turn_report`` and on_delta,
+    with ``verified`` stamped — so a narration loop is reported honestly instead
+    of burning rounds until an external timeout.
+
+    The looping assistant message is deliberately NOT appended before this runs:
+    dropping it keeps the transcript free of a ``tool_calls`` row with no
+    matching tool results, which a resumed session could not send.
+    """
+    print(
+        ui.telemetry(
+            f"loop-guard: escalated — turn force-finalized after "
+            f"{emissions} identical assistant messages"
+        ),
+        file=sys.stderr,
+    )
+    reason = (
+        f"This turn was ended by the harness: the model sent the same message "
+        f"{emissions} times while still calling tools, making no progress."
+    )
+    return _finalize_giveup(
+        session, state, reason, "rephrase or split the request and try again.", on_delta
+    )

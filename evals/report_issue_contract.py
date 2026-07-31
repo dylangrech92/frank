@@ -410,9 +410,11 @@ def check_agent_wiring() -> list[str]:
 
     # Left out of the repeat-cap exemption on purpose: three byte-identical
     # reports in one turn is duplicate spam, and the existing cap blocks it.
+    from turn.verification import _REPEAT_CAP_EXEMPT
+
     if 'report_issue' in agent._VERIFICATION_TOOLS:
         failures.append("wiring: report_issue must not count as a verification tool")
-    if 'report_issue' in agent._REPEAT_CAP_EXEMPT:
+    if 'report_issue' in _REPEAT_CAP_EXEMPT:
         failures.append("wiring: report_issue must not be exempt from the repeat-call cap")
 
     return failures

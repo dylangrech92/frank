@@ -105,9 +105,12 @@ def _make_fixtures(project_dir: Path, n: int) -> list[str]:
 def _inflating_factory(session, fixtures, stop_when_summarized: bool):
     """Return a single adaptive turn factory reused for every scripted call.
 
-    Each call emits a long filler turn plus a *distinct* ``read_file`` call
-    (distinct arguments dodge the repeat-call guard while keeping the loop alive
-    and the transcript growing). When *stop_when_summarized* is set, the factory
+    Each call emits a long filler turn plus a *distinct* ``read_file`` call.
+    Both the arguments and the filler's leading sentence vary per round, so
+    neither the repeat-call guard nor the narration-runaway guard (which force-
+    finalizes a turn re-emitting byte-identical prose on tool-bearing rounds)
+    ends the turn before compaction can be observed — the loop stays alive and
+    the transcript keeps growing. When *stop_when_summarized* is set, the factory
     switches to a plain final answer as soon as a summary exists — i.e. once
     compaction has fired — so the normal scenario terminates cleanly right after
     the fold.
@@ -126,7 +129,7 @@ def _inflating_factory(session, fixtures, stop_when_summarized: bool):
             name="read_file",
             arguments={"path": fixtures[i % len(fixtures)]},
         )
-        return ChatResponse(text=_FILLER, tool_calls=[tc])
+        return ChatResponse(text=f"Analysis pass {i}. {_FILLER}", tool_calls=[tc])
 
     return factory
 

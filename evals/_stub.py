@@ -29,6 +29,18 @@ from compaction import COMPACTION_SYSTEM_PROMPT as _COMPACTION_PROMPT
 
 _SUMMARIZER_PROMPT_PREFIX = _COMPACTION_PROMPT[:32]
 
+# Monotonic across every factory in the process, so a script assembled from
+# several factories cannot mint the same call id twice. Ids must be unique for
+# the whole transcript, not just within one factory: the wire protocol pairs a
+# tool result to its call id, so a collision silently makes one assistant row
+# look answered by another round's result.
+_CALL_IDS = {"n": 0}
+
+
+def _next_call_id(prefix: str) -> str:
+    _CALL_IDS["n"] += 1
+    return f"{prefix}-{_CALL_IDS['n']}"
+
 
 class _StubConfig:
     """Minimal stand-in for LLMConfig — only ``context_limit`` is read.
@@ -95,21 +107,46 @@ class _StubClient:
         return self._script[idx]()
 
 
-def _same_call_response(name: str, arguments: dict):
+def _same_call_response(name: str, arguments: dict, text: str = ""):
     """Return a factory that yields a ChatResponse re-issuing one identical call.
 
     Each call gets a fresh id (the wire protocol pairs a tool result to its
     call id) but the same name+arguments, so the repeat-call cap counts them as
     identical and the loop-guard eventually blocks them.
+
+    *text* is the assistant prose that rides along with the call — empty by
+    default (a tool-only round). Passing a fixed non-empty string reproduces the
+    narration loop the identical-call tally cannot see: the same prose emitted
+    round after round.
     """
     from llm import ChatResponse, ToolCall
 
-    counter = {"n": 0}
+    def factory():
+        tc = ToolCall(id=_next_call_id("call"), name=name, arguments=dict(arguments))
+        return ChatResponse(text=text, tool_calls=[tc])
+
+    return factory
+
+
+def _burst_call_response(name: str, arguments: dict, count: int):
+    """Return a factory whose ONE ChatResponse carries *count* identical calls.
+
+    The shape a runaway actually takes in the wild: not one repeated call per
+    round, but a single assistant message holding thousands of them (measured:
+    2,555 in one message). Every call is identical bar its id, so the per-call
+    guards see the same key throughout while the round-level bound is what has
+    to stop the batch.
+    """
+    from llm import ChatResponse, ToolCall
 
     def factory():
-        counter["n"] += 1
-        tc = ToolCall(id=f"call-{counter['n']}", name=name, arguments=dict(arguments))
-        return ChatResponse(text="", tool_calls=[tc])
+        return ChatResponse(
+            text="",
+            tool_calls=[
+                ToolCall(id=_next_call_id("burst"), name=name, arguments=dict(arguments))
+                for _ in range(count)
+            ],
+        )
 
     return factory
 

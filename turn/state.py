@@ -93,6 +93,11 @@ class _TurnState:
     # (read-only dedup carries but does not gate on it). Distinct from seen_calls,
     # whose int tally the pre-dispatch hard cap depends on.
     seen_renders: dict[tuple[str, str], tuple[str, int, int]] = field(default_factory=dict)
+    # Identical non-empty assistant texts emitted on TOOL-BEARING rounds this
+    # turn, keyed by the stripped text, for the narration-runaway guard
+    # (_text_runaway_count). Terminal no-tool-call rounds are never tallied here
+    # — a final answer echoing earlier narration is an ending, not a loop.
+    seen_texts: dict[str, int] = field(default_factory=dict)
     # Every distinct path mutated this turn (H1/H5 tracking).
     mutated_paths: set[str] = field(default_factory=set)
     # Monotonic count of file-mutation EVENTS this turn (not distinct paths — a

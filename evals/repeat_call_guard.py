@@ -6,8 +6,9 @@ repeated-identical-*success* path owned by ``_repeat_call_check``: the no-op
 loop where a model re-issues the exact same successful call (e.g.
 ``replace_one`` with search == replace) over and over. A passive steer alone
 does not reliably break a determined loop, so ``_REPEAT_CALL_CAP`` and the
-exempt set are also asserted here; the dispatch-time hard block itself lives
-inline in ``handle_user_message`` and is exercised end-to-end by real runs.
+exempt set are also asserted here; the dispatch-time hard block itself is read
+from ``turn.guards._repeat_cap_block_count`` by both dispatch paths and is
+exercised end-to-end by ``runaway_bounds.py``.
 
 Imports ``agent`` directly, drives two identical successful
 ``_repeat_call_check`` calls with the same arguments, and asserts:
@@ -74,13 +75,18 @@ def main() -> int:
     if not isinstance(agent._REPEAT_CALL_CAP, int) or agent._REPEAT_CALL_CAP < 2:
         print(f"FAIL: _REPEAT_CALL_CAP must be >= 2, got {agent._REPEAT_CALL_CAP!r}", file=sys.stderr)
         ok_flag = False
-    if not {"run_command", "run_tests"} <= agent._REPEAT_CAP_EXEMPT:
-        print(f"FAIL: run_command/run_tests must be exempt, got {agent._REPEAT_CAP_EXEMPT!r}", file=sys.stderr)
+    from turn.verification import _REPEAT_CAP_EXEMPT
+
+    if not {"run_command", "run_tests"} <= _REPEAT_CAP_EXEMPT:
+        print(f"FAIL: run_command/run_tests must be exempt, got {_REPEAT_CAP_EXEMPT!r}", file=sys.stderr)
         ok_flag = False
 
     # Signature must be order-independent so dict insertion order never splits
-    # what is logically the same call into two counts.
-    if agent._call_signature({"a": 1, "b": 2}) != agent._call_signature({"b": 2, "a": 1}):
+    # what is logically the same call into two counts. Read from its home module:
+    # both dispatch paths key on it via turn.guards, agent.py no longer does.
+    from turn.guards import _call_signature
+
+    if _call_signature({"a": 1, "b": 2}) != _call_signature({"b": 2, "a": 1}):
         print("FAIL: _call_signature is not order-independent", file=sys.stderr)
         ok_flag = False
 

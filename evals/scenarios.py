@@ -296,6 +296,21 @@ SCENARIOS: list[dict] = [
         "inline": "loop_guard_escalation.py",
     },
     {
+        "name": "runaway_bounds",
+        "description": (
+            "End-to-end check (stub LLM, no network) of the three runaway shapes "
+            "the between-rounds escalation ladder cannot reach, each reproduced "
+            "from a measured session: a burst of identical calls in ONE assistant "
+            "message stops dispatching at _BLOCKED_STREAK_CAP and answers the "
+            "undispatched calls with round-abandoned rows so the transcript stays "
+            "wire-legal; an all-parallel_safe batch is subject to the same repeat "
+            "cap as the sequential path instead of bypassing it; and identical "
+            "narration on _TEXT_RUNAWAY_CAP tool-bearing rounds force-finalizes "
+            "the turn while a terminal answer echoing that narration does not."
+        ),
+        "inline": "runaway_bounds.py",
+    },
+    {
         "name": "repro_steer",
         "description": (
             "End-to-end check (stub LLM, no network): the first relevant file "
