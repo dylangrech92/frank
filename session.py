@@ -19,7 +19,7 @@ import stats
 from llm import ToolCall
 
 from session_context import _prune_messages
-from session_store import _format_json, _load_transcript, _parse_frontmatter, list_sessions  # noqa: F401
+from session_store import _load_transcript, _write_transcript, list_sessions  # noqa: F401
 
 
 # Module-level extension seam: add callables that accept a ``Session`` and
@@ -382,38 +382,23 @@ class Session:
         return content if isinstance(content, str) else str(content)
 
     def _persist(self) -> None:
-        """Write YAML frontmatter followed by the JSON messages array to disk.
+        """Hand this session's persisted state to the transcript store.
 
-        Writes to a pid-suffixed sibling temp file first, then atomically
-        renames it into place via ``os.replace`` so a resuming reader never
-        observes a partially-written transcript (the file is now load-bearing
-        for ``Session.resume``, not just an append-only log).
+        The file format itself — the frontmatter keys, the body schema and the
+        atomic rename — belongs to ``session_store``, alongside the reader that
+        has to agree with it. This method only supplies the state.
         """
-        lines = [
-            "---",
-            f"session_id: {self.session_id}",
-            f"cwd: {str(self.project_root)}",
-            f"model: {self.model}",
-            f"created_at: {self.created_at.strftime('%Y-%m-%dT%H:%M:%SZ')}",
-            "---",
-        ]
-
-        body_obj: Dict[str, Any] = {"messages": self._messages}
-        if self._summary:
-            body_obj["summary"] = self._summary
-            body_obj["summary_covers"] = self._summary_covers
-        if self.episodic_watermark:
-            body_obj["episodic_watermark"] = self.episodic_watermark
-
-        body = _format_json(body_obj)
-        file_contents = "\n".join(lines) + "\n" + body
-
-        tmp_path = self.transcript_path.with_suffix(
-            self.transcript_path.suffix + f".{os.getpid()}.tmp"
+        _write_transcript(
+            self.transcript_path,
+            session_id=self.session_id,
+            project_root=self.project_root,
+            model=self.model,
+            created_at=self.created_at,
+            messages=self._messages,
+            summary=self._summary,
+            summary_covers=self._summary_covers,
+            episodic_watermark=self.episodic_watermark,
         )
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(file_contents)
-        os.replace(tmp_path, self.transcript_path)
 
     def record_llm_call(
         self,

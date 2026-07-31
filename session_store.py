@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -147,3 +148,64 @@ def list_sessions(project_root: str | Path) -> List[tuple[str, int | None]]:
 
     entries.sort(key=lambda e: e[1], reverse=True)
     return [(sid, count) for sid, _mtime, count in entries]
+
+
+def _write_transcript(
+    path: Path,
+    *,
+    session_id: str,
+    project_root: Path,
+    model: str,
+    created_at: datetime,
+    messages: List[Dict[str, Any]],
+    summary: str | None,
+    summary_covers: int,
+    episodic_watermark: int,
+) -> None:
+    """Write a transcript file: YAML frontmatter, then the JSON body.
+
+    The exact inverse of ``_load_transcript``. The four frontmatter keys and the
+    body schema are spelled out here, next to the reader that has to agree with
+    them, so the two halves of one format cannot drift apart in separate files.
+
+    Writes to a pid-suffixed sibling temp file first, then atomically renames it
+    into place via ``os.replace`` so a resuming reader never observes a
+    partially-written transcript (the file is load-bearing for ``Session.resume``,
+    not just an append-only log).
+
+    Args:
+        path: Destination ``<session_id>.json`` transcript file.
+        session_id: Session id, written to the frontmatter.
+        project_root: Resolved project root, written to the frontmatter as ``cwd``.
+        model: Model identifier, written to the frontmatter.
+        created_at: Session creation time, written to the frontmatter.
+        messages: Full OpenAI-format message list forming the body.
+        summary: Compaction summary, or None when the session has none.
+        summary_covers: How many leading messages ``summary`` covers.
+        episodic_watermark: Row count already handed to the episodic encoder.
+    """
+    lines = [
+        "---",
+        f"session_id: {session_id}",
+        f"cwd: {str(project_root)}",
+        f"model: {model}",
+        f"created_at: {created_at.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        "---",
+    ]
+
+    body_obj: Dict[str, Any] = {"messages": messages}
+    if summary:
+        body_obj["summary"] = summary
+        body_obj["summary_covers"] = summary_covers
+    if episodic_watermark:
+        body_obj["episodic_watermark"] = episodic_watermark
+
+    body = _format_json(body_obj)
+    file_contents = "\n".join(lines) + "\n" + body
+
+    tmp_path = path.with_suffix(
+        path.suffix + f".{os.getpid()}.tmp"
+    )
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(file_contents)
+    os.replace(tmp_path, path)
