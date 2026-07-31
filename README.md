@@ -18,7 +18,7 @@ Python 3.10+ is required. Dependencies are managed with [uv](https://docs.astral
 uv sync
 ```
 
-This creates a `.venv` and installs the pinned dependencies (`requests`, `mcp`, `psutil`) from the committed `uv.lock`. Run the agent with `uv run python main.py --mode <mode>`, or activate `.venv` and run `python main.py --mode <mode>` directly — see [Run directly from the CLI](#3b-run-directly-from-the-cli) for the available modes.
+This creates a `.venv` and installs the pinned dependencies from the committed `uv.lock`: `requests`, `mcp` and `psutil` for the agent itself, plus the `dev` group (`pyyaml`) that the evaluation harness needs to parse tool output back. Run the agent with `uv run python main.py --mode <mode>`, or activate `.venv` and run `python main.py --mode <mode>` directly — see [Run directly from the CLI](#3b-run-directly-from-the-cli) for the available modes.
 
 Optional packages (the agent degrades gracefully without each one):
 
