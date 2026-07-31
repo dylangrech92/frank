@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 MAX_ITERATIONS = 5
 
 # Below this self-rated confidence, a parsed bullet is dropped instead of
-# persisted (poisoning defence) -- matches memory.consolidation.CONFIDENCE_FLOOR.
+# persisted (poisoning defence) -- matches memory.consolidation_apply's floor.
 CONFIDENCE_FLOOR = 0.45
 
 # Fallback confidence for a bullet whose self-rating is missing/unparseable --
@@ -373,7 +373,7 @@ def persist_brief(
     that bullet (``parse_brief``'s ``confidence`` field, conservative default
     when the model omits it) rather than a flat value for the whole brief --
     this is LLM-attested, not diff-verified, so a bullet below
-    ``CONFIDENCE_FLOOR`` (matching ``memory.consolidation``'s poisoning
+    ``CONFIDENCE_FLOOR`` (matching ``memory.consolidation_apply``'s poisoning
     defence) is skipped instead of written.
 
     Returns the list of new fact ids actually written (low-confidence
