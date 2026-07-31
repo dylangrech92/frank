@@ -188,7 +188,7 @@ def check_e2e_scaffolding_survives() -> list[str]:
 
 def check_prune_keeps_in_turn_steer() -> list[str]:
     """b. In-turn steer keeps all rows; a completed turn still collapses as before."""
-    from session import _prune_messages
+    from session_context import _prune_messages
 
     failures: list[str] = []
 
@@ -271,7 +271,7 @@ def check_prune_keeps_in_turn_steer() -> list[str]:
 
 def check_post_compaction_tail_folds_steer_survives() -> list[str]:
     """c. A tail with no real user collapses; the steer rides through."""
-    from session import _prune_messages
+    from session_context import _prune_messages
 
     failures: list[str] = []
 

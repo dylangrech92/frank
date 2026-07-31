@@ -396,7 +396,8 @@ def check_reset_no_premature_escalation() -> list[str]:
 
 def check_fold_survival() -> list[str]:
     """C. A steer user-row survives _prune_messages; tool scaffolding before it drops."""
-    from session import STEER_PREFIX, _prune_messages
+    from session import STEER_PREFIX
+    from session_context import _prune_messages
 
     failures: list[str] = []
 

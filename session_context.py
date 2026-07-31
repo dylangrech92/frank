@@ -1,8 +1,8 @@
-"""Message-list shaping helpers used when assembling assembled context."""
+"""Assembling the message list sent to the LLM: providers, folding, pruning."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 
 def _prune_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -74,3 +74,75 @@ def _prune_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # else: tool results and mid-chain (tool-calling / empty) assistants dropped.
 
     return pruned + list(in_flight)
+
+
+def assemble_context(
+    session: Any,
+    providers: List[Callable[[Any], str]],
+) -> List[Dict[str, str]]:
+    """Return the list of message dicts to send to the LLM.
+
+    The first element is a system message whose content is the session's ``system_prompt``
+    followed by every non-empty block returned by registered context providers,
+    each separated by a blank line.  All stored messages follow as pass-through.
+
+    Returns:
+        The assembled message list ready for the provider API.
+    """
+    blocks = [session.system_prompt]
+
+    for provider in providers:
+        block = provider(session)
+        if block:
+            blocks.append(block)
+
+    system_content = "\n\n".join(blocks)
+
+    result: List[Dict[str, Any]] = [
+        {"role": "system", "content": system_content}
+    ]
+
+    if session._summary:
+        content = (
+            "Summary of the earlier conversation "
+            "(older turns compacted to fit context):\n\n" + session._summary
+        )
+        # When compaction has folded the current turn's own user message into
+        # the summary (its index is now behind the watermark), re-show it
+        # verbatim so the model never loses the literal task it is working on
+        # — the summary's paraphrase is a safety net, not a replacement.
+        anchor = _folded_task_anchor(session._messages, session._summary_covers)
+        if anchor is not None:
+            content += (
+                "\n\n---\n\nYour current task (original request, shown "
+                "verbatim):\n\n" + anchor
+            )
+        result.append({"role": "user", "content": content})
+        tail = session._messages[session._summary_covers:]
+    else:
+        tail = session._messages
+
+    result.extend(_prune_messages(tail))
+    return result
+
+
+def _folded_task_anchor(
+    messages: List[Dict[str, Any]],
+    summary_covers: int,
+) -> str | None:
+    """Return the current task's user text when it sits behind the watermark.
+
+    The "current task" is the most recent ``user`` message. When compaction
+    has advanced *summary_covers* past it (its index < the watermark), it
+    no longer appears in the assembled tail, so ``assemble_context`` re-shows
+    it verbatim. Returns ``None`` when the latest user message is still
+    visible in the tail (nothing to re-inject).
+    """
+    last_user = -1
+    for i, m in enumerate(messages):
+        if m.get("role") == "user":
+            last_user = i
+    if last_user < 0 or last_user >= summary_covers:
+        return None
+    content = messages[last_user].get("content", "")
+    return content if isinstance(content, str) else str(content)
