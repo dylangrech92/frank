@@ -1,8 +1,11 @@
-"""On-disk conversation transcript storage for coding-agent sessions.
+"""The live state of one conversation: messages, summary, usage, lock.
 
-Serialises a list of OpenAI-format messages with YAML frontmatter to
-``project_root/.coding_agent/sessions/<session_id>.json`` so every turn is
-persisted without loss.
+``Session`` owns what the conversation currently is — the message list, the
+compaction summary and the watermarks over it, the per-session usage totals —
+and grows it a turn at a time, persisting after every append. The mechanics sit
+in three siblings: ``session_store`` reads and writes the transcript file,
+``session_context`` shapes the message list sent to the model, and
+``session_lock`` keeps a single writer per transcript.
 """
 
 from __future__ import annotations

@@ -181,10 +181,15 @@ See `.env.example` for all supported variables. The key ones:
 ```
 main.py             CLI entry point (REPL + one-shot modes)
 mcp_server.py       MCP server (research / code / test / performance_debug tools)
-agent.py            Agent loop (message handling, tool dispatch, loop guards)
+modes.py            The four modes; each launch declares exactly one
+agent.py            Agent loop: turn orchestration and tool dispatch
+turn/               Per-turn helpers (guards, steering, verification, rendering)
 config.py           Config loading and validation
 llm.py              OpenAI-compatible chat-completions client
-session.py          Session lifecycle, transcript persistence, compaction
+session.py          Live conversation state (messages, summary, usage totals)
+session_store.py    Transcript files on disk (read / write / list)
+session_context.py  Assembling the message list sent to the LLM
+session_lock.py     Advisory single-writer lock on a transcript
 compaction.py       Reactive context compaction
 jsonrpc.py          JSON-RPC framing for LSP/DAP
 diagnostics.py      Diagnostic store (LSP publishDiagnostics)
