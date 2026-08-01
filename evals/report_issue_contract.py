@@ -6,8 +6,10 @@ validation and ``ReportIssue.run`` together against a real file on disk. Zero
 mocks: entries are appended to a real temp log with the real ``flock`` write
 path, and read back with a real YAML parser. Asserts:
 
-a. report_issue is reachable in all four modes (a failure can happen in any of
-   them, so the channel for reporting it has to exist in all of them);
+a. report_issue is reachable in every mode (a failure can happen in any of
+   them, so the channel for reporting it has to exist in all of them) — the
+   check iterates ``modes.MODES``, so a newly added mode is covered the moment
+   it is declared, without this file being touched;
 b. happy path: the log is created when absent and the entry parses as YAML;
 c. a second call appends -- the first entry survives byte-for-byte;
 d. multi-line text becomes an indented ``|2`` block scalar, and a line of
@@ -480,7 +482,7 @@ def main() -> int:
         return 1
 
     print(
-        "PASS: report_issue reaches all four modes, appends parseable YAML entries "
+        "PASS: report_issue reaches every mode, appends parseable YAML entries "
         "(block scalar for multi-line, --- safe), stamps the mode, emits no mutation "
         "events, rejects blank input, and caps oversize reports"
     )

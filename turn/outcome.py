@@ -4,8 +4,10 @@
 bounces once on an empty answer, once on an unverified file mutation, then marks
 the answer and delivers it. The give-up exits — ``_over_cap_giveup``,
 ``_blocked_loop_giveup``, ``_text_loop_giveup`` — synthesize an answer when the
-turn cannot continue at all. Every one of them stamps the turn through
-``_stamp_turn_outcome``, so all exits report the same truth the same way.
+turn cannot continue at all. ``_report_finalize`` is verify mode's terminal-tool
+exit: an accepted ``report`` call ends the turn on the spot. Every one of them
+stamps the turn through ``_stamp_turn_outcome``, so all exits report the same
+truth the same way.
 """
 
 from __future__ import annotations
@@ -286,6 +288,87 @@ def _text_loop_giveup(
     return _finalize_giveup(
         session, state, reason, "rephrase or split the request and try again.", on_delta
     )
+
+
+def _render_report_answer(payload: dict) -> str:
+    """Render an accepted ``report`` payload as the turn's prose answer.
+
+    The structured payload is what a machine caller reads (out of the envelope's
+    ``verdict`` / ``plan`` / ``assertions`` / ``observations`` fields); this is
+    the same content for a human reading stdout or the transcript. Nothing is
+    truncated and nothing is inferred — every line comes from a field the
+    evidence gate in ``tools/report.py`` already validated.
+    """
+    verdict = payload.get("verdict", "inconclusive")
+    plan = payload.get("plan") or []
+    assertions = payload.get("assertions") or []
+    observations = (payload.get("observations") or "").strip()
+
+    lines = [f"VERDICT: {verdict}"]
+
+    if plan:
+        lines.append("")
+        lines.append("Plan:")
+        lines.extend(f"  {i}. {step}" for i, step in enumerate(plan, 1))
+
+    if assertions:
+        lines.append("")
+        lines.append("Assertions:")
+        for i, item in enumerate(assertions, 1):
+            lines.append(f"  {i}. [{item.get('verdict')}] {item.get('assertion')}")
+            evidence = item.get("evidence") or {}
+            detail = (evidence.get("detail") or "").strip()
+            if detail:
+                lines.append(f"     evidence ({evidence.get('kind')}): {detail}")
+            artifact = evidence.get("artifact")
+            if artifact:
+                lines.append(f"     artifact: {artifact}")
+
+    if observations:
+        lines.append("")
+        lines.append("Observations:")
+        lines.append(f"  {observations}")
+
+    return "\n".join(lines)
+
+
+def _report_finalize(
+    session: Session, state: "_TurnState", on_delta: Callable[[str], None] | None
+) -> str:
+    """Terminal-tool exit: an accepted ``report`` call ends the verify turn.
+
+    Only reached once ``tools/report.py`` has ACCEPTED the payload — the
+    evidence gate (no unevidenced pass/fail, no incoherent top-level verdict)
+    has already run, so this never has to re-judge the content. A rejected
+    report never sets ``state.terminal_report``, so the model keeps its turn and
+    can fix the verdict.
+
+    Mirrors the give-up exits' contract: records the rendered report as the
+    turn's final answer across the transcript, ``turn_report["answer"]``, and
+    ``on_delta``, publishes the structured payload under
+    ``turn_report["report"]`` for the one-shot envelope, and stamps
+    ``verified`` through the one shared formula.
+
+    ``verified`` stays tri-state and is NOT set from the verdict: it answers
+    "did this turn verify the files it changed", and a verify run changes no
+    files, so it correctly reports ``None``. The verification outcome the caller
+    wants is ``verdict``, which is a separate field precisely so the two cannot
+    be confused.
+    """
+    payload = state.terminal_report or {}
+    msg = _render_report_answer(payload)
+    session.append_assistant(msg)
+    state.turn_report["answer"] = msg
+    state.turn_report["report"] = {
+        "verdict": payload.get("verdict"),
+        "plan": payload.get("plan") or [],
+        "assertions": payload.get("assertions") or [],
+        "observations": payload.get("observations") or "",
+    }
+    _stamp_turn_outcome(state)
+    if on_delta is not None:
+        on_delta(msg + "\n")
+    return msg
 
 
 def _finalize_answer(

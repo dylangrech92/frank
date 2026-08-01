@@ -24,12 +24,14 @@ the compaction summarizer, and any transcript reader can all tell harness
 guidance from real human input.
 """
 
+import base64
 import json
 import sys
 import compaction
 import ui
 
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Callable
 
 from llm import ChatResponse, LLMClient, ToolCall
@@ -45,6 +47,7 @@ from turn.llm_call import _run_llm_with_compaction
 from turn.outcome import (
     _blocked_loop_giveup,
     _finalize_answer,
+    _report_finalize,
     _text_loop_giveup,
 )
 from turn.rendering import _guard_oversize_result, render_tool_result
@@ -373,6 +376,35 @@ def _dispatch_sequential_call(
     return result, lint_suffix
 
 
+def _attach_screenshot(session: Session, image_path: str, call_id: str) -> None:
+    """Read a captured PNG and attach it to the transcript as a vision message.
+
+    The screenshot tool saves a file and reports its path in ``meta.image_path``;
+    turning that path into model-visible pixels happens here, at the one seam
+    that already owns appending to the transcript.
+
+    A read failure is reported to the model instead of raising: the run is
+    mid-verification, the tool result already said a screenshot was captured, and
+    silently continuing would leave the model believing it can see an image it
+    never received. The message names the path so the discrepancy is legible in
+    the transcript rather than inferred from a missing row.
+    """
+    try:
+        data = Path(image_path).read_bytes()
+    except OSError as exc:
+        session.append_user(
+            f"[screenshot at {image_path} could not be read back and is NOT "
+            f"attached: {exc}. Do not describe its contents — capture it again "
+            f"or use a different signal.]"
+        )
+        return
+
+    data_uri = "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+    session.append_screenshot(
+        image_path, data_uri, label=f"Screenshot for tool call {call_id}"
+    )
+
+
 def _dispatch_round(
     session: Session,
     state: "_TurnState",
@@ -447,6 +479,9 @@ def _dispatch_round(
         state.blocked_streak = 0
 
     blocked_this_round = False
+    # (image_path, tool_call_id) for every screenshot captured this round,
+    # attached after the loop — see the queueing comment at the call site.
+    pending_images: list[tuple[str, str]] = []
     # Snapshot the one-shot first-mutation steer flags before the loop so the
     # post-round block can tell whether THIS round is the one that flipped each
     # (and so should append that steer). A no-op on every later round once fired.
@@ -496,6 +531,17 @@ def _dispatch_round(
         if result.code == "loop-guard-blocked":
             blocked_this_round = True
 
+        # Terminal-tool exit (verify mode). Only an ACCEPTED report ends the
+        # turn: tools/report.py returns an error status when the evidence gate
+        # rejects the payload, and that must leave the turn running so the model
+        # can fix the verdict. The remaining calls in this batch are still
+        # dispatched — every id in the assistant's tool_calls needs its result
+        # row for the transcript to stay wire-legal — and handle_user_message
+        # ends the turn once this round returns.
+        if call.name == "report" and result.status == "success":
+            if state.terminal_report is None:
+                state.terminal_report = dict(call.arguments)
+
         if call.name in _VERIFICATION_TOOLS:
             _record_verification_run(
                 state, call, result, str(session.project_root)
@@ -525,7 +571,19 @@ def _dispatch_round(
 
         session.append_tool_result(call.id, call.name, rendered)
 
+        # Vision attachment (verify mode's screenshot tool). Queued, not appended
+        # here: the image rides a user-role message, and a user row landing
+        # between an assistant tool_calls entry and the rest of its results would
+        # break the OpenAI wire protocol. Same constraint the post-round steers
+        # below already respect.
+        image_path = result.meta.get("image_path") if result.status == "success" else None
+        if image_path:
+            pending_images.append((str(image_path), call.id))
+
     diagnostics_inject_summary(session)
+
+    for image_path, call_id in pending_images:
+        _attach_screenshot(session, image_path, call_id)
 
     # Fold-surviving post-round steers (blocked-round + the two first-mutation
     # verify steers): all ride the user role — which
@@ -594,6 +652,11 @@ def handle_user_message(
           tallies cannot see; ``_text_loop_giveup`` force-finalizes the turn.
           Checked before the assistant row is appended, so the looping row is
           dropped rather than left in the transcript without tool results.
+       e. **terminal-tool exit** — verify mode's ``report`` tool was called and
+          its evidence gate ACCEPTED the payload, so the run's deliverable
+          exists; ``_report_finalize`` renders it as the answer and publishes the
+          structured verdict under ``turn_report["report"]``. A rejected report
+          is not an exit — the turn continues so the model can fix the verdict.
     3. **single choke point** — after the loop breaks, the end-of-turn
        consolidation hook (``consolidation_maybe_extract``) fires exactly once,
        on EVERY exit path, so a turn force-finalized by (a)/(c)/(d) is mined into
@@ -651,6 +714,11 @@ def handle_user_message(
         "verified": None,
         "declared_unverified": False,
         "answer": None,
+        # verify mode's structured verdict, published only by the terminal-tool
+        # exit (_report_finalize). Stays None on every other mode and on a verify
+        # turn that ended without an accepted report — an absent verdict is
+        # reported as absent, never guessed at from how the turn happened to end.
+        "report": None,
         "usage": {"prompt_tokens": None, "completion_tokens": None, "llm_calls": 0},
     }
     session.turn_report = turn_report
@@ -730,6 +798,15 @@ def handle_user_message(
             continue
 
         _dispatch_round(session, state, response, on_delta)
+
+        # Terminal-tool exit: verify mode's `report` was accepted this round, so
+        # the run is over by contract — the verdict IS the deliverable and any
+        # further round would only invite the model to keep browsing after it
+        # already submitted. Checked before the escalation ladder because an
+        # accepted report is a completed run, not a stuck one.
+        if state.terminal_report is not None:
+            answer = _report_finalize(session, state, on_delta)
+            break
 
         # Escalation ladder: the model has re-issued a call the hard cap keeps
         # refusing, ignoring both the block error and the fold-surviving steer.

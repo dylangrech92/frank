@@ -55,8 +55,11 @@ _WALL_CLOCK_CEILING_SECONDS = 1800.0
 # OpenAI chat-completions wire format. ``steer`` marks a harness-authored
 # guidance turn (see Session.append_steer); it must never reach the provider,
 # both because strict OpenAI-compatible endpoints reject unknown message fields
-# and because it is an internal flag, not data the model should see.
-_NON_WIRE_MESSAGE_KEYS = frozenset({"steer"})
+# and because it is an internal flag, not data the model should see. ``screenshot``
+# marks a vision attachment (see Session.append_screenshot) for the same reason:
+# the flag exists so the pruner can tell an image row from a real turn start,
+# and nothing downstream of that needs it.
+_NON_WIRE_MESSAGE_KEYS = frozenset({"steer", "screenshot"})
 
 
 def to_wire_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -28,6 +28,7 @@ class Config:
     git: dict = field(default_factory=dict)
     linters: dict = field(default_factory=dict)
     subagents: dict = field(default_factory=dict)
+    browser: dict = field(default_factory=dict)
 
 
 _REQUIRED_LLM_KEYS = ('base_url', 'api_key', 'model')
@@ -59,7 +60,7 @@ def load(path: str | Path = 'config.json') -> Config:
 
     llm = LLMConfig(**llm_data)
 
-    future_blocks = ('language_servers', 'debug_adapters', 'test_runners', 'compaction', 'git', 'linters', 'subagents')
+    future_blocks = ('language_servers', 'debug_adapters', 'test_runners', 'compaction', 'git', 'linters', 'subagents', 'browser')
     passthru: dict[str, dict] = {}
     for k in future_blocks:
         if k in data and isinstance(data[k], dict):

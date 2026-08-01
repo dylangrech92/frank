@@ -431,12 +431,30 @@ SCENARIOS: list[dict] = [
             "run_tests (absent from code mode by design); "
             "turn.verification._available_verification_tools() returns exactly "
             "the verification tools each mode actually carries (research: none, "
-            "code: run_command+verify_scratch, test: "
+            "code: run_command+verify_scratch, qa: "
             "run_command+run_tests+verify_scratch, performance_debug: "
-            "run_command); and a mode carrying zero verification tools never "
-            "fires the nudge at all rather than naming a tool it cannot call."
+            "run_command, verify: none); and a mode carrying zero verification "
+            "tools never fires the nudge at all rather than naming a tool it "
+            "cannot call."
         ),
         "inline": "verify_tool_wiring.py",
+    },
+    {
+        "name": "verify_mode_contract",
+        "description": (
+            "End-to-end check (stub LLM, no network, no browser): verify "
+            "mode's evidence gate refuses an unevidenced 'pass' and an "
+            "incoherent top-level verdict through real dispatch, and refuses "
+            "report entirely outside verify mode; a REJECTED report leaves the "
+            "turn running while an ACCEPTED one ends it on the spot, publishing "
+            "the structured payload on turn_report and leaving verified=None (a "
+            "verify run changes no files); a screenshot never moves the turn "
+            "boundary, never writes base64 into the transcript, never escapes "
+            "the image budget in the assembled context, and never inflates the "
+            "compaction token estimate; and the envelope reports trace only "
+            "when trace.zip is really on disk."
+        ),
+        "inline": "verify_mode_contract.py",
     },
     {
         "name": "profile_tools_contract",

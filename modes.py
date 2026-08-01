@@ -107,10 +107,10 @@ and why" summary.
 [end: MODE]\
 """
 
-TEST_MODE = """\
-[MODE: TEST — VERIFY AND DEBUG]
+QA_MODE = """\
+[MODE: QA — TEST AND DEBUG]
 
-You are operating in test mode.  Verify code correctness by running tests and
+You are operating in QA mode.  Verify code correctness by running tests and
 debugging failures.  This is observe-and-report.
 
 Tools to use:
@@ -133,6 +133,56 @@ Constraints:
 
 Return a clear summary: what passed, what failed, and the failure details (error
 messages, stack traces, assertion failures).
+[end: MODE]\
+"""
+
+VERIFY_MODE = """\
+[MODE: VERIFY — DRIVE A REAL BROWSER AND SUBMIT A VERDICT]
+
+You are operating in verify mode.  You drive a REAL browser via Playwright to
+verify that a delivered change actually works.  You are given a brief: what
+changed, the environment URL and how to reach it, and what must not regress.
+
+Workflow:
+1. PLAN FIRST — before acting, write out the concrete assertions you will
+   check, derived from the brief.
+2. navigate then snapshot are your primary, cheap eyes — an ARIA-style tree
+   with element refs.  Reason and act over the snapshot, not a screenshot.
+3. Use screenshot ONLY for genuinely visual claims (layout, color, the actual
+   rendered text or glyphs) — it attaches the image directly to your context,
+   so reserve it for what a snapshot cannot show.  When you report a visual
+   attribute (a color, a position, a state), read it off the target element
+   itself — never carry over a color or style from a nearby element.
+4. Act via refs from the LATEST snapshot — click, fill, press, hover_element,
+   select_option, scroll, wait_for, handle_dialog — and RE-SNAPSHOT after any
+   action that mutates the DOM: refs go stale the moment the page changes.
+5. Gather DETERMINISTIC evidence first: snapshot state, console_logs,
+   network_requests statuses, the current URL, http_request for direct API
+   cross-checks.  Reach for vision only when the claim is inherently visual.
+6. Choose each verdict from the EVIDENCE, not from how the brief is framed:
+   'pass' needs evidence you captured THIS run that the behavior is correct;
+   'fail' needs evidence that the asserted condition is false — the behavior is
+   wrong, OR a claimed element is definitively absent from a page you DID load;
+   'inconclusive' is for when you could not gather the evidence to judge at all
+   — the environment was unreachable, a page never loaded, or a required signal
+   was ungettable.  Never report 'pass' without captured evidence, and never
+   report 'fail' for something you could not reach or observe — an unreachable
+   or unobservable target is 'inconclusive', regardless of any claim in the
+   brief that a change was deployed.
+7. When you are done, call report exactly once with your verdict, the plan you
+   generated, a per-assertion breakdown with evidence, and any observations.
+   A successful report call ENDS the run — it is not a progress update, it is
+   the last thing you do.
+
+Constraints:
+- DO NOT create, modify, or delete any project files.  You observe a running
+  system; you never change one.
+- Be skeptical: a plausible-looking screen is not proof — check the actual
+  signal behind it.  Ground every claim in a tool result; never invent
+  selectors, refs, or results.
+
+Return your verdict through the report tool: that call IS your answer, so
+everything the caller needs to know belongs in its fields.
 [end: MODE]\
 """
 
@@ -164,10 +214,10 @@ Tools to use:
 
 Constraints:
 - DO NOT modify project files.  Profiled code may itself write files — the
-  tool results name any files a run touched; report them.
+  tool results name any files a run touched; surface them.
 - Profile a bounded, realistic workload that exits on its own; state the
   exact command or entry point you measured.
-- Ground every claim in measured numbers from a tool result — never report a
+- Ground every claim in measured numbers from a tool result — never claim a
   bottleneck you did not observe.
 
 Return a performance report: what was measured (with wall/CPU/memory numbers),
@@ -229,9 +279,9 @@ MODES: dict[str, Mode] = {
             "verify_scratch",
         ),
     ),
-    "test": Mode(
-        name="test",
-        instructions=TEST_MODE,
+    "qa": Mode(
+        name="qa",
+        instructions=QA_MODE,
         tools=_COMMON_TOOLS + (
             "hover",
             "document_symbols",
@@ -270,6 +320,31 @@ MODES: dict[str, Mode] = {
             "run_command",
             "read_output",
             "stop_process",
+        ),
+    ),
+    # verify is the only mode without the LSP cluster: it verifies a RUNNING
+    # system through a browser, not source code. It is also the only mode with a
+    # terminal tool — a successful `report` ends the turn (see turn/outcome.py),
+    # which is what makes the evidence gate binding rather than advisory.
+    "verify": Mode(
+        name="verify",
+        instructions=VERIFY_MODE,
+        tools=_COMMON_TOOLS + (
+            "navigate",
+            "snapshot",
+            "click",
+            "fill",
+            "press",
+            "hover_element",
+            "select_option",
+            "scroll",
+            "wait_for",
+            "screenshot",
+            "console_logs",
+            "network_requests",
+            "http_request",
+            "handle_dialog",
+            "report",
         ),
     ),
 }

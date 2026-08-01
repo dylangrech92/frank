@@ -168,9 +168,9 @@ def main() -> int:
 
     from tools import registry
 
-    # verify_scratch is declared by 'test' mode (modes.py) — dispatch()
+    # verify_scratch is declared by 'qa' mode (modes.py) — dispatch()
     # refuses any tool outside the active mode's fixed set.
-    registry.activate_mode("test")
+    registry.activate_mode("qa")
 
     all_failures: list[str] = []
     for description, check in CHECKS:

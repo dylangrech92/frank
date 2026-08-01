@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 
 import modes
 import ui
@@ -21,7 +22,7 @@ from llm import LLMClient
 from session import Session
 from session_store import list_sessions
 from runtime.process import reap_all
-from tools.registry import activate_mode, discover
+from tools.registry import activate_mode, current_mode, discover
 from diagnostics import STORE
 
 # When run as a script this module is "__main__"; alias it as "main" so that
@@ -44,9 +45,8 @@ def register_mode_provider() -> None:
     cannot see its own tool-use instructions.
     """
     from session import CONTEXT_PROVIDERS
-    from tools.registry import current_mode
 
-    mode = modes.get_mode(current_mode())
+    mode = modes.get_mode(current_mode() or "")
     CONTEXT_PROVIDERS.append(lambda _session: mode.instructions)
 
 
@@ -218,6 +218,57 @@ DEBUG_MANAGER: DAPManager | None = None
 SESSION: Session | None = None
 
 
+def _browser_start_run(cfg: Config, project_root: str) -> None:
+    """Hand verify mode its config and its artifact directory. No-op elsewhere.
+
+    Imported lazily and only under verify mode: ``runtime.browser`` pulls in
+    ``playwright.sync_api``, and the other four modes have no browser to drive —
+    they should not pay that import on every launch.
+
+    The run directory is main's to own, the same way the LSP and DAP managers'
+    roots are: the browser session writes screenshots and ``trace.zip`` into it,
+    and the envelope reports it back, so exactly one place decides where it is.
+    It sits under the project's existing ``.coding_agent/`` sidecar next to
+    ``sessions/``, and is created eagerly — a run that only ever calls
+    ``http_request`` never starts a browser, and the caller should still get a
+    real directory rather than a path that may or may not exist.
+    """
+    if current_mode() != "verify":
+        return
+
+    from runtime import browser
+
+    browser.configure(cfg.browser)
+    run_dir = Path(project_root) / ".coding_agent" / "runs" / SESSION.session_id  # type: ignore[union-attr]
+    run_dir.mkdir(parents=True, exist_ok=True)
+    browser.get_session().run_dir = run_dir
+
+
+def _browser_finish_run(session: Session) -> None:
+    """Close the browser and record its artifacts on ``turn_report``. No-op elsewhere.
+
+    Must run BEFORE the envelope is built: ``trace.zip`` is only written by
+    ``BrowserSession.shutdown``, and the envelope reports ``trace`` as a path
+    that exists on disk — never as a path where a file is expected to appear.
+    Both fields stay ``None`` when there is nothing real to point at.
+    """
+    if current_mode() != "verify":
+        return
+
+    from runtime import browser
+
+    bs = browser.get_session()
+    bs.shutdown()
+
+    report = getattr(session, "turn_report", None)
+    if report is None:
+        return
+    run_dir = bs.run_dir
+    trace = run_dir / "trace.zip" if run_dir is not None else None
+    report["artifacts_dir"] = str(run_dir) if run_dir is not None else None
+    report["trace"] = str(trace) if trace is not None and trace.exists() else None
+
+
 def _build_envelope(
     session: Session, status: str, error: str | None, duration_s: float
 ) -> dict:
@@ -251,6 +302,13 @@ def _build_envelope(
         "declared_unverified": report.get("declared_unverified", False),
         "files_changed": report.get("files_changed", []),
         "verification_runs": report.get("verification_runs", []),
+        # verify mode's structured verdict. None on every other mode, and on a
+        # verify run that ended without an accepted report — the caller can tell
+        # "no verdict was submitted" from "the verdict was inconclusive", which
+        # collapsing the two into a default would destroy.
+        "report": report.get("report"),
+        "artifacts_dir": report.get("artifacts_dir"),
+        "trace": report.get("trace"),
         "usage": {
             "prompt_tokens": usage.get("prompt_tokens"),
             "completion_tokens": usage.get("completion_tokens"),
@@ -411,6 +469,8 @@ def main() -> None:
         global DEBUG_MANAGER
         DEBUG_MANAGER = DAPManager(cfg.debug_adapters, project_root)
 
+        _browser_start_run(cfg, project_root)
+
         if args.prompt is not None:
             task = sys.stdin.read() if args.prompt == "-" else args.prompt
             task = task.strip()
@@ -441,6 +501,10 @@ def main() -> None:
                     # teardown (consolidation drain) still runs after this —
                     # a caller-side kill in that window must not lose the
                     # already-produced answer.
+                    # Close the browser first: trace.zip is written by the
+                    # shutdown, and the envelope only reports artifacts that
+                    # exist on disk by the time it is built.
+                    _browser_finish_run(session)
                     if args.json:
                         duration_s = time.monotonic() - start_t
                         print(
@@ -452,6 +516,7 @@ def main() -> None:
                 except Exception as exc:
                     duration_s = time.monotonic() - start_t
                     error_msg = f"{type(exc).__name__}: {exc}"
+                    _browser_finish_run(session)
                     if args.json:
                         print(json.dumps(
                             _build_envelope(session, "error", error_msg, duration_s)
@@ -521,6 +586,11 @@ def main() -> None:
 
         if DEBUG_MANAGER is not None and DEBUG_MANAGER.active:
             DEBUG_MANAGER.stop()
+
+        # Idempotent: the one-shot path already closed the browser before
+        # building its envelope, so this only does real work for the REPL, where
+        # the session spans many turns and teardown is the only right moment.
+        _browser_finish_run(session)
 
         session_end_jobs(session, client)
     finally:

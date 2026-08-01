@@ -15,3 +15,7 @@ issues.md
 
 # Ruff
 .ruff_cache/
+
+# Playwright browser builds (installed via scripts/install_browsers.py).
+# verify-mode run artifacts land in .coding_agent/runs/, already covered above.
+.browsers/

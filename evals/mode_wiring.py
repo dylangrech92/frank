@@ -17,7 +17,7 @@ This script verifies the mode-gating harness end to end, with no mocks:
      ``code="not-in-mode"`` AND never executes — proven by a real side
      effect (a file) that must NOT appear on disk.
   e. Drift guard between ``modes.py``'s prose and its declared tool tuples,
-     plus ``mcp_server.py``'s four literal mode strings against ``MODES``.
+     plus ``mcp_server.py``'s five literal mode strings against ``MODES``.
      See ``check_drift_guard`` for why this is two separate, asymmetric
      assertions rather than one "every tool name in the prose" scan.
   f. ``tools/spawn_agents.py`` launches each child with ``--mode`` set to
@@ -196,7 +196,7 @@ def check_dispatch_out_of_mode_blocked() -> list[str]:
     """d. dispatch() of an out-of-mode tool returns not-in-mode and never executes.
 
     Activates 'research' (strictly read-only: no file-writing tool present)
-    then dispatches 'create_file', which belongs to 'code'/'test' but not
+    then dispatches 'create_file', which belongs to 'code'/'qa' but not
     'research'. Asserts both the error contract AND the real side effect
     (the file) does not exist on disk — the gate must block execution, not
     just mislabel a result after the fact.
@@ -246,9 +246,11 @@ def check_drift_guard() -> list[str]:
     So this check is scoped in two directions that do NOT overlap:
 
     1. POSITIVE (recommended-in-prose implies declared): scan only the
-       "Tools to use:" section, stopping before "Constraints:". Every tool
-       named there must be in the mode's declared tool tuple. This section
-       never negates a tool, so a straight subset check is safe here.
+       "Tools to use:" section — or, for a mode that structures its guidance
+       as an ordered procedure instead of a bullet list, "Workflow:" —
+       stopping before "Constraints:". Every tool named there must be in the
+       mode's declared tool tuple. This section never negates a tool, so a
+       straight subset check is safe here.
 
     2. INVERSE, the more valuable half (forbidden-in-prose implies absent):
        scan only the "Constraints:" section. Any tool named there as
@@ -260,14 +262,25 @@ def check_drift_guard() -> list[str]:
        prose forbade running tests in code mode, but the flat catalog made
        run_tests callable anyway).
 
+       Known limitation of the inverse half: several tools are named after
+       ordinary English words ('report', 'format', 'find', 'git', 'lint',
+       'snapshot', 'click', 'press'), and the scan cannot tell a tool
+       reference from the plain verb. A Constraints bullet that uses one of
+       those words as prose therefore asserts "this mode must not carry that
+       tool" — true today for every mode, but by coincidence, not by
+       intent. If this half ever fires on a mode that genuinely should carry
+       the named tool, the fix is to reword the prose, not to relax the
+       check: the check is the only thing holding prose and tool list
+       together.
+
     Also checks, as the same "does the static harness config match
     modes.py truth" drift class:
     - every registered tool belongs to at least one mode (no orphans)
     - no mode declares an unknown tool name
-    - mcp_server.py's four literal mode strings (passed positionally to
+    - mcp_server.py's five literal mode strings (passed positionally to
       _run_agent(...), read via AST since mcp_server.py deliberately does
-      not import modes.py) are exactly {'research','code','test',
-      'performance_debug'} and each is a valid modes.MODES key — this is
+      not import modes.py) are exactly {'research','code','qa',
+      'performance_debug','verify'} and each is a valid modes.MODES key — this is
       the only thing standing between a renamed mode and a silently broken
       MCP tool.
     """
@@ -283,8 +296,26 @@ def check_drift_guard() -> list[str]:
 
         covered: set[str] = set()
         for mode_name, mode in MODES.items():
+            # A mode names its recommended tools under one of two headers: a
+            # "Tools to use:" bullet list, or verify's "Workflow:" numbered
+            # procedure. Neither section ever negates a tool, so both feed the
+            # positive half. Absence of BOTH is reported rather than skipped —
+            # a section this scan cannot find is a check that silently passes,
+            # which is the one failure mode a drift guard must not have.
             tools_section = _section(mode.instructions, "Tools to use:", "Constraints:")
+            if not tools_section:
+                tools_section = _section(mode.instructions, "Workflow:", "Constraints:")
             constraints_section = _section(mode.instructions, "Constraints:", "\nReturn ")
+            if not tools_section:
+                failures.append(
+                    f"mode {mode_name!r}: no 'Tools to use:' or 'Workflow:' section — "
+                    f"the drift guard's positive half has nothing to check"
+                )
+            if not constraints_section:
+                failures.append(
+                    f"mode {mode_name!r}: no 'Constraints:' section — the drift "
+                    f"guard's inverse half has nothing to check"
+                )
 
             recommended = _mentioned_tools(tools_section, all_tool_names)
             forbidden = _mentioned_tools(constraints_section, all_tool_names)
@@ -331,7 +362,7 @@ def check_drift_guard() -> list[str]:
                     if isinstance(first, ast.Constant) and isinstance(first.value, str):
                         mcp_mode_calls.add(first.value)
 
-        expected = {"research", "code", "test", "performance_debug"}
+        expected = {"research", "code", "qa", "performance_debug", "verify"}
         if mcp_mode_calls != expected:
             failures.append(
                 f"mcp_server.py's _run_agent call sites name {sorted(mcp_mode_calls)}, "
@@ -409,7 +440,7 @@ def check_spawn_agents_propagates_parent_mode() -> list[str]:
                 f"(exit_code={outcome.get('exit_code')!r} timed_out={outcome.get('timed_out')!r}). "
                 f"stderr: {stderr[:1000]!r}"
             )
-        for other_mode in ("code", "test", "performance_debug"):
+        for other_mode in ("code", "qa", "performance_debug", "verify"):
             if f"mode: {other_mode}" in stderr:
                 failures.append(f"child ran under mode {other_mode!r}, not the parent's {mode!r}")
 

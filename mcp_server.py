@@ -1,19 +1,22 @@
-"""MCP server exposing coding_agent behind four mode-specific tools.
+"""MCP server exposing coding_agent behind five mode-specific tools.
 
 Each tool takes a ``prompt`` (simple natural-language direction from the
 orchestrator) and a ``working_dir`` (the target project root).  The server
 invokes the coding agent as a one-shot subprocess (``main.py -p - --json
 --mode <mode>``), parses the JSON envelope, and returns the result.
 
-The four tools:
+The five tools:
 
 - ``research`` — read-only investigation (LSP, search, navigation).  Returns
   natural-language findings.
 - ``code`` — make precise code changes (edit, refactor, format).  Returns JSON
   with files-changed, verification status, and a summary.
-- ``test`` — run tests and debug (test runner, commands, DAP).  Returns JSON
+- ``qa`` — run tests and debug (test runner, commands, DAP).  Returns JSON
   with verification runs and findings.
 - ``performance_debug`` — profile runtime performance and report hotspots.
+- ``verify`` — drive a real browser to check a running system against a brief.
+  Returns JSON with an evidence-backed verdict, per-assertion breakdown, and
+  the run's artifact paths.
 
 Each mode's instructions and complete tool set live in ``modes.py``. The
 agent subprocess loads them itself via ``--mode``; this server forwards the
@@ -73,9 +76,9 @@ async def _run_agent(
     ``timeout_s`` without the client giving up.
 
     Args:
-        mode: One of ``"research"``, ``"code"``, ``"test"``, ``"performance_debug"`` — passed to
-            the subprocess as ``--mode``, which loads that mode's complete tool set and
-            instructions inside the agent itself.
+        mode: One of ``"research"``, ``"code"``, ``"qa"``, ``"performance_debug"``,
+            ``"verify"`` — passed to the subprocess as ``--mode``, which loads that
+            mode's complete tool set and instructions inside the agent itself.
         prompt: The orchestrator's natural-language direction, sent as-is.
         working_dir: The target project root (becomes the agent's CWD).
         timeout_s: Wall-clock timeout for the subprocess.
@@ -176,13 +179,37 @@ def _format_code_result(envelope: dict) -> str:
     }, indent=2)
 
 
-def _format_test_result(envelope: dict) -> str:
-    """Format the envelope for test mode as a focused JSON string."""
+def _format_qa_result(envelope: dict) -> str:
+    """Format the envelope for qa mode as a focused JSON string."""
     return json.dumps({
         "status": envelope.get("status"),
         "error": envelope.get("error"),
         "answer": envelope.get("answer"),
         "verification_runs": envelope.get("verification_runs", []),
+    }, indent=2)
+
+
+def _format_verify_result(envelope: dict) -> str:
+    """Format the envelope for verify mode as a focused JSON string.
+
+    The verdict fields are lifted out of the envelope's ``report`` object so the
+    orchestrator reads ``verdict`` / ``plan`` / ``assertions`` / ``observations``
+    at the top level. When no report was submitted, ``report`` is absent and
+    every one of those is reported as null/empty rather than defaulted — a run
+    that ended without a verdict must not be readable as one that returned a
+    verdict, so the caller can tell "no verdict" from "inconclusive".
+    """
+    report = envelope.get("report") or {}
+    return json.dumps({
+        "status": envelope.get("status"),
+        "error": envelope.get("error"),
+        "verdict": report.get("verdict"),
+        "plan": report.get("plan", []),
+        "assertions": report.get("assertions", []),
+        "observations": report.get("observations", ""),
+        "artifacts_dir": envelope.get("artifacts_dir"),
+        "trace": envelope.get("trace"),
+        "answer": envelope.get("answer"),
     }, indent=2)
 
 
@@ -235,7 +262,7 @@ async def code(prompt: str, working_dir: str, ctx: Context) -> str:
     refactoring, and formatting.  Returns JSON with files-changed, verification
     status, and a summary of what was done.
 
-    Does NOT run tests — use the 'test' tool for verification.
+    Does NOT run tests — use the 'qa' tool for verification.
 
     Use for: implementing features, fixing bugs, refactoring, renaming symbols,
     applying quick-fixes, formatting.
@@ -254,29 +281,30 @@ async def code(prompt: str, working_dir: str, ctx: Context) -> str:
 
 
 @app.tool()
-async def test(prompt: str, working_dir: str, ctx: Context) -> str:
+async def qa(prompt: str, working_dir: str, ctx: Context) -> str:
     """Run tests and verify code correctness in a project.  Returns JSON with
     test results and findings.
 
     Can run test suites, execute commands, run verification snippets, and debug
     failures with breakpoints and stepping (DAP).
 
-    Does NOT modify code — use the 'code' tool for changes.
+    Does NOT modify code — use the 'code' tool for changes.  Does NOT drive a
+    browser — use the 'verify' tool to check a running system end to end.
 
     Use for: running tests, reproducing bugs, debugging failures, verifying
     changes made by the code tool.
 
     Args:
-        prompt: Natural-language test direction, e.g. "Run the test suite in
+        prompt: Natural-language QA direction, e.g. "Run the test suite in
             tests/ and report any failures with their stack traces".
         working_dir: Absolute path to the target project root.
     """
     try:
-        envelope = await _run_agent("test", prompt, working_dir, ctx=ctx)
+        envelope = await _run_agent("qa", prompt, working_dir, ctx=ctx)
     except RuntimeError as exc:
         return json.dumps({"status": "error", "error": str(exc)}, indent=2)
 
-    return _format_test_result(envelope)
+    return _format_qa_result(envelope)
 
 
 @app.tool()
@@ -304,6 +332,42 @@ async def performance_debug(prompt: str, working_dir: str, ctx: Context) -> str:
         return json.dumps({"status": "error", "error": str(exc)}, indent=2)
 
     return _format_perf_result(envelope)
+
+
+@app.tool()
+async def verify(prompt: str, working_dir: str, ctx: Context) -> str:
+    """Drive a real browser (Playwright) to verify that a RUNNING system behaves
+    as described.  Returns JSON with an evidence-backed verdict ('pass', 'fail',
+    or 'inconclusive'), the plan it checked, a per-assertion breakdown with the
+    evidence behind each one, and the run's artifact paths (screenshots plus a
+    Playwright trace.zip).
+
+    Every 'pass' or 'fail' assertion must cite evidence captured during the run —
+    an ARIA snapshot, a console message, a network status, an HTTP response, a
+    screenshot, or the page URL.  A claim it could not reach or observe comes
+    back 'inconclusive', never 'fail'.
+
+    Does NOT modify code and does NOT run unit tests — use 'code' for changes and
+    'qa' for the test suite.
+
+    Use for: confirming a deployed change actually works, checking a user flow
+    end to end, catching console/network errors on a real page, verifying visual
+    or rendered state that a unit test cannot see.
+
+    Args:
+        prompt: The verification brief — what changed, the URL and how to reach
+            it, and what must not regress.  e.g. "At http://localhost:3000,
+            verify the login form rejects a wrong password with a visible error
+            and logs no console errors".
+        working_dir: Absolute path to the target project root (run artifacts are
+            written under its .coding_agent/runs/ directory).
+    """
+    try:
+        envelope = await _run_agent("verify", prompt, working_dir, ctx=ctx)
+    except RuntimeError as exc:
+        return json.dumps({"status": "error", "error": str(exc)}, indent=2)
+
+    return _format_verify_result(envelope)
 
 
 # ---------------------------------------------------------------------------

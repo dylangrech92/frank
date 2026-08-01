@@ -31,10 +31,27 @@ from turn.steering import _is_bug_report
 #
 # Profiling tools are repeat-cap exempt because a measure -> edit -> re-measure
 # loop legitimately re-issues identical calls, but they are NOT verification tools.
+#
+# verify mode's observation tools are exempt for the same structural reason: its
+# instructions MANDATE re-snapshotting after every DOM mutation, and scroll /
+# wait_for are legitimately called repeatedly with identical arguments, so a
+# normal multi-step verification would false-positive the cap and break its own
+# evidence chain. `report` is exempt so a model retrying it after an
+# evidence-gate rejection can keep retrying — the gate is the whole point of the
+# mode, and capping the retry would strand the run with no verdict.
 _VERIFICATION_TOOLS = frozenset({"run_command", "run_tests", "verify_scratch"})
 _PROFILING_TOOLS = frozenset({"profile_command", "profile_hotspots", "profile_memory", "trace_execution"})
+_BROWSER_OBSERVE_TOOLS = frozenset({
+    "report",
+    "snapshot",
+    "console_logs",
+    "network_requests",
+    "screenshot",
+    "scroll",
+    "wait_for",
+})
 _REPEAT_CALL_CAP = 3
-_REPEAT_CAP_EXEMPT = _VERIFICATION_TOOLS | _PROFILING_TOOLS
+_REPEAT_CAP_EXEMPT = _VERIFICATION_TOOLS | _PROFILING_TOOLS | _BROWSER_OBSERVE_TOOLS
 
 
 def _available_verification_tools() -> list[str]:
@@ -45,10 +62,11 @@ def _available_verification_tools() -> list[str]:
     to name real, callable tools, so this reports the intersection of
     ``_VERIFICATION_TOOLS`` with the active mode via ``registry.is_loaded`` (which
     now means "in the active mode"), letting each steer name exactly what the
-    model can call: all three in test mode, ``run_command`` + ``verify_scratch``
+    model can call: all three in qa mode, ``run_command`` + ``verify_scratch``
     in code mode (never ``run_tests`` — code mode's own instructions forbid
     running the suite), and ``run_command`` alone in performance_debug. Empty in
-    research mode, which has no verification tools and no way to mutate.
+    research and verify modes, which have no verification tools and no way to
+    mutate.
     """
     return sorted(name for name in _VERIFICATION_TOOLS if is_loaded(name))
 

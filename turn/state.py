@@ -116,3 +116,10 @@ class _TurnState:
     # turn is force-finalized instead of looping the same blocked call forever
     # (see handle_user_message / _blocked_loop_giveup).
     blocked_streak: int = 0
+    # Terminal-tool exit (verify mode): the accepted `report` payload — the
+    # arguments of the first `report` call whose evidence gate PASSED this turn.
+    # Set in _dispatch_round; handle_user_message ends the turn on the next
+    # statement after that round returns. A rejected report (evidence-required /
+    # incoherent-verdict / bad-arguments) leaves this None so the model keeps its
+    # turn and can fix the verdict — the gate must be survivable to be useful.
+    terminal_report: dict | None = None

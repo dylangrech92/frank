@@ -1,12 +1,15 @@
 [project]
 name = "coding-agent"
 version = "0.1.0"
-description = "Local LLM coding agent with LSP, DAP, profiling, and MCP integration"
+description = "Local LLM agent with LSP, DAP, profiling, browser verification, and MCP integration"
 requires-python = ">=3.10"
 dependencies = [
     "requests",
     "mcp",
     "psutil",
+    # verify mode drives a real browser; the Playwright sync API is the whole
+    # runtime behind runtime/browser.py and every tools/browser_*.py tool.
+    "playwright>=1.49",
 ]
 
 [dependency-groups]

@@ -40,6 +40,61 @@ STEER_PREFIX = (
     "this as a user request] "
 )
 
+# How many of the most recent screenshots keep their actual image data in the
+# assembled context. Vision payloads are the single heaviest thing a turn can
+# put on the wire (a base64 PNG dwarfs any tool body), and a verify run takes
+# many shots — so older ones degrade to a text line naming where the file was
+# saved, which is what the model needs to cite it as evidence anyway. Applies to
+# the ASSEMBLED view only; the message list itself is never rewritten.
+MAX_IMAGES = 3
+
+# Placeholder that replaces a pruned screenshot's image data. Names the path so
+# the model can still cite the artifact it saw earlier in the run.
+_PRUNED_IMAGE = "[screenshot pruned — saved at {path}]"
+
+
+class _ImageRef:
+    """Where one screenshot lives: its index in ``_messages`` and its file path."""
+
+    __slots__ = ("index", "path")
+
+    def __init__(self, index: int, path: str) -> None:
+        self.index = index
+        self.path = path
+
+
+def _collapse_persisted_images(messages: List[Dict[str, Any]]) -> None:
+    """Turn resumed ``image_ref`` parts back into plain text, in place.
+
+    The transcript stores a screenshot as ``{"type": "image_ref", "path": ...}``
+    rather than the base64 data URI (see ``_transcript_messages``), so a resumed
+    session has the path but not the pixels. That part is not valid provider
+    content and the image cannot be reconstructed, so each such message collapses
+    to the same placeholder a pruned screenshot gets — a resumed run is told
+    exactly what it is: a screenshot was taken, here is where it was saved.
+    """
+    for entry in messages:
+        content = entry.get("content")
+        if not isinstance(content, list):
+            continue
+        if not any(
+            isinstance(part, dict) and part.get("type") == "image_ref" for part in content
+        ):
+            continue
+        texts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        paths = [
+            part.get("path", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "image_ref"
+        ]
+        label = " ".join(t for t in texts if t)
+        placeholder = " ".join(_PRUNED_IMAGE.format(path=p) for p in paths)
+        entry["content"] = f"{label} {placeholder}".strip() if label else placeholder
+
 
 class Session:
     """A conversation transcript stored with full fidelity on disk.
@@ -83,6 +138,13 @@ class Session:
         self.model = model
         self.system_prompt = system_prompt
         self._messages: List[Dict[str, Any]] = list(messages) if messages is not None else []
+        # Screenshots attached THIS process, newest last — the input to the
+        # assembled view's image pruning. Deliberately empty on resume: a
+        # resumed transcript carries paths, not pixels, so its screenshots are
+        # collapsed to text here and there is nothing left to prune.
+        self._image_refs: List[_ImageRef] = []
+        if messages is not None:
+            _collapse_persisted_images(self._messages)
 
         if session_id is not None:
             self.session_id = session_id
@@ -236,6 +298,42 @@ class Session:
         self._messages.append({"role": "user", "content": STEER_PREFIX + text, "steer": True})
         self._persist()
 
+    def append_screenshot(self, image_path: str, data_uri: str, label: str) -> None:
+        """Append a user-role message carrying *label* plus the screenshot itself.
+
+        Vision rides the user role with OpenAI content parts — a ``text`` part
+        for the label and an ``image_url`` part for the image — because that is
+        the only role the chat API accepts image content on. ``llm.to_wire_messages``
+        passes ``content`` through untouched, so this reaches the provider as-is
+        with no transport change.
+
+        The message is recorded once and never rewritten: pruning happens in the
+        assembled view (see ``session_context.assemble_context``) and the base64
+        payload is swapped for a path when the transcript is written (see
+        ``_transcript_messages``), so neither the context nor the file on disk
+        carries every image forever.
+
+        Args:
+            image_path: Absolute path to the PNG saved by the screenshot tool.
+            data_uri: ``data:image/png;base64,...`` URI for the image_url part.
+            label: Text describing the screenshot (e.g. which call produced it).
+        """
+        self._messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": label},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+            # Rides the user role out of necessity, but is NOT a turn start —
+            # same distinction the ``steer`` flag draws. Without it the pruner's
+            # boundary scan would treat every screenshot as a new turn and fold
+            # away the tool scaffolding of the very run that took it. Stripped at
+            # the wire boundary (llm._NON_WIRE_MESSAGE_KEYS).
+            "screenshot": True,
+        })
+        self._image_refs.append(_ImageRef(index=len(self._messages) - 1, path=image_path))
+        self._persist()
+
     def append_assistant(self, text: str, tool_calls: List[ToolCall] | None = None) -> None:
         """Append an assistant message and persist.
 
@@ -330,6 +428,38 @@ class Session:
 
     # ------------------------------------------------------------------ private
 
+    def _transcript_messages(self) -> List[Dict[str, Any]]:
+        """The message list as it should be WRITTEN — image data swapped for paths.
+
+        The only place the on-disk transcript deviates from ``_messages``, and it
+        is a substitution rather than a loss: an ``image_url`` part becomes
+        ``{"type": "image_ref", "path": ...}``, so the transcript records that a
+        screenshot was taken and where the PNG lives, without embedding a base64
+        payload that would dominate the file and be re-read on every append.
+        Messages with no image parts are passed through by identity.
+        """
+        if not self._image_refs:
+            return self._messages
+
+        paths_by_index = {ref.index: ref.path for ref in self._image_refs}
+        out: List[Dict[str, Any]] = []
+        for index, entry in enumerate(self._messages):
+            path = paths_by_index.get(index)
+            content = entry.get("content")
+            if path is None or not isinstance(content, list):
+                out.append(entry)
+                continue
+            out.append({
+                **entry,
+                "content": [
+                    {"type": "image_ref", "path": path}
+                    if isinstance(part, dict) and part.get("type") == "image_url"
+                    else part
+                    for part in content
+                ],
+            })
+        return out
+
     def _persist(self) -> None:
         """Hand this session's persisted state to the transcript store.
 
@@ -343,7 +473,7 @@ class Session:
             project_root=self.project_root,
             model=self.model,
             created_at=self.created_at,
-            messages=self._messages,
+            messages=self._transcript_messages(),
             summary=self._summary,
             summary_covers=self._summary_covers,
             episodic_watermark=self.episodic_watermark,

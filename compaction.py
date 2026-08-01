@@ -15,6 +15,45 @@ from llm import OverCapError
 from session import Session  # noqa: E402
 
 
+# What one attached screenshot is counted as costing. A vision part is billed by
+# the provider as a fixed tile budget, NOT by the length of its base64 payload:
+# a 200KB PNG is ~270k base64 characters, which chars/4 would score as ~67k
+# tokens against a real cost nearer 1-2k. Left unhandled, a single screenshot
+# would appear to blow the window and send the compaction ladder into a fold on
+# a context that was never over cap. This is a deliberate over-estimate of the
+# real tile cost — over-counting a screenshot is safe, under-counting is not.
+_IMAGE_PART_TOKENS = 2000
+
+
+def _flatten_content(content: Any) -> str:
+    """Render a message's ``content`` as countable/summarizable text.
+
+    A plain string passes through. A content-parts list (vision messages — see
+    ``Session.append_screenshot``) is flattened part by part, with an
+    ``image_url`` part replaced by a fixed-size marker rather than its base64
+    data URI: the payload is neither worth summarizing nor countable by
+    character length (see ``_IMAGE_PART_TOKENS``).
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return "" if content is None else json.dumps(content)
+
+    out: List[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            out.append(json.dumps(part))
+        elif part.get("type") == "image_url":
+            # Padded to _IMAGE_PART_TOKENS' worth of chars/4 so the estimator
+            # bills the image without depending on the base64 length.
+            out.append("[screenshot attached]" + ("x" * (_IMAGE_PART_TOKENS * 4)))
+        elif part.get("type") == "text":
+            out.append(str(part.get("text", "")))
+        else:
+            out.append(json.dumps(part))
+    return "\n".join(out)
+
+
 def _serialize_for_estimate(
     messages: List[Dict[str, Any]],
     tools: List[Dict[str, Any]] | None,
@@ -30,11 +69,7 @@ def _serialize_for_estimate(
 
     for m in messages:
         parts.append(str(m.get("role", "")))
-        content = m.get("content", "")
-        if isinstance(content, str):
-            parts.append(content)
-        elif content is not None:
-            parts.append(json.dumps(content))
+        parts.append(_flatten_content(m.get("content", "")))
         name = m.get("name")
         if name:
             parts.append(str(name))
@@ -225,7 +260,17 @@ def _render_messages_for_summary(messages):
     for m in messages:
         role = "harness" if m.get("steer") else m.get("role", "")
         content = m.get("content", "")
-        if not isinstance(content, str):
+        if isinstance(content, list):
+            # Vision message: keep the label, drop the base64 — the summarizer
+            # cannot read an image and must not be fed a data URI as prose.
+            content = " ".join(
+                str(part.get("text", ""))
+                if part.get("type") == "text"
+                else "[screenshot attached]"
+                for part in content
+                if isinstance(part, dict)
+            ).strip()
+        elif not isinstance(content, str):
             content = json.dumps(content)
         calls = m.get("tool_calls") or []
         if calls:

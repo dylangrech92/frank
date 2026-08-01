@@ -18,13 +18,14 @@ with a stub LLM client, no network) plus direct calls into the real
 a. ``turn.verification._available_verification_tools()`` returns exactly the
    documented per-mode set: research -> [] (no mutating tools, nothing to
    verify); code -> ['run_command', 'verify_scratch'] (code mode's own
-   instructions forbid running the suite, so never run_tests); test ->
+   instructions forbid running the suite, so never run_tests); qa ->
    ['run_command', 'run_tests', 'verify_scratch'] (all three); performance_debug
-   -> ['run_command'] (profiling tools are not verification tools).
+   -> ['run_command'] (profiling tools are not verification tools); verify ->
+   [] (it drives a browser against a running system and changes no files).
 
 b. The H1 nudge text built from each mode's available list names exactly
    those tools and nothing else — code mode's nudge never mentions run_tests
-   or run_tests' clause text; test mode's does; performance_debug's names only
+   or run_tests' clause text; qa mode's does; performance_debug's names only
    run_command.
 
 c. End-to-end through the real turn loop, in 'code' mode: an edit with zero
@@ -92,8 +93,12 @@ def check_available_verification_tools_per_mode() -> list[str]:
     expected = {
         "research": [],
         "code": ["run_command", "verify_scratch"],
-        "test": ["run_command", "run_tests", "verify_scratch"],
+        "qa": ["run_command", "run_tests", "verify_scratch"],
         "performance_debug": ["run_command"],
+        # verify drives a browser against a RUNNING system and changes no
+        # files, so it carries none of the three verification tools — the
+        # empty list is the assertion that the H1 nudge stays silent there.
+        "verify": [],
     }
 
     saved_mode = registry.current_mode()
@@ -134,14 +139,14 @@ def check_nudge_names_only_available_tools() -> list[str]:
         if "verify_scratch" not in code_text:
             failures.append(f"code mode's H1 nudge does not name verify_scratch: {code_text!r}")
 
-        registry.activate_mode("test")
-        test_text = _verification_nudge_text(_available_verification_tools())
-        if "run_tests" not in test_text:
-            failures.append(f"test mode's H1 nudge does not name run_tests: {test_text!r}")
-        if "run_command" not in test_text:
-            failures.append(f"test mode's H1 nudge does not name run_command: {test_text!r}")
-        if "verify_scratch" not in test_text:
-            failures.append(f"test mode's H1 nudge does not name verify_scratch: {test_text!r}")
+        registry.activate_mode("qa")
+        qa_text = _verification_nudge_text(_available_verification_tools())
+        if "run_tests" not in qa_text:
+            failures.append(f"qa mode's H1 nudge does not name run_tests: {qa_text!r}")
+        if "run_command" not in qa_text:
+            failures.append(f"qa mode's H1 nudge does not name run_command: {qa_text!r}")
+        if "verify_scratch" not in qa_text:
+            failures.append(f"qa mode's H1 nudge does not name verify_scratch: {qa_text!r}")
 
         registry.activate_mode("performance_debug")
         perf_text = _verification_nudge_text(_available_verification_tools())

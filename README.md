@@ -1,8 +1,8 @@
 # Frank
 
-An LLM-powered coding agent that acts as a headless IDE. It connects an LLM to a project through real tooling — LSP code intelligence, DAP debugging, sandboxed file operations, terminal access, test runners, web search, and per-project long-term memory.
+An LLM-powered coding agent that acts as a headless IDE. It connects an LLM to a project through real tooling — LSP code intelligence, DAP debugging, sandboxed file operations, terminal access, test runners, profilers, a real browser, web search, and per-project long-term memory.
 
-Frank is designed as a **companion to an orchestrator agent** — the orchestrator (Claude, opencode, GPT, or any MCP-compatible host) handles planning, sequencing, and user interaction. It delegates the deep code work to Frank via four mode-scoped tools: `research` (read-only), `code` (implement), `test` (verify), and `performance_debug` (measure). Each tool invocation spins up a one-shot agent run against the target project.
+Frank is designed as a **companion to an orchestrator agent** — the orchestrator (Claude, opencode, GPT, or any MCP-compatible host) handles planning, sequencing, and user interaction. It delegates the deep code work to Frank via five mode-scoped tools: `research` (read-only), `code` (implement), `qa` (run tests and debug), `performance_debug` (measure), and `verify` (drive a real browser and return an evidence-backed verdict). Each tool invocation spins up a one-shot agent run against the target project.
 
 Frank can also be used directly from the CLI as an interactive REPL or one-shot command.
 
@@ -18,7 +18,15 @@ Python 3.10+ is required. Dependencies are managed with [uv](https://docs.astral
 uv sync
 ```
 
-This creates a `.venv` and installs the pinned dependencies from the committed `uv.lock`: `requests`, `mcp` and `psutil` for the agent itself, plus the `dev` group (`pyyaml`) that the evaluation harness needs to parse tool output back. Run the agent with `uv run python main.py --mode <mode>`, or activate `.venv` and run `python main.py --mode <mode>` directly — see [Run directly from the CLI](#3b-run-directly-from-the-cli) for the available modes.
+This creates a `.venv` and installs the pinned dependencies from the committed `uv.lock`: `requests`, `mcp`, `psutil` and `playwright` for the agent itself, plus the `dev` group (`pyyaml`) that the evaluation harness needs to parse tool output back. Run the agent with `uv run python main.py --mode <mode>`, or activate `.venv` and run `python main.py --mode <mode>` directly — see [Run directly from the CLI](#3b-run-directly-from-the-cli) for the available modes.
+
+`verify` mode additionally needs a Chromium build. Install it once into the repo's own `.browsers/` directory (where the browser session looks for it, rather than the user-global Playwright cache):
+
+```bash
+uv run python scripts/install_browsers.py
+```
+
+Every other mode runs without it.
 
 Optional packages (the agent degrades gracefully without each one):
 
@@ -57,12 +65,15 @@ The rest of the config (linters, language servers, debug adapters) comes pre-fil
 uv run python mcp_server.py
 ```
 
-This exposes four tools over stdio MCP transport:
+This exposes five tools over stdio MCP transport:
 
 - **`research(prompt, working_dir)`** — read-only investigation. Returns natural-language findings.
 - **`code(prompt, working_dir)`** — implement changes. Returns JSON with files-changed and verification status.
-- **`test(prompt, working_dir)`** — run tests and debug. Returns JSON with test results.
+- **`qa(prompt, working_dir)`** — run tests and debug. Returns JSON with test results.
 - **`performance_debug(prompt, working_dir)`** — measure-first performance analysis of a target project: resource usage, wall time, hotspots, allocation sites, iteration counts, and nesting depth. Returns a measured report as a JSON envelope with status, answer, files_changed, and duration.
+- **`verify(prompt, working_dir)`** — drive a real browser against a running system and return a verdict. Every `pass` assertion must cite evidence captured during the run (an accessibility snapshot, console output, a network response, an HTTP status, a URL, or a screenshot), or the report is refused and the agent has to try again. Returns a JSON envelope with `verdict` (`pass` / `fail` / `inconclusive`), the plan, the per-assertion evidence breakdown, observations, and the paths to the run's artifacts and Playwright trace.
+
+**Browser prerequisite:** `verify` needs the Chromium build installed by `scripts/install_browsers.py` (see [Install dependencies](#1-install-dependencies)). Without it the first browser call fails loudly rather than silently reporting an unverifiable result.
 
 **Profiling prerequisites:** Python profiling is fully bundled. Node profiling needs Node.js >= 12 on `PATH`. PHP profiling needs PHP with Xdebug >= 3.1. A missing runtime produces an explicit `interpreter-unavailable` or `xdebug-unavailable` error rather than silently degrading. The interpreter path can be overridden with `CODING_AGENT_PY_BIN`, `CODING_AGENT_NODE_BIN`, or `CODING_AGENT_PHP_BIN` (see `.env.example`).
 
@@ -94,7 +105,7 @@ Or in Claude Desktop (`claude_desktop_config.json`):
 
 ### 3b. Run directly from the CLI
 
-`--mode` is required for every launch that talks to an LLM — it selects the tool set (`research`, `code`, `test`, or `performance_debug`) loaded into the request from turn 0.
+`--mode` is required for every launch that talks to an LLM — it selects the tool set (`research`, `code`, `qa`, `performance_debug`, or `verify`) loaded into the request from turn 0.
 
 ```bash
 # Interactive REPL
@@ -108,7 +119,7 @@ echo "Add a docstring to foo()" | uv run python main.py --mode code -p - --json
 
 # Resume a previous session
 uv run python main.py --list-sessions
-uv run python main.py --mode test --session 2026-07-11T14-30-00-12345
+uv run python main.py --mode qa --session 2026-07-11T14-30-00-12345
 ```
 
 Run from inside the target project directory — the launch CWD becomes the sandboxed project root.
@@ -117,7 +128,7 @@ Run from inside the target project directory — the launch CWD becomes the sand
 
 ## How it works
 
-Frank treats every IDE operation as an LLM-driveable tool. Every launch declares a mode — `research`, `code`, `test`, or `performance_debug` — and the LLM receives that mode's complete tool set with full schemas from turn 0. There is no discovery step and no way to load a tool outside the declared mode; each mode carries exactly the tools its task needs, which keeps context lean without making the model guess what's callable.
+Frank treats every IDE operation as an LLM-driveable tool. Every launch declares a mode — `research`, `code`, `qa`, `performance_debug`, or `verify` — and the LLM receives that mode's complete tool set with full schemas from turn 0. There is no discovery step and no way to load a tool outside the declared mode; each mode carries exactly the tools its task needs, which keeps context lean without making the model guess what's callable.
 
 **Tool categories:**
 - **Navigation**: `find_symbol`, `go_to_definition`, `find_references`, `call_hierarchy`, `hover`, `document_symbols`, `signature_help`
@@ -126,6 +137,7 @@ Frank treats every IDE operation as an LLM-driveable tool. Every launch declares
 - **Testing**: `run_tests`, `verify_scratch`
 - **Debugging** (DAP): `set_breakpoint`, `debug_start`, `debug_control`, `debug_inspect`, `debug_stop`
 - **Profiling**: `profile_command`, `profile_hotspots`, `profile_memory`, `trace_execution`
+- **Browser** (Playwright, `verify` mode): `navigate`, `snapshot`, `click`, `fill`, `press`, `hover_element`, `select_option`, `scroll`, `wait_for`, `screenshot`, `console_logs`, `network_requests`, `http_request`, `handle_dialog`, `report`
 - **Web**: `web_search`, `web_read`
 - **Memory**: `remember`, `recall`, `forget`, `record`
 - **Subagents**: `spawn_agents` (fan out independent tasks)
@@ -180,8 +192,8 @@ See `.env.example` for all supported variables. The key ones:
 
 ```
 main.py             CLI entry point (REPL + one-shot modes)
-mcp_server.py       MCP server (research / code / test / performance_debug tools)
-modes.py            The four modes; each launch declares exactly one
+mcp_server.py       MCP server (research / code / qa / performance_debug / verify tools)
+modes.py            The five modes; each launch declares exactly one
 agent.py            Agent loop: turn orchestration and tool dispatch
 turn/               Per-turn helpers (guards, steering, verification, rendering)
 config.py           Config loading and validation
@@ -198,7 +210,7 @@ stats.py            Per-session usage telemetry
 tools/              One file per tool (auto-discovered via registry.py)
 lsp/                LSP client + manager (language servers)
 dap/                DAP client + manager (debug adapters)
-runtime/            Process runner, test runner, web fetch
+runtime/            Process runner, test runner, web fetch, browser session
 memory/             Per-project memory (atoms, graph, recall, consolidation)
 samples/            Sample projects for testing (Python, JS, PHP)
 evals/              Evaluation harness and scenarios

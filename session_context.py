@@ -21,6 +21,12 @@ def _prune_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
       rows and their results — into the completed-slice collapse, so the model
       loses the record of its own work the moment a steer is appended. Steers
       stay embedded in intact scaffolding, in order.
+    * **Screenshot** (a ``user``-role row flagged ``screenshot`` — a vision
+      attachment produced by a tool call mid-turn). Like a steer it is not a turn
+      start, and for a sharper reason: treating one as the boundary would fold
+      away the tool scaffolding of the very run that took the screenshot, so a
+      verify run would lose its own evidence chain the moment it looked at
+      anything.
     * **Assistant answer** (``assistant`` with content and no ``tool_calls``) —
       the final answer of a completed turn; the only assistant row kept from the
       completed slice.
@@ -53,7 +59,7 @@ def _prune_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     # turn is still carved out and kept verbatim.
     last_user = -1
     for i, m in enumerate(messages):
-        if m.get("role") == "user" and not m.get("steer"):
+        if m.get("role") == "user" and not m.get("steer") and not m.get("screenshot"):
             last_user = i
 
     completed = messages if last_user < 0 else messages[:last_user]
@@ -122,8 +128,50 @@ def assemble_context(
     else:
         tail = session._messages
 
-    result.extend(_prune_messages(tail))
+    result.extend(_prune_images(session, _prune_messages(tail)))
     return result
+
+
+def _prune_images(session: Any, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep only the most recent ``MAX_IMAGES`` screenshots as actual image data.
+
+    Runs on the assembled view, after ``_prune_messages``, so it prunes what is
+    actually being sent rather than what happens to be stored. Older screenshots
+    collapse to a one-line placeholder naming the file — the model can still
+    cite the artifact as evidence, it just no longer carries the pixels.
+
+    ``session._image_refs`` indexes into ``session._messages``, but this list has
+    been folded and pruned, so the two cannot be joined by position. They are
+    matched by identity instead: the shared message dicts are the same objects,
+    so ``id()`` says exactly which assembled row is which screenshot.
+
+    The input list and its messages are never mutated — a pruned screenshot is
+    emitted as a fresh text-only dict, leaving the session's own record intact.
+    """
+    refs = getattr(session, "_image_refs", None)
+    if not refs:
+        return messages
+
+    # Imported here, not at module scope: session.py imports this module, so a
+    # top-level import back into it would close the cycle at import time.
+    from session import MAX_IMAGES, _PRUNED_IMAGE
+
+    path_by_id = {id(session._messages[ref.index]): ref.path for ref in refs}
+    present = [m for m in messages if id(m) in path_by_id]
+    keep = {id(m) for m in present[-MAX_IMAGES:]} if MAX_IMAGES > 0 else set()
+
+    out: List[Dict[str, Any]] = []
+    for m in messages:
+        key = id(m)
+        if key not in path_by_id or key in keep:
+            out.append(m)
+            continue
+        out.append({
+            "role": m.get("role", "user"),
+            "content": _PRUNED_IMAGE.format(path=path_by_id[key]),
+            "screenshot": True,
+        })
+    return out
 
 
 def _folded_task_anchor(
