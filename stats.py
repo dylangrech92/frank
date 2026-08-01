@@ -17,10 +17,47 @@ from __future__ import annotations
 import fcntl
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, NamedTuple
 
 STATS_PATH = Path(__file__).resolve().parent / "stats.json"
 JS_PATH = Path(__file__).resolve().parent / "stats.js"
+
+
+class Totals(NamedTuple):
+    """One session's cumulative usage, and the only place the row keys live.
+
+    ``stats.json``'s key names are a published format, not an internal detail:
+    ``stats.js`` mirrors the rows verbatim and ``dashboard.html`` reads
+    ``r.input`` / ``r.output`` / ``r.run_time`` / ``r.tool_calls`` straight off
+    them. Callers pass and receive this type instead of a bare dict so a key is
+    spelled in exactly one place -- a reader that spelled its own would keep
+    parsing happily and silently report zeros if a name here ever moved.
+    """
+
+    run_time: float = 0.0
+    tool_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    def as_row(self, session_id: str) -> Dict[str, Any]:
+        """This session's ``stats.json`` row."""
+        return {
+            "session_id": session_id,
+            "run_time": self.run_time,
+            "tool_calls": self.tool_calls,
+            "input": self.input_tokens,
+            "output": self.output_tokens,
+        }
+
+    @classmethod
+    def from_row(cls, row: Dict[str, Any]) -> Totals:
+        """Read a stored row back, defaulting any field the row omits."""
+        return cls(
+            float(row.get("run_time", 0.0)),
+            int(row.get("tool_calls", 0)),
+            int(row.get("input", 0)),
+            int(row.get("output", 0)),
+        )
 
 
 def _parse(content: str) -> List[Dict[str, Any]]:
@@ -34,8 +71,8 @@ def _parse(content: str) -> List[Dict[str, Any]]:
     return rows if isinstance(rows, list) else []
 
 
-def read_row(session_id: str, path: Path = STATS_PATH) -> Dict[str, Any] | None:
-    """Return the stored row for *session_id*, or ``None`` if the file has none.
+def read_totals(session_id: str, path: Path = STATS_PATH) -> Totals:
+    """Return stored cumulative usage for *session_id*; zeros if it has no row.
 
     Used to seed a (possibly resumed) session's in-memory counters so its totals
     continue rather than reset. Read without a lock: a point-in-time snapshot at
@@ -45,19 +82,16 @@ def read_row(session_id: str, path: Path = STATS_PATH) -> Dict[str, Any] | None:
     try:
         content = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return None
+        return Totals()
     for row in _parse(content):
         if row.get("session_id") == session_id:
-            return row
-    return None
+            return Totals.from_row(row)
+    return Totals()
 
 
 def upsert(
     session_id: str,
-    run_time: float,
-    tool_calls: int,
-    input_tokens: int,
-    output_tokens: int,
+    totals: Totals,
     path: Path = STATS_PATH,
     js_path: Path = JS_PATH,
 ) -> None:
@@ -66,13 +100,7 @@ def upsert(
     The whole read-modify-write is performed under an exclusive ``flock`` on the
     file so concurrent subagent processes serialize instead of losing rows.
     """
-    row = {
-        "session_id": session_id,
-        "run_time": run_time,
-        "tool_calls": tool_calls,
-        "input": input_tokens,
-        "output": output_tokens,
-    }
+    row = totals.as_row(session_id)
     # "a+" creates the file if absent and never truncates on open, so an
     # existing array survives until we deliberately rewrite it under the lock.
     with open(path, "a+", encoding="utf-8") as f:

@@ -138,11 +138,11 @@ class Session:
         # Usage-stats accumulators (stats.json). Seeded from any existing row so
         # a resumed session's totals continue rather than reset; run_time is the
         # prior wall-clock plus this process's elapsed time since construction.
-        prior = stats.read_row(self.session_id)
-        self._stats_run_base: float = float(prior.get("run_time", 0.0)) if prior else 0.0
-        self._stats_tool_calls: int = int(prior.get("tool_calls", 0)) if prior else 0
-        self._stats_input_tokens: int = int(prior.get("input", 0)) if prior else 0
-        self._stats_output_tokens: int = int(prior.get("output", 0)) if prior else 0
+        prior = stats.read_totals(self.session_id)
+        self._stats_run_base: float = prior.run_time
+        self._stats_tool_calls: int = prior.tool_calls
+        self._stats_input_tokens: int = prior.input_tokens
+        self._stats_output_tokens: int = prior.output_tokens
         self._stats_run_started: float = time.monotonic()
 
         session_lock.acquire(self._lock_path, self.session_id)
@@ -368,10 +368,12 @@ class Session:
         run_time = self._stats_run_base + (time.monotonic() - self._stats_run_started)
         stats.upsert(
             self.session_id,
-            round(run_time, 3),
-            self._stats_tool_calls,
-            self._stats_input_tokens,
-            self._stats_output_tokens,
+            stats.Totals(
+                round(run_time, 3),
+                self._stats_tool_calls,
+                self._stats_input_tokens,
+                self._stats_output_tokens,
+            ),
         )
 
     def close(self) -> None:
