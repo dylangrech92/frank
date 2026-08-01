@@ -5,6 +5,7 @@ The leading underscore keeps this module out of tool discovery by the registry.
 Exports
 -------
 resolve_in_root : verify a candidate path stays under *root*
+resolve_existing_file : the same, and require an existing file
 MUTATION_SUBSCRIBERS, subscribe_mutations, emit_mutation, log_mutation_to_stderr
 """
 
@@ -59,6 +60,33 @@ def resolve_in_root(root: str | Path, candidate: str | Path) -> Path:
         f"path escapes the project root: {candidate!r} "
         f"resolves to {resolved}, which is not under {root_path}"
     )
+
+
+def resolve_existing_file(root: str | Path, candidate: str | Path) -> Path:
+    """Resolve *candidate* under *root* and require it to name an existing file.
+
+    Every tool that takes a project-relative target file needs exactly this
+    pair of checks, and needs them to fail the same way. Keeping it beside
+    :func:`resolve_in_root`, the function it wraps, is what stops each caller
+    from growing its own copy with a subtly different message.
+
+    Args:
+        root: The project root directory.
+        candidate: A relative path to an existing file under *root*.
+
+    Returns:
+        The resolved absolute ``Path``.
+
+    Raises:
+        ValueError: When :func:`resolve_in_root` rejects the path, or the
+            resolved path is not an existing file.
+    """
+    resolved = resolve_in_root(root, candidate)
+    if not resolved.is_file():
+        raise ValueError(
+            f"target file not found: {candidate!r} (resolved to {resolved})"
+        )
+    return resolved
 
 
 # ---------------------------------------------------------------------------

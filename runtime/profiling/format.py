@@ -78,3 +78,19 @@ def render_top_table(
 
     return "\n".join(lines)
 
+
+def format_streams(stdout_text: str, stderr_text: str) -> str:
+    """Render captured stdout/stderr with section labels.
+
+    The ``--- stderr ---`` section is only emitted when *stderr_text* is
+    non-empty, so a run that produced no error output does not carry an
+    empty labelled block.
+    """
+    if stderr_text:
+        return f'--- stdout ---\n{stdout_text}\n--- stderr ---\n{stderr_text}'
+    return f'--- stdout ---\n{stdout_text}'
+
+
+def tail_lines(text: str, n: int = 10) -> str:
+    """Return the last *n* lines of *text*, joined with newlines."""
+    return '\n'.join(str(text).splitlines()[-n:])

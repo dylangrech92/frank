@@ -7,7 +7,8 @@ from this package directly:
 - Parser functions: :func:`parse_cpuprofile`, :func:`parse_heapprofile`,
   :func:`parse_cachegrind`.
 - Formatting helpers: :func:`fmt_bytes`, :func:`fmt_seconds`,
-  :func:`fmt_count`, :func:`render_top_table`.
+  :func:`fmt_count`, :func:`render_top_table`, :func:`format_streams`,
+  :func:`tail_lines`.
 - Bootstrap generation: :func:`write_python_bootstrap`.
 
 All public names are re-exported at package level so consumers can import:
@@ -19,7 +20,14 @@ from __future__ import annotations
 
 from .bootstrap import write_python_bootstrap
 from .cachegrind import parse_cachegrind
-from .format import fmt_bytes, fmt_count, fmt_seconds, render_top_table
+from .format import (
+    fmt_bytes,
+    fmt_count,
+    fmt_seconds,
+    format_streams,
+    render_top_table,
+    tail_lines,
+)
 from .parsers import parse_cpuprofile, parse_heapprofile
 from .run import (
     MeasuredRun,
@@ -40,5 +48,7 @@ __all__ = [
     "fmt_seconds",
     "fmt_count",
     "render_top_table",
+    "format_streams",
+    "tail_lines",
     "write_python_bootstrap",
 ]
