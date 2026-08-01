@@ -6,23 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from runtime.process import is_denied, run_one_shot, start_background
+from runtime.profiling import format_streams
 from tools._snapshot import publish_snapshot_diff, render_mutation_line, snapshot_tree
 from tools.base import Tool
 from tools.result import ToolResult
-
-
-def _format_streams(stdout_text: str, stderr_text: str) -> str:
-    """Render captured stdout/stderr with section labels.
-
-    The ``--- stderr ---`` section is only emitted when *stderr_text* is
-    non-empty, so a command that produced no error output does not carry an
-    empty labelled block. Shared by the timeout and normal foreground paths so
-    the two render captured streams identically.
-    """
-    if stderr_text:
-        return f'--- stdout ---\n{stdout_text}\n--- stderr ---\n{stderr_text}'
-    return f'--- stdout ---\n{stdout_text}'
-
 
 
 class RunCommand(Tool):
@@ -142,7 +129,7 @@ class RunCommand(Tool):
                 mutation_line = render_mutation_line(root, created, deleted, changed)
 
         if result['timed_out']:
-            body = _format_streams(str(result['stdout']), str(result.get('stderr', '')))
+            body = format_streams(str(result['stdout']), str(result.get('stderr', '')))
             if mutation_line:
                 body += f'\n{mutation_line}'
             return ToolResult.err(
@@ -151,7 +138,7 @@ class RunCommand(Tool):
                 hint=f'The command ran longer than {timeout}s. Try a shorter timeout or run in background mode with background=true.',
             )
 
-        output = _format_streams(str(result['stdout']), str(result.get('stderr', '')))
+        output = format_streams(str(result['stdout']), str(result.get('stderr', '')))
         # Name the files this command touched (fact only) before the nonzero-exit
         # grounding line, so the render reads streams, then mutation, then
         # grounding.
