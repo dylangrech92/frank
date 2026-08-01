@@ -10,17 +10,31 @@ target project's cwd, because a single agent run operates on arbitrary projects
 and its usage should aggregate in one place. Parallel subagent runs share this
 one file, so the read-modify-write is guarded by an exclusive ``flock`` to keep
 concurrent processes from clobbering each other's rows.
+
+A file that exists but does not parse is never silently discarded: its bytes are
+copied to ``stats.json.corrupt-<timestamp>-<pid>`` and the failure is reported on
+stderr before recording restarts from an empty array. Treating unparseable
+content as "no history" instead would let a single bad write erase every stored
+row with no error anywhere -- the read succeeds, returns nothing, and the next
+upsert rewrites the file with one row.
 """
 
 from __future__ import annotations
 
 import fcntl
 import json
+import os
+import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple
 
 STATS_PATH = Path(__file__).resolve().parent / "stats.json"
 JS_PATH = Path(__file__).resolve().parent / "stats.js"
+
+
+class CorruptStatsFile(Exception):
+    """``stats.json`` exists but is not the JSON array this module writes."""
 
 
 class Totals(NamedTuple):
@@ -61,14 +75,41 @@ class Totals(NamedTuple):
 
 
 def _parse(content: str) -> List[Dict[str, Any]]:
-    """Parse *content* as the stats array, tolerating an empty/corrupt file."""
+    """Parse *content* as the stats array. Empty is normal; malformed is not.
+
+    Raises ``CorruptStatsFile`` rather than returning ``[]`` so that a caller
+    about to rewrite the file can preserve the bytes first.
+    """
     if not content.strip():
         return []
     try:
         rows = json.loads(content)
-    except json.JSONDecodeError:
-        return []
-    return rows if isinstance(rows, list) else []
+    except json.JSONDecodeError as exc:
+        raise CorruptStatsFile(f"not valid JSON: {exc}") from exc
+    if not isinstance(rows, list):
+        raise CorruptStatsFile(f"expected a JSON array, got {type(rows).__name__}")
+    return rows
+
+
+def _quarantine(path: Path, content: str, reason: Exception) -> None:
+    """Copy unparseable *content* aside and report the loss on stderr.
+
+    Called under the write lock, immediately before the file is rewritten from
+    scratch. The copy is what makes the rows recoverable; the stderr line is what
+    stops the loss from going unnoticed until someone opens the dashboard.
+    """
+    stamp = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+    aside = path.with_name(f"{path.name}.corrupt-{stamp}")
+    try:
+        aside.write_text(content, encoding="utf-8")
+        kept = f"{len(content)} bytes kept at {aside.name}"
+    except OSError as exc:
+        kept = f"{len(content)} bytes COULD NOT be kept ({exc})"
+    print(
+        f"stats: {path.name} is corrupt ({reason}); {kept}; starting a new file",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def read_totals(session_id: str, path: Path = STATS_PATH) -> Totals:
@@ -78,12 +119,25 @@ def read_totals(session_id: str, path: Path = STATS_PATH) -> Totals:
     continue rather than reset. Read without a lock: a point-in-time snapshot at
     session start is sufficient, and no writer for this same session_id can be
     running concurrently (the session lock in ``session.py`` forbids it).
+
+    A corrupt file seeds zeros rather than raising -- telemetry must not stop a
+    session from starting -- but says so on stderr. Preserving the bytes is left
+    to ``upsert``, which holds the lock this reader deliberately does not.
     """
     try:
         content = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return Totals()
-    for row in _parse(content):
+    try:
+        rows = _parse(content)
+    except CorruptStatsFile as exc:
+        print(
+            f"stats: cannot seed totals from {path.name}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return Totals()
+    for row in rows:
         if row.get("session_id") == session_id:
             return Totals.from_row(row)
     return Totals()
@@ -107,7 +161,14 @@ def upsert(
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         try:
             f.seek(0)
-            rows = _parse(f.read())
+            content = f.read()
+            try:
+                rows = _parse(content)
+            except CorruptStatsFile as exc:
+                # Rewriting from scratch is the only way forward, so keep the
+                # old bytes first -- this rewrite is what would destroy them.
+                _quarantine(path, content, exc)
+                rows = []
             for i, existing in enumerate(rows):
                 if existing.get("session_id") == session_id:
                     rows[i] = row
