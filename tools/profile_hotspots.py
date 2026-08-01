@@ -12,14 +12,16 @@ from typing import Any
 
 from runtime.profiling import (
     fmt_seconds,
+    format_streams,
     php_xdebug_status,
     parse_cachegrind,
     parse_cpuprofile,
     render_top_table,
     run_measured,
+    tail_lines,
     which_interpreter,
 )
-from tools._sandbox import resolve_in_root
+from tools._sandbox import resolve_existing_file
 from tools._snapshot import publish_snapshot_diff, render_mutation_line, snapshot_tree
 from tools.base import Tool
 from tools.result import ToolResult
@@ -31,39 +33,6 @@ _SNIPPET_SUFFIXES: dict[str, str] = {
     'node': '.js',
     'php': '.php',
 }
-
-
-def _format_streams(stdout_text: str, stderr_text: str) -> str:
-    """Render captured stdout/stderr with section labels.
-
-    The ``--- stderr ---`` section is only emitted when *stderr_text* is
-    non-empty, so a program that produced no error output does not carry an
-    empty labelled block.
-    """
-    if stderr_text:
-        return f'--- stdout ---\n{stdout_text}\n--- stderr ---\n{stderr_text}'
-    return f'--- stdout ---\n{stdout_text}'
-
-
-def _stderr_tail(stderr: str, n: int = 10) -> str:
-    """Return the last *n* lines of *stderr* joined with newlines."""
-    return '\n'.join(str(stderr).splitlines()[-n:])
-
-
-def _resolve_target(
-    target: str, root: Path,
-) -> tuple[Path, str]:
-    """Resolve a project-relative *target* to a Path under *root* and return
-    ``(resolved_path, relative_label)``.
-
-    Raises ValueError on escape or missing file.
-    """
-    resolved = resolve_in_root(root, target)
-    if not resolved.is_file():
-        raise ValueError(
-            f'target file not found: {target!r} (resolved to {resolved})'
-        )
-    return resolved, target
 
 
 def _render_python_hotspots(
@@ -424,7 +393,7 @@ class ProfileHotspots(Tool):
             script_path = target  # module name passed verbatim; the interpreter resolves it from cwd
         elif target:
             try:
-                resolved, _ = _resolve_target(target, root)
+                resolved = resolve_existing_file(root, target)
             except ValueError as exc:
                 return ToolResult.err(
                     str(exc),
@@ -513,7 +482,7 @@ class ProfileHotspots(Tool):
 
             # --- Timeout path ---
             if result.timed_out:
-                stderr_tail = _stderr_tail(result.stderr)
+                stderr_tail = tail_lines(result.stderr)
                 lines = [
                     f'Profiled program timed out after {timeout} seconds.',
                     'No profile artifact survives a kill — the program must '
@@ -538,7 +507,7 @@ class ProfileHotspots(Tool):
                 has_artifact = bool(_glob.glob(artifact_pattern))
 
             if not has_artifact:
-                stderr_tail = _stderr_tail(result.stderr)
+                stderr_tail = tail_lines(result.stderr)
                 lines = [
                     f'Profile artifact missing. Program exited with code '
                     f'{result.exit_code}.',
@@ -584,9 +553,9 @@ class ProfileHotspots(Tool):
                 lines.append(mutation_line)
 
             # --- Stdout/stderr tails ---
-            stdout_tail = _stderr_tail(result.stdout)
-            stderr_tail = _stderr_tail(result.stderr)
-            streams = _format_streams(stdout_tail, stderr_tail)
+            stdout_tail = tail_lines(result.stdout)
+            stderr_tail = tail_lines(result.stderr)
+            streams = format_streams(stdout_tail, stderr_tail)
             lines.append('')
             lines.append(streams)
 
