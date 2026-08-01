@@ -6,22 +6,16 @@ from pathlib import Path
 from typing import Any
 
 from runtime.process import is_denied
-from runtime.profiling import fmt_bytes, fmt_seconds, run_measured
+from runtime.profiling import (
+    fmt_bytes,
+    fmt_seconds,
+    format_streams,
+    run_measured,
+    tail_lines,
+)
 from tools._snapshot import publish_snapshot_diff, render_mutation_line, snapshot_tree
 from tools.base import Tool
 from tools.result import ToolResult
-
-
-def _format_streams(stdout_text: str, stderr_text: str) -> str:
-    """Render captured stdout/stderr with section labels.
-
-    The ``--- stderr ---`` section is only emitted when *stderr_text* is
-    non-empty, so a command that produced no error output does not carry an
-    empty labelled block.
-    """
-    if stderr_text:
-        return f'--- stdout ---\n{stdout_text}\n--- stderr ---\n{stderr_text}'
-    return f'--- stdout ---\n{stdout_text}'
 
 
 class ProfileCommand(Tool):
@@ -155,9 +149,9 @@ class ProfileCommand(Tool):
                 )
             if mutation_line:
                 lines.append(mutation_line)
-            stdout_tail = '\n'.join(str(last.stdout).splitlines()[-20:])
-            stderr_tail = '\n'.join(str(last.stderr).splitlines()[-20:])
-            streams = _format_streams(stdout_tail, stderr_tail)
+            stdout_tail = tail_lines(last.stdout, 20)
+            stderr_tail = tail_lines(last.stderr, 20)
+            streams = format_streams(stdout_tail, stderr_tail)
             lines.append(streams)
             return ToolResult.err(
                 '\n'.join(lines),
@@ -203,9 +197,9 @@ class ProfileCommand(Tool):
             lines.append(mutation_line)
 
         # Stdout/stderr tails from the LAST run, capped to 20 lines.
-        stdout_tail = '\n'.join(str(last.stdout).splitlines()[-20:])
-        stderr_tail = '\n'.join(str(last.stderr).splitlines()[-20:])
-        streams = _format_streams(stdout_tail, stderr_tail)
+        stdout_tail = tail_lines(last.stdout, 20)
+        stderr_tail = tail_lines(last.stderr, 20)
+        streams = format_streams(stdout_tail, stderr_tail)
         lines.append(streams)
 
         # Grounding line for nonzero exit codes.
