@@ -518,6 +518,22 @@ SCENARIOS: list[dict] = [
         ),
         "inline": "report_issue_contract.py",
     },
+    {
+        "name": "argument_validation",
+        "description": (
+            "Dispatch-level check (no LLM): tool argument validation pairs each "
+            "missing parameter with its own declared type instead of joining names "
+            "and types as two detached lists; reports unknown keys, missing keys "
+            "and wrong types together in one message so a caller that fixes what "
+            "it was told converges in a single retry rather than one problem class "
+            "per round-trip; leaves a property with no declared type and one whose "
+            "type has no mapping alone; keeps bool out of integer/number while "
+            "still accepting it for boolean; names an unknown key exactly once; and "
+            "rejects the real report payload from the live run through "
+            "registry.dispatch naming both its violations at once."
+        ),
+        "inline": "argument_validation.py",
+    },
 ]
 
 

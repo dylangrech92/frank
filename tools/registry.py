@@ -12,7 +12,7 @@ from modes import get_mode
 from tools.base import Tool
 from tools.result import ToolResult
 
-_PY_TYPE_MAP: dict[str, type] = {
+_PY_TYPE_MAP: dict[str, type | tuple[type, ...]] = {
     "string": str,
     "integer": int,
     "number": (int, float),
@@ -25,16 +25,16 @@ _PY_TYPE_MAP: dict[str, type] = {
 def validate_arguments(tool: Tool, arguments: dict[str, Any]) -> str | None:
     """Validate *arguments* against the tool's JSON Schema ``parameters``.
 
-    Checks three things:
+    Checks three things, and reports **every** violation it finds rather than
+    stopping at the first:
 
     1. **Unknown keys rejected** — every key in *arguments* must appear in the
        schema's ``properties`` mapping.  Unknown keys produce a message naming
-       the bad key followed by `` (allowed: ...)`` with the allowed parameter
-       names listed.
+       them, followed by the allowed parameter names.
 
     2. **Required keys checked** — every name in the schema's ``required`` list
-       must be present in *arguments*.  Missing ones produce a message listing
-       all the missing keys and their declared types.
+       must be present in *arguments*.  Each missing name is listed with its
+       own declared type beside it.
 
     3. **Type checking** — each provided value is checked against the declared
        JSON Schema ``type`` for that property, using the mapping below::
@@ -46,85 +46,71 @@ def validate_arguments(tool: Tool, arguments: dict[str, Any]) -> str | None:
           array        → list
           object       → dict
 
-       Mismatches are rejected with a message naming the parameter, the expected
-       JSON Schema type, and the actual Python type name.
+       Mismatches name the parameter, the expected JSON Schema type, and the
+       actual Python type name.
+
+    Reporting all three classes at once is deliberate.  Returning after the
+    first class made a caller fix one violation per round-trip, so a tool with
+    four required parameters could take four rejected calls to get right — long
+    enough for the repeat-call guard to step in and block the correction that
+    was on its way.  One message means one corrected retry.
 
     Returns:
-        ``None`` when arguments are valid, or an error-message string when
-        one or more checks fail (the first failure encountered).
+        ``None`` when arguments are valid, or a message describing every
+        violation found, one per line.
     """
     schema: dict = tool.parameters
     properties: dict[str, Any] = schema.get("properties", {})
     required: list[str] | None = schema.get("required")
 
+    problems: list[str] = []
+
     # 1. Unknown keys
-    allowed_params = list(properties.keys())
-    for key in arguments:
-        if key not in properties:
-            return (
-                f"unknown parameter '{key}'; "
-                f"allowed parameters are {', '.join(allowed_params)}"
-            )
+    unknown = [key for key in arguments if key not in properties]
+    if unknown:
+        allowed = ", ".join(properties) or "(none)"
+        problems.append(
+            f"unknown parameter(s) {', '.join(repr(key) for key in unknown)}; "
+            f"allowed parameters are {allowed}"
+        )
 
-    # 2. Missing required keys
+    # 2. Missing required keys.  Each name carries its own type, so a caller
+    #    reading the message never has to align two parallel lists.
     if required:
-        missing = [name for name in required if name not in arguments]
+        missing = [
+            f"{name!r} ({properties.get(name, {}).get('type') or 'unknown'})"
+            for name in required
+            if name not in arguments
+        ]
         if missing:
-            parts = [f"{name!r}" for name in missing]
-            type_parts = []
-            for name in missing:
-                param_schema = properties.get(name, {})
-                ptype = param_schema.get("type")
-                if ptype:
-                    type_parts.append(f"({ptype})")
-                else:
-                    type_parts.append("(unknown)")
-            return (
-                f"missing required parameter(s) "
-                f"{', '.join(parts)} {''.join(type_parts)}"
+            problems.append(
+                f"missing required parameter(s) {', '.join(missing)}"
             )
 
-    # 3. Type validation
+    # 3. Type validation.  A key with no declared type is skipped, which covers
+    #    both an unknown key (check 1 already named it, and it has no schema
+    #    entry to check against) and a property whose schema declares no type.
+    #    So is a type string with no mapping: an unrecognised schema is not the
+    #    caller's fault, so it is not the caller's error.
     for key, value in arguments.items():
-        prop_schema = properties.get(key, {})
-        expected_type_str: str | None = prop_schema.get("type")
-        if expected_type_str is None:
-            continue
-
-        python_types = _PY_TYPE_MAP.get(expected_type_str)
+        expected: str | None = properties.get(key, {}).get("type")
+        python_types = _PY_TYPE_MAP.get(expected) if expected is not None else None
         if python_types is None:
             continue
 
-        # reject bool for integer/number (bool is subclass of int in Python)
-        if expected_type_str == "integer":
-            if isinstance(value, bool) or not isinstance(value, int):
-                return (
-                    f"parameter '{key}' must be {expected_type_str}, "
-                    f"got {type(value).__name__}"
-                )
-
-        elif expected_type_str == "number":
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                return (
-                    f"parameter '{key}' must be {expected_type_str}, "
-                    f"got {type(value).__name__}"
-                )
-
+        # bool is a subclass of int in Python, so the numeric types have to
+        # exclude it explicitly or ``True`` passes as an integer.
+        if expected in ("integer", "number") and isinstance(value, bool):
+            matches = False
         else:
-            expected_python = python_types
-            if not isinstance(value, expected_python):
-                singular_type = str(expected_python).split(".")[-1].strip("()'")
-                # Handle tuple display like "(int, float)"
-                if "," in singular_type:
-                    type_display = f"{{{expected_type_str} types}}"
-                else:
-                    type_display = f"{expected_type_str}"
-                return (
-                    f"parameter '{key}' must be {type_display}, "
-                    f"got {type(value).__name__}"
-                )
+            matches = isinstance(value, python_types)
 
-    return None
+        if not matches:
+            problems.append(
+                f"parameter '{key}' must be {expected}, got {type(value).__name__}"
+            )
+
+    return "\n".join(problems) if problems else None
 
 # populated by discover() — one instance of each concrete tool class
 _registry: dict[str, "Tool"] = {}
@@ -278,8 +264,9 @@ def dispatch(name: str, arguments: dict[str, Any]) -> ToolResult:
     active mode's tool set — a tool outside the active mode is rejected with a
     ``not-in-mode`` error rather than executed; (1) unknown parameter keys are
     rejected, (2) missing required keys are rejected, and (3) each value is checked
-    against the declared JSON Schema type.  Any validation failure returns an error
-    immediately without calling ``run``.
+    against the declared JSON Schema type.  All three are reported together, so one
+    corrected retry can clear them; any violation returns an error without calling
+    ``run``.
 
     When arguments pass validation the tool's ``run()`` is invoked; all exceptions from
     an unknown or a crashed tool are captured as errors — nothing escapes this function.
