@@ -504,7 +504,8 @@ SCENARIOS: list[dict] = [
     {
         "name": "report_issue_contract",
         "description": (
-            "Dispatch-level check (no LLM): report_issue reaches all four modes; "
+            "Dispatch-level check (no LLM): report_issue reaches every mode in "
+            "modes.MODES; "
             "appends YAML-parseable entries to the install-dir log, creating it "
             "when absent and preserving earlier entries byte-for-byte; multi-line "
             "text becomes an indented '|2' block scalar so an embedded '---' line "
@@ -514,7 +515,8 @@ SCENARIOS: list[dict] = [
             "verification gate); blank/missing/non-string input errors with a "
             "kebab-case code and writes nothing; oversize text is capped and "
             "flagged truncated; and the tool is neither parallel_safe nor exempt "
-            "from the repeat-call cap. Skips if PyYAML is absent."
+            "from the repeat-call cap. Fails loudly if PyYAML is absent, since "
+            "no check in the contract can run without it."
         ),
         "inline": "report_issue_contract.py",
     },

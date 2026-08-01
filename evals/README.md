@@ -41,13 +41,15 @@ Scenarios are declared in `evals/scenarios.py` as plain dicts appended to
 - `name` / `description` — unique id and one-line summary.
 - `turns` — a list of single-line prompt strings, sent one per line to the
   agent's stdin in order.
-- `mode` — `"research"`, `"code"`, `"test"`, or `"performance_debug"`, passed
-  to `main.py` as `--mode`. **Required for every live scenario** (any scenario
+- `mode` — any key of `modes.MODES` (`python3 -c 'import modes;
+  print(modes.mode_names())'`), passed to `main.py` as `--mode`. **Required
+  for every live scenario** (any scenario
   with `turns` and no `inline`), because the mode fixes the exact tool set the
   agent gets for the whole run and therefore determines what the scenario can
   measure. There is deliberately no default: `evals/run.py` validates this on
-  import and exits 1 naming the offending scenario, rather than guessing a
-  toolset and silently changing what the scenario tests.
+  import against `modes.mode_names()` and exits 1 naming the offending
+  scenario and the valid set, rather than guessing a toolset and silently
+  changing what the scenario tests.
 - `config` — `"default"` to use the repo's `config.json` unmodified, or a
   dict that gets deep-merged on top of it (e.g. to shrink `llm.context_limit`
   so compaction or oversize-guard paths trigger reliably).
