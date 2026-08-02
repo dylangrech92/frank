@@ -148,18 +148,18 @@ def check_escalation() -> list[str]:
 def _drive_giveup(tmp_prefix: str, prefix_script: list):
     """Drive one force-finalized turn and return ``(answer, session)``.
 
-    Runs *prefix_script* (real create_file/run_command calls that leave facts in
+    Runs *prefix_script* (real write_file/run_command calls that leave facts in
     turn_report), then spirals into an identical blocked call until the
     escalation give-up force-finalizes the turn. Consolidation is stubbed to a
     no-op so the check never touches memory. chdir's into a throwaway temp dir
-    (create_file / list_files resolve against cwd) and restores cwd afterward.
+    (write_file / list_files resolve against cwd) and restores cwd afterward.
     """
     disable_memory_hooks()
     import agent
     from session import Session
     from tools import registry
 
-    # create_file / run_command are both declared by 'code' mode (modes.py);
+    # write_file / run_command are both declared by 'code' mode (modes.py);
     # list_files is a _COMMON_TOOLS member present in every mode too, so
     # 'code' covers the whole prefix + trailing escalation call.
     saved_mode = registry.current_mode()
@@ -196,7 +196,7 @@ def check_giveup_verified_work() -> list[str]:
     """
     failures: list[str] = []
     prefix = [
-        _same_call_response("create_file", {"path": "feature.py", "content": "x = 1\n"}),
+        _same_call_response("write_file", {"path": "feature.py", "contents": "x = 1\n"}),
         _same_call_response("run_command", {"cmd": "python3 -c \"print('ok')\""}),
     ]
     answer, session = _drive_giveup("giveup-verified-", prefix)
@@ -204,7 +204,7 @@ def check_giveup_verified_work() -> list[str]:
 
     files = report["files_changed"]
     if not files:
-        failures.append("no files_changed recorded despite a create_file mutation")
+        failures.append("no files_changed recorded despite a write_file mutation")
     else:
         path = files[0]["path"]
         if path not in answer:
@@ -235,14 +235,14 @@ def check_giveup_unverified_work() -> list[str]:
     """
     failures: list[str] = []
     prefix = [
-        _same_call_response("create_file", {"path": "widget.py", "content": "y = 2\n"}),
+        _same_call_response("write_file", {"path": "widget.py", "contents": "y = 2\n"}),
     ]
     answer, session = _drive_giveup("giveup-unverified-", prefix)
     report = session.turn_report
 
     files = report["files_changed"]
     if not files:
-        failures.append("no files_changed recorded despite a create_file mutation")
+        failures.append("no files_changed recorded despite a write_file mutation")
     else:
         path = files[0]["path"]
         if path not in answer:
@@ -310,7 +310,7 @@ def check_verified_tristate_contract() -> list[str]:
 
     # Mutation followed by a passing verification run -> True.
     verified_prefix = [
-        _same_call_response("create_file", {"path": "ok.py", "content": "a = 1\n"}),
+        _same_call_response("write_file", {"path": "ok.py", "contents": "a = 1\n"}),
         _same_call_response("run_command", {"cmd": "python3 -c \"print('ok')\""}),
     ]
     _, ok_session = _drive_giveup("tristate-verified-", verified_prefix)
@@ -322,7 +322,7 @@ def check_verified_tristate_contract() -> list[str]:
 
     # Mutation with no verification run at all -> False.
     unverified_prefix = [
-        _same_call_response("create_file", {"path": "raw.py", "content": "b = 2\n"}),
+        _same_call_response("write_file", {"path": "raw.py", "contents": "b = 2\n"}),
     ]
     _, bad_session = _drive_giveup("tristate-unverified-", unverified_prefix)
     if bad_session.turn_report["verified"] is not False:

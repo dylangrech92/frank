@@ -63,7 +63,7 @@ def _needs_quoting(text: str) -> bool:
     under-quoting either corrupts the entry or silently changes its type. Each
     rule closes a case observed to break a real round-trip:
 
-    * a colon anywhere can open a mapping (``replace_one: not found`` is a
+    * a colon anywhere can open a mapping (``edit_file: not found`` is a
       realistic report and a YAML syntax error);
     * a tab or control character cannot start a plain scalar at all;
     * a single bare token with no space is what every typed YAML scalar looks

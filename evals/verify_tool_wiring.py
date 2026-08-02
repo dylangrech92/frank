@@ -41,7 +41,7 @@ d. A read-only turn in the same mode never fires the steer and never touches
 Exits 0 on success, prints ``FAIL: <reason>`` to stderr and exits 1 otherwise.
 Runs with the repo root on ``sys.path`` (evals/run.py inserts it before
 exec'ing this file); (c)/(d) chdir into their own throwaway temp project dir
-(create_file/run_command resolve against cwd) and restore the cwd afterward,
+(write_file/run_command resolve against cwd) and restore the cwd afterward,
 disable memory side effects for the run, and touch no repo files. Each check
 restores whichever mode it found active in a finally, so the four checks
 sharing one process never contaminate each other's precondition.
@@ -181,7 +181,7 @@ def check_repro_steer_fires_and_tool_is_callable() -> list[str]:
 
     failures: list[str] = []
 
-    # create_file and run_command are both declared by 'code' mode (modes.py)
+    # write_file and run_command are both declared by 'code' mode (modes.py)
     # from the start of the process — mode-gating has no per-tool activation
     # step, so run_command is already callable in round 2 with nothing needing
     # to fire at round 1's steer to unlock it.
@@ -196,7 +196,7 @@ def check_repro_steer_fires_and_tool_is_callable() -> list[str]:
         # Round 1 edits (no run yet -> repro steer fires); round 2 calls
         # run_command DIRECTLY; round 3 ends the turn.
         script = [
-            _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
+            _tool_call_response("write_file", {"path": "buggy.py", "contents": "x = 1\n"}),
             _tool_call_response("run_command", {"cmd": "echo verified"}),
             _final_answer_response("Edited then verified."),
         ]

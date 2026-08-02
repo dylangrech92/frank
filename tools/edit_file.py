@@ -1,36 +1,36 @@
-"""Replace one tool: replaces exactly one occurrence of a literal string in a single file."""
+"""Edit file tool: replaces exactly one occurrence of a literal string in a file."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from tools.base import Tool
-from tools.result import ToolResult
 from tools._edit import (
     finalize_write,
     freshness_gate,
     looks_line_numbered,
     resolve_existing_file,
 )
+from tools.base import Tool
+from tools.result import ToolResult
 
 
-class ReplaceOne(Tool):
-    """Replaces exactly one occurrence of a literal string in a single file.
+class EditFile(Tool):
+    """Replaces exactly one occurrence of a literal string in a file.
 
-    Refuses to perform the replacement when the search string matches zero times or
-    more than once -- every match must be unique for safety.  The path must be
-    relative to the project root.  Only regular files can be modified; directories
-    and other special paths are rejected.
+    Refuses to perform the replacement when the search string matches zero times
+    or more than once -- every match must be unique for safety.  The path must be
+    the raw file text -- do not include read_file's display-only line-number
+    prefixes.
     """
 
-    name = 'replace_one'
+    name = 'edit_file'
     description = (
         'Replaces exactly one occurrence of a literal string in a single file. '
         'Refuses when the match is not unique. The search string must be the raw file text — '
         "do not include read_file's display-only line-number prefixes (the '     1\\t' column). "
-        'The path must be relative to the project root.'
+        'Pass an empty string as ``replace`` to delete the matched text. The path must be relative to the project root.'
     )
-    alternative = 'replace_many or update_file'
+    alternative = 'write_file'
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {
@@ -44,7 +44,7 @@ class ReplaceOne(Tool):
             },
             'replace': {
                 'type': 'string',
-                'description': 'The replacement text.',
+                'description': 'The replacement text. An empty string deletes the matched text.',
             },
         },
         'required': ['path', 'search', 'replace'],
@@ -56,12 +56,13 @@ class ReplaceOne(Tool):
         Args:
             **kwargs: Parsed from LLM function-call payload. Expects ``path``
                 (required, relative to project root), ``search`` (required, the exact
-                literal text to find), and ``replace`` (required, the replacement text).
+                literal text to find), and ``replace`` (required; empty string
+                means delete the match).
 
         Returns:
             A ``ToolResult`` describing the single replacement on success, or an error
-            when the path escapes root, the file does not exist/is not a file, or the
-            match count is zero or greater than one.
+            when the path escapes root, the file does not exist/is not a file, the
+            match count is zero, or the match is not unique.
         """
         path_arg = kwargs.get('path')
         raw_path = path_arg if isinstance(path_arg, str) else ''
@@ -99,7 +100,7 @@ class ReplaceOne(Tool):
                 )
             return ToolResult.err(
                 f'The search string was not found in {raw_path}.',
-                code='no-match',
+                code='not-found',
                 hint=hint,
             )
 
@@ -109,7 +110,7 @@ class ReplaceOne(Tool):
                     f'Found {count} occurrences of the search string in {raw_path}; '
                     f'replacement was refused because the match must be unique.'
                 ),
-                code='ambiguous-match',
+                code='not-unique',
                 hint='Include more surrounding context in the search string.',
             )
 

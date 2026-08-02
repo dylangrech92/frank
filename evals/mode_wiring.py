@@ -196,7 +196,7 @@ def check_dispatch_out_of_mode_blocked() -> list[str]:
     """d. dispatch() of an out-of-mode tool returns not-in-mode and never executes.
 
     Activates 'research' (strictly read-only: no file-writing tool present)
-    then dispatches 'create_file', which belongs to 'code'/'qa' but not
+    then dispatches 'write_file', which belongs to 'code'/'qa' but not
     'research'. Asserts both the error contract AND the real side effect
     (the file) does not exist on disk — the gate must block execution, not
     just mislabel a result after the fact.
@@ -214,7 +214,7 @@ def check_dispatch_out_of_mode_blocked() -> list[str]:
         marker_name = "should_not_exist.txt"
         marker_path = os.path.join(tmp, marker_name)
 
-        result = registry.dispatch("create_file", {"path": marker_name, "content": "x"})
+        result = registry.dispatch("write_file", {"path": marker_name, "contents": "x"})
 
         if result.status != "error" or result.code != "not-in-mode":
             failures.append(

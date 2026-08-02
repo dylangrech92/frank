@@ -6,14 +6,13 @@ from llm import ToolCall
 
 
 # Write tools that mutate exactly the file named by their own `path` argument
-# (as opposed to e.g. `replace_many`, which can touch an unbounded, only-known-
-# after-the-fact set of paths, or `move_file`, whose mutation event fires on
-# the *destination* path while `path` names the *source* -- a move changes a
-# file's location, never its content, so it can never introduce a lint issue
-# and is deliberately excluded here). Limiting reactive lint-delta injection to
-# this single-path set keeps the pre-edit snapshot cheap and exact: one lint
-# call on one known path before dispatch, one after.
-_LINT_TRACKED_TOOLS = frozenset({"create_file", "update_file", "replace_one", "format"})
+# (unlike `move_file`, whose mutation event fires on the *destination* path
+# while `path` names the *source* -- a move changes a file's location, never
+# its content, so it can never introduce a lint issue and is deliberately
+# excluded here). Limiting reactive lint-delta injection to this single-path
+# set keeps the pre-edit snapshot cheap and exact: one lint call on one known
+# path before dispatch, one after.
+_LINT_TRACKED_TOOLS = frozenset({"format", "write_file", "edit_file"})
 
 # Cap on how many new lint issues are appended per call, mirroring the
 # `lint` tool's own `_MAX_RENDERED_ISSUES` guard against flooding context.
@@ -129,4 +128,3 @@ def _lint_delta_suffix(pre_issues, call: ToolCall, project_root: str) -> str:
         return "\n\n" + "\n".join(lines)
     except Exception:
         return ""
-

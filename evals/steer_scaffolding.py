@@ -15,7 +15,7 @@ the ``steer`` flag). Steers stay embedded in intact scaffolding, in order. This
 script asserts three things:
 
 a. End-to-end through the real ``agent.handle_user_message`` (stub LLM, no
-   network): an edit with no prior verification run (create_file — the
+   network): an edit with no prior verification run (write_file — the
    reproduce-before-edit steer fires and appends after the round), then a round
    that reads a file, then a final answer. After the turn ``assemble_context``
    still carries the FIRST round's assistant ``tool_calls`` row and its tool
@@ -34,7 +34,7 @@ c. A post-compaction tail — NO real user, but a steer row plus tool scaffoldin
 Exits 0 on success, prints ``FAIL: <reason>`` to stderr and exits 1 otherwise.
 Runs with the repo root on ``sys.path`` (evals/run.py inserts it before exec'ing
 this file); scenario (a) chdir's into its own throwaway temp project dir
-(create_file/read_file resolve against cwd) and restores the cwd afterward,
+(write_file/read_file resolve against cwd) and restores the cwd afterward,
 disables memory side effects for the run, and touches no repo files.
 """
 
@@ -114,7 +114,7 @@ def check_e2e_scaffolding_survives() -> list[str]:
     disable_memory_hooks()
     from session import Session
 
-    # create_file and read_file are both declared by 'code' mode (modes.py).
+    # write_file and read_file are both declared by 'code' mode (modes.py).
     saved_mode = registry.current_mode()
     registry.activate_mode("code")
 
@@ -129,7 +129,7 @@ def check_e2e_scaffolding_survives() -> list[str]:
         # fires and appends after the round. Round 2 reads the file it created.
         # Then a plain final answer ends the turn.
         script = [
-            _tool_call_response("create_file", {"path": "buggy_a.py", "content": "x = 1\n"}),
+            _tool_call_response("write_file", {"path": "buggy_a.py", "contents": "x = 1\n"}),
             _tool_call_response("read_file", {"path": "buggy_a.py"}),
             _final_answer_response("Edited and read the file."),
         ]
@@ -149,21 +149,21 @@ def check_e2e_scaffolding_survives() -> list[str]:
         sent = ctx[1:]
 
         create_tc_idx = next(
-            (i for i, m in enumerate(sent) if _is_tool_calls_row(m, "create_file")), -1
+            (i for i, m in enumerate(sent) if _is_tool_calls_row(m, "write_file")), -1
         )
         create_result_idx = next(
-            (i for i, m in enumerate(sent) if _is_tool_result_row(m, "create_file")), -1
+            (i for i, m in enumerate(sent) if _is_tool_result_row(m, "write_file")), -1
         )
         steer_idx = _repro_steer_index(sent)
 
         if create_tc_idx < 0:
             failures.append(
-                "the first round's create_file assistant tool_calls row was "
+                "the first round's write_file assistant tool_calls row was "
                 "collapsed out of the sent view (the steer moved the boundary)"
             )
         if create_result_idx < 0:
             failures.append(
-                "the first round's create_file tool result was collapsed out of "
+                "the first round's write_file tool result was collapsed out of "
                 "the sent view (the steer moved the boundary)"
             )
         if steer_idx < 0:
@@ -192,7 +192,7 @@ def check_prune_keeps_in_turn_steer() -> list[str]:
 
     failures: list[str] = []
 
-    # A single in-flight turn: a real user, then create_file scaffolding, a
+    # A single in-flight turn: a real user, then write_file scaffolding, a
     # mid-turn steer, and a second round of scaffolding. The boundary is the real
     # user at index 0, so every row must survive verbatim, in order.
     in_turn = [
@@ -202,10 +202,10 @@ def check_prune_keeps_in_turn_steer() -> list[str]:
             "content": "",
             "tool_calls": [
                 {"id": "c1", "type": "function",
-                 "function": {"name": "create_file", "arguments": "{}"}}
+                 "function": {"name": "write_file", "arguments": "{}"}}
             ],
         },
-        {"role": "tool", "tool_call_id": "c1", "name": "create_file", "content": "wrote file"},
+        {"role": "tool", "tool_call_id": "c1", "name": "write_file", "content": "wrote file"},
         {"role": "user", "content": "[harness] reproduce before editing on", "steer": True},
         {
             "role": "assistant",

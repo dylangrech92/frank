@@ -4,7 +4,7 @@ Mirrors ``inline_loop_guard.py`` (which covers the repeated-identical-*failure*
 path owned by ``_loop_guard_check``). This one covers the
 repeated-identical-*success* path owned by ``_repeat_call_check``: the no-op
 loop where a model re-issues the exact same successful call (e.g.
-``replace_one`` with search == replace) over and over. A passive steer alone
+``edit_file`` with search == replace) over and over. A passive steer alone
 does not reliably break a determined loop, so ``_REPEAT_CALL_CAP`` and the
 exempt set are also asserted here; the dispatch-time hard block itself is read
 from ``turn.guards._repeat_cap_block_count`` by both dispatch paths and is
@@ -36,12 +36,12 @@ def main() -> int:
 
     ok = ToolResult.ok("Replaced 1 occurrence in app.py", path="app.py", occurrences=1)
     arguments = {"path": "app.py", "search": "x", "replace": "x"}
-    rend = "[replace_one(success)] Replaced 1 occurrence in app.py"
+    rend = "[edit_file(success)] Replaced 1 occurrence in app.py"
 
     seen: dict[tuple[str, str], int] = {}
     seen_renders: dict[tuple[str, str], tuple[str, int, int]] = {}
-    rendered1 = agent._repeat_call_check("replace_one", arguments, ok, rend, seen, seen_renders, 0, 0)
-    rendered2 = agent._repeat_call_check("replace_one", arguments, ok, rend, seen, seen_renders, 0, 0)
+    rendered1 = agent._repeat_call_check("edit_file", arguments, ok, rend, seen, seen_renders, 0, 0)
+    rendered2 = agent._repeat_call_check("edit_file", arguments, ok, rend, seen, seen_renders, 0, 0)
 
     ok_flag = True
 
@@ -59,11 +59,11 @@ def main() -> int:
     # _loop_guard_check) — drive two identical error results and assert no
     # success-path suffix appears on either.
     err = ToolResult.err("boom", code="boom")
-    erend = "[replace_one(error code=boom)] boom"
+    erend = "[edit_file(error code=boom)] boom"
     seen_err: dict[tuple[str, str], int] = {}
     seen_renders_err: dict[tuple[str, str], tuple[str, int, int]] = {}
-    e1 = agent._repeat_call_check("replace_one", arguments, err, erend, seen_err, seen_renders_err, 0, 0)
-    e2 = agent._repeat_call_check("replace_one", arguments, err, erend, seen_err, seen_renders_err, 0, 0)
+    e1 = agent._repeat_call_check("edit_file", arguments, err, erend, seen_err, seen_renders_err, 0, 0)
+    e2 = agent._repeat_call_check("edit_file", arguments, err, erend, seen_err, seen_renders_err, 0, 0)
     if "[loop-guard]" in e1 or "[loop-guard]" in e2:
         print("FAIL: error result was steered by the success-path guard", file=sys.stderr)
         print(f"  e1={e1!r} e2={e2!r}", file=sys.stderr)

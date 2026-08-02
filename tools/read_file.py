@@ -36,7 +36,7 @@ class ReadFile(Tool):
         'Reads a file inside the project returning its contents with optional line range. '
         'Output is cat -n style: every line is prefixed with its true 1-based file line number '
         'and a tab. The line numbers are display-only \u2014 never include them in file content you '
-        'write, nor in search strings for replace_one/replace_many. '
+        'write, nor in search strings for edit_file. '
         'The path must be relative to the project root.'
     )
     action = 'read the file'

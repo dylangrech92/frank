@@ -269,16 +269,20 @@ SCENARIOS: list[dict] = [
         "inline": "steer_channel.py",
     },
     {
-        "name": "edit_lines",
+        "name": "file_ops",
         "description": (
-            "Dispatch-level check (no LLM): edit_lines replaces a line range, "
-            "inserts on an empty range (end=start-1) and at the top, rejects "
-            "out-of-bounds ranges with code=bad-range, honors the not-read-yet "
-            "and file-changed-on-disk gates, preserves trailing-newline "
-            "behavior, and echoes a cat -n numbered preview; read_file emits "
-            "cat -n output with TRUE line numbers under paging."
+            "Dispatch-level check (no LLM): the file ops tools write_file and "
+            "edit_file correctly create nested files, overwrite after a read, "
+            "gate unwritten files with code=not-read-yet, refuse writes "
+            "targeting directories with code=not-a-file, truncate small files "
+            "on empty-contents write, refuse destructive-partial-overwrites "
+            "while leaving the original bytes on disk, allow legitimate "
+            "rewrites, support edit_file's unique-match search/replace with "
+            "proper not-found / not-unique / not-read-yet error reporting, and "
+            "refuse both tools with code=file-changed-on-disk (naming both "
+            "possible causes) when the file changed after the last read."
         ),
-        "inline": "edit_lines.py",
+        "inline": "file_ops.py",
     },
     {
         "name": "find_dash_query",

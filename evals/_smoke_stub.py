@@ -11,7 +11,7 @@ contents — the canned output does not depend on what turns were "sent").
 For the json_multiline scenario it also writes haiku.txt into the current
 directory (the temp project dir), since that scenario's check asserts the
 file exists on disk with a minimum line count — real main.py would have
-created it via the create_file tool.
+created it via the write_file tool.
 """
 
 from __future__ import annotations
@@ -27,10 +27,10 @@ _CANNED: dict[str, dict[str, str]] = {
             'whisper their truth\nBinaries take flight\n\n- qwen\n'
         ),
         "stderr": (
-            "Tool call: create_file({\"path\": \"haiku.txt\", \"content\": "
+            "Tool call: write_file({\"path\": \"haiku.txt\", \"contents\": "
             "\"Code compiles at dawn\\nSyntax trees whisper their truth\\n"
             "Binaries take flight\\n\\n- qwen\\n\"})\n"
-            "[create_file(success)]\n"
+            "[write_file(success)]\n"
             "Tool call: read_file({\"path\": \"haiku.txt\"})\n"
             "[read_file(success)]\n"
         ),

@@ -25,12 +25,12 @@ with a stub LLM client, no network) and asserts:
 
 a. Identical successful read twice (``read_file`` on an unchanged file) → the first
    tool-result row carries the body; the second is the read-only stub.
-b. Read → edit the same file (``update_file``) → identical re-read → the re-read
+b. Read → edit the same file (``write_file``) → identical re-read → the re-read
    renders the full fresh body reflecting the NEW content and is NOT stubbed
    (fingerprint mismatch defeats the dedup — condition (d)).
 c1. Identical ``run_command`` twice with NO intervening mutation → the 2nd render
     is the ``[no-change]`` verification stub (condition (m) satisfied).
-c2/c3. Identical ``run_command`` → a mutation event (``create_file``) → the
+c2/c3. Identical ``run_command`` → a mutation event (``write_file``) → the
     identical ``run_command`` again renders the FULL body (no stub — the mutation
     stamp advanced, condition (m) fails) and the record re-stamps, so (c3) one
     more identical run with no new mutation is stubbed again.
@@ -38,7 +38,7 @@ c4. ``_repeat_render`` driven directly for a verification tool with a matching k
     but a DIFFERENT fingerprint (the command's output changed) → full render, no
     stub (condition (d) defeats the dedup even at an unchanged mutation count).
 c5. Read-only tools do NOT gate on the mutation stamp: read → mutate a DIFFERENT
-    file (``create_file``) → identical re-read whose body is unchanged → still the
+    file (``write_file``) → identical re-read whose body is unchanged → still the
     read-only stub.
 d. The extracted ``_repeat_render`` is driven directly (read-only class) with a
    fabricated stamp dict: same key and fingerprint but a bumped compaction count →
@@ -50,15 +50,15 @@ registry, ``modes.py``) — there is no PINNED-outside-mode carve-out, so even a
 ``read_file``-only check must activate a mode first. The registry is
 module-global with no deactivate API, so each check snapshots
 ``tools.registry.current_mode()`` and restores it in a finally. 'code' mode
-covers every write/verification tool these checks use (update_file,
-create_file, run_command); 'research' mode is used for the read_file-only
+covers every write/verification tool these checks use (write_file,
+write_file, run_command); 'research' mode is used for the read_file-only
 check since it's the narrowest mode that still declares it (read_file is a
 ``_COMMON_TOOLS`` member, present in every mode).
 
 Exits 0 on success, prints ``FAIL: <reason>`` to stderr and exits 1 otherwise.
 Runs with the repo root on ``sys.path`` (evals/run.py inserts it before exec'ing
 this file); each e2e check chdir's into its own throwaway temp project dir
-(read_file / update_file / run_command resolve against cwd) and restores the cwd
+(read_file / write_file / run_command resolve against cwd) and restores the cwd
 afterward, disables memory side effects, and touches no repo files.
 """
 
@@ -184,7 +184,7 @@ def check_reread_after_edit_full_body() -> list[str]:
 
     failures: list[str] = []
 
-    # update_file is declared by 'code' mode (modes.py).
+    # write_file is declared by 'code' mode (modes.py).
     saved_mode = registry.current_mode()
     registry.activate_mode("code")
 
@@ -196,11 +196,11 @@ def check_reread_after_edit_full_body() -> list[str]:
             fh.write("old_marker = 1\n")
 
         session = Session(tmp, "test-model", "You are a test agent.")
-        # read (stamps the read registry so update_file's freshness gate passes),
+        # read (stamps the read registry so write_file's freshness gate passes),
         # overwrite with new content, then re-read the SAME path with identical args.
         script = [
             _tool_call_response("read_file", {"path": "conf.txt"}),
-            _tool_call_response("update_file", {"path": "conf.txt", "content": "new_marker = 2\n"}),
+            _tool_call_response("write_file", {"path": "conf.txt", "contents": "new_marker = 2\n"}),
             _tool_call_response("read_file", {"path": "conf.txt"}),
             _final_answer_response("Edited then re-read."),
         ]
@@ -308,7 +308,7 @@ def check_verify_remutate_then_restub() -> list[str]:
 
     failures: list[str] = []
 
-    # run_command and create_file are both declared by 'code' mode (modes.py).
+    # run_command and write_file are both declared by 'code' mode (modes.py).
     saved_mode = registry.current_mode()
     registry.activate_mode("code")
 
@@ -322,7 +322,7 @@ def check_verify_remutate_then_restub() -> list[str]:
         # body, re-stamped) → identical run (no new mutation → stub again).
         script = [
             _tool_call_response("run_command", {"cmd": "echo dedup_probe"}),
-            _tool_call_response("create_file", {"path": "made.txt", "content": "x\n"}),
+            _tool_call_response("write_file", {"path": "made.txt", "contents": "x\n"}),
             _tool_call_response("run_command", {"cmd": "echo dedup_probe"}),
             _tool_call_response("run_command", {"cmd": "echo dedup_probe"}),
             _final_answer_response("Ran, edited, ran, ran."),
@@ -426,7 +426,7 @@ def check_readonly_dedups_despite_other_mutation() -> list[str]:
 
     failures: list[str] = []
 
-    # create_file is declared by 'code' mode (modes.py); read_file is a
+    # write_file is declared by 'code' mode (modes.py); read_file is a
     # _COMMON_TOOLS member so the same mode covers both.
     saved_mode = registry.current_mode()
     registry.activate_mode("code")
@@ -444,7 +444,7 @@ def check_readonly_dedups_despite_other_mutation() -> list[str]:
         # read-only dedup ignores the mutation stamp).
         script = [
             _tool_call_response("read_file", {"path": "readme.txt"}),
-            _tool_call_response("create_file", {"path": "other.txt", "content": "z\n"}),
+            _tool_call_response("write_file", {"path": "other.txt", "contents": "z\n"}),
             _tool_call_response("read_file", {"path": "readme.txt"}),
             _final_answer_response("Read, made another file, re-read."),
         ]

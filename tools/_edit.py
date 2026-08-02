@@ -1,14 +1,12 @@
 """Shared boilerplate for the single-file edit tools.
 
 The leading underscore keeps this module out of tool discovery by the registry.
-``update_file``, ``replace_one``, ``replace_many`` and ``edit_lines`` all have
-to resolve a path under the project root, reject non-files, refuse to write
-against a stale or never-read view of a file, and — after a successful write —
-re-stamp the read registry and emit exactly one mutation event.  ``delete_file``
-shares the freshness gate alone: a delete has nothing to re-stamp, and it also
-accepts directories, which carry no read stamp.  Centralizing that surface here
-keeps the tools byte-identical on their error codes, hints, and the
-record_read/emit_mutation ordering, instead of each maintaining its own copy.
+``write_file`` and ``edit_file`` both have to resolve a path under the project
+root, reject non-files, refuse to write against a stale or never-read view of a
+file, and — after a successful write — re-stamp the read registry and emit
+exactly one mutation event.  Centralizing that surface here keeps the tools
+byte-identical on their error codes, hints, and the record_read/emit_mutation
+ordering, instead of each maintaining its own copy.
 
 Exports
 -------
@@ -37,7 +35,7 @@ def resolve_existing_file(raw_path: str) -> tuple[Path | None, ToolResult | None
 
     Returns ``(resolved, None)`` when the path stays under the root and points at
     an existing regular file, or ``(None, error)`` carrying the shared error
-    contract otherwise: ``path-escapes-root``, ``not-found`` (with the create_file
+    contract otherwise: ``path-escapes-root``, ``not-found`` (with the write_file
     hint), or ``not-a-file``.
     """
     try:
@@ -49,7 +47,7 @@ def resolve_existing_file(raw_path: str) -> tuple[Path | None, ToolResult | None
         return None, ToolResult.err(
             f'{raw_path} does not exist.',
             code='not-found',
-            hint="Use create_file to create a new file.",
+            hint="Use write_file to create a new file.",
         )
 
     if not resolved.is_file():

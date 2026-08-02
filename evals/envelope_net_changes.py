@@ -83,7 +83,7 @@ def _drive_turn(task: str, script: list, tmp_prefix: str, seed: dict[str, str]):
     """Drive one scripted turn through the real turn loop; return the session.
 
     Materializes *seed* (relative path -> content) in a fresh temp project dir,
-    activates 'code' mode (the scripts use read_file/create_file/update_file/
+    activates 'code' mode (the scripts use read_file/write_file/
     run_command, all declared by that mode), isolates cwd + memory, and
     returns the session so the caller can read ``session.turn_report``. Restores
     cwd/memory/mode afterward. Touches no repo files.
@@ -94,7 +94,7 @@ def _drive_turn(task: str, script: list, tmp_prefix: str, seed: dict[str, str]):
     disable_memory_hooks()
     from session import Session
 
-    # read_file, create_file, update_file, run_command are all declared by
+    # read_file, write_file, run_command are all declared by
     # 'code' mode (see modes.py) — the mode-gated equivalent of activating
     # each tool individually under the old catalog.
     saved_mode = registry.current_mode()
@@ -133,12 +133,12 @@ def check_edit_then_revert() -> list[str]:
     """a. A byte-for-byte revert (plus a passing run) is flagged reverted, net no-op."""
     original = "value = 1\n"
     script = [
-        # Read first — update_file gates on a prior read of the file.
+        # Read first — write_file gates on a prior read of the file.
         _tool_call_response("read_file", {"path": "mod.py"}),
         # Change the file's bytes...
-        _tool_call_response("update_file", {"path": "mod.py", "content": "value = 2\n"}),
+        _tool_call_response("write_file", {"path": "mod.py", "contents": "value = 2\n"}),
         # ...then write the ORIGINAL bytes back — a net no-op on disk.
-        _tool_call_response("update_file", {"path": "mod.py", "content": original}),
+        _tool_call_response("write_file", {"path": "mod.py", "contents": original}),
         # A passing run clears the verify gate so verified can be True.
         _tool_call_response("run_command", {"cmd": "exit 0"}),
         _final_answer_response("Reverted the speculative edit; nothing changed."),
@@ -172,7 +172,7 @@ def check_edit_no_revert() -> list[str]:
     """b. A file left changed carries no reverted key."""
     script = [
         _tool_call_response("read_file", {"path": "mod.py"}),
-        _tool_call_response("update_file", {"path": "mod.py", "content": "value = 2\n"}),
+        _tool_call_response("write_file", {"path": "mod.py", "contents": "value = 2\n"}),
         _tool_call_response("run_command", {"cmd": "exit 0"}),
         _final_answer_response("Applied the fix."),
     ]
@@ -199,7 +199,7 @@ def check_edit_no_revert() -> list[str]:
 def check_create_then_delete() -> list[str]:
     """c. A file created then rm'd via run_command is flagged reverted, net no-op."""
     script = [
-        _tool_call_response("create_file", {"path": "scratch.py", "content": "tmp = 1\n"}),
+        _tool_call_response("write_file", {"path": "scratch.py", "contents": "tmp = 1\n"}),
         _tool_call_response("run_command", {"cmd": "rm scratch.py"}),
         _final_answer_response("Created a scratch file then removed it."),
     ]
@@ -236,11 +236,11 @@ def check_partial_revert() -> list[str]:
     script = [
         # Edit a.py then write its original bytes back — a net no-op on a.py.
         _tool_call_response("read_file", {"path": "a.py"}),
-        _tool_call_response("update_file", {"path": "a.py", "content": "a = 2\n"}),
-        _tool_call_response("update_file", {"path": "a.py", "content": a_original}),
+        _tool_call_response("write_file", {"path": "a.py", "contents": "a = 2\n"}),
+        _tool_call_response("write_file", {"path": "a.py", "contents": a_original}),
         # Edit b.py and LEAVE it changed — a genuine change this turn.
         _tool_call_response("read_file", {"path": "b.py"}),
-        _tool_call_response("update_file", {"path": "b.py", "content": "b = 2\n"}),
+        _tool_call_response("write_file", {"path": "b.py", "contents": "b = 2\n"}),
         # A passing run clears the verify gate.
         _tool_call_response("run_command", {"cmd": "exit 0"}),
         _final_answer_response("Reverted a.py, kept the b.py fix."),
@@ -284,11 +284,11 @@ def check_unknown_preimage() -> list[str]:
     script = [
         # FIRST mutation is a shell side effect — no capturable pre-image.
         _tool_call_response("run_command", {"cmd": "echo 'extra = 2' >> notes.py"}),
-        # Read the post-shell state (update_file gates on a prior read), then a
+        # Read the post-shell state (write_file gates on a prior read), then a
         # later scripted call restores the original bytes; the harness must NOT
         # infer a revert, because it never knew this file's turn-start state.
         _tool_call_response("read_file", {"path": "notes.py"}),
-        _tool_call_response("update_file", {"path": "notes.py", "content": original}),
+        _tool_call_response("write_file", {"path": "notes.py", "contents": original}),
         _tool_call_response("run_command", {"cmd": "exit 0"}),
         _final_answer_response("Touched notes.py via the shell then rewrote it."),
     ]

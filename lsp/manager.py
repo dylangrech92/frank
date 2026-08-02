@@ -435,8 +435,8 @@ class LSPManager:
 
         Matches the exact ``kind`` strings and ``extra`` payload keys emitted by the file tools:
 
-        * ``created`` -- from ``tools.create_file.CreateFile`` (no extra keys)
-        * ``changed`` -- from ``tools.update_file.UpdateFile`` (no extra keys)
+        * ``created`` -- from ``tools.write_file.WriteFile`` on the create path (no extra keys)
+        * ``changed`` -- from ``tools.write_file.WriteFile`` via finalize_write on the overwrite path (no extra keys)
         * ``deleted`` -- from ``tools.delete_file.DeleteFile`` (no extra keys)
         * ``renamed`` -- from ``tools.move_file.MoveFile`` with extra key **``old_path``**
 

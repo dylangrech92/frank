@@ -49,7 +49,7 @@ h. Environment-noise failures do not count as an observed project failure. A run
 
 Exits 0 on success, prints ``FAIL: <reason>`` to stderr and exits 1 otherwise.
 Runs with the repo root on ``sys.path`` (evals/run.py inserts it before exec'ing
-this file); it chdir's into its own throwaway temp project dir (create_file and
+this file); it chdir's into its own throwaway temp project dir (write_file and
 run_command resolve against cwd) and restores the cwd afterward, disables memory
 side effects for the run, and touches no repo files.
 """
@@ -113,7 +113,7 @@ def check_fires_and_one_shot() -> list[str]:
     disable_memory_hooks()
     from session import Session
 
-    # create_file and run_command are both declared by 'code' mode (modes.py).
+    # write_file and run_command are both declared by 'code' mode (modes.py).
     saved_mode = registry.current_mode()
     registry.activate_mode("code")
 
@@ -127,8 +127,8 @@ def check_fires_and_one_shot() -> list[str]:
         # Two distinct edits in one turn, no run_command anywhere, then a plain
         # final answer. The first edit must steer; the second must not.
         script = [
-            _tool_call_response("create_file", {"path": "buggy_a.py", "content": "x = 1\n"}),
-            _tool_call_response("create_file", {"path": "buggy_b.py", "content": "y = 2\n"}),
+            _tool_call_response("write_file", {"path": "buggy_a.py", "contents": "x = 1\n"}),
+            _tool_call_response("write_file", {"path": "buggy_b.py", "contents": "y = 2\n"}),
             _final_answer_response("Edited both files."),
         ]
         client = _StubClient(script)
@@ -177,7 +177,7 @@ def check_suppressed_after_run() -> list[str]:
     disable_memory_hooks()
     from session import Session
 
-    # create_file and run_command are both declared by 'code' mode (modes.py).
+    # write_file and run_command are both declared by 'code' mode (modes.py).
     saved_mode = registry.current_mode()
     registry.activate_mode("code")
 
@@ -192,7 +192,7 @@ def check_suppressed_after_run() -> list[str]:
         # run), then an edit, then a plain final answer. No repro steer must fire.
         script = [
             _tool_call_response("run_command", {"cmd": "exit 7"}),
-            _tool_call_response("create_file", {"path": "buggy_a.py", "content": "x = 1\n"}),
+            _tool_call_response("write_file", {"path": "buggy_a.py", "contents": "x = 1\n"}),
             _final_answer_response("Reproduced then edited."),
         ]
         client = _StubClient(script)
@@ -227,7 +227,7 @@ def check_suppressed_after_run() -> list[str]:
 def _drive_turn(task: str, script: list, tmp_prefix: str):
     """Drive one scripted turn through the real turn loop; return (session, stderr).
 
-    Activates 'code' mode (the scripts use create_file/run_command, both
+    Activates 'code' mode (the scripts use write_file/run_command, both
     declared by it), isolates cwd + memory, and captures stderr so the caller
     can assert on both transcript rows and telemetry. Restores cwd/memory/mode
     afterward. Touches no repo files.
@@ -272,7 +272,7 @@ def check_no_failure_steer_fires() -> list[str]:
 
     script = [
         _tool_call_response("run_command", {"cmd": "exit 0"}),
-        _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
+        _tool_call_response("write_file", {"path": "buggy.py", "contents": "x = 1\n"}),
         _final_answer_response("Applied a defensive fix."),
     ]
     session, stderr = _drive_turn(
@@ -313,7 +313,7 @@ def check_no_failure_suppressed_on_failing_run() -> list[str]:
 
     script = [
         _tool_call_response("run_command", {"cmd": "exit 7"}),
-        _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
+        _tool_call_response("write_file", {"path": "buggy.py", "contents": "x = 1\n"}),
         _final_answer_response("Reproduced then edited."),
     ]
     session, stderr = _drive_turn(
@@ -346,7 +346,7 @@ def check_no_failure_suppressed_without_lexicon() -> list[str]:
 
     script = [
         _tool_call_response("run_command", {"cmd": "exit 0"}),
-        _tool_call_response("create_file", {"path": "feature.py", "content": "x = 1\n"}),
+        _tool_call_response("write_file", {"path": "feature.py", "contents": "x = 1\n"}),
         _final_answer_response("Added the feature."),
     ]
     session, stderr = _drive_turn(
@@ -383,7 +383,7 @@ def _check_noise_run_fires(noise_cmd: str, tmp_prefix: str) -> list[str]:
     script = [
         _tool_call_response("run_command", {"cmd": noise_cmd}),
         _tool_call_response("run_command", {"cmd": "exit 0"}),
-        _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
+        _tool_call_response("write_file", {"path": "buggy.py", "contents": "x = 1\n"}),
         _final_answer_response("Applied a defensive fix."),
     ]
     session, stderr = _drive_turn(
@@ -456,7 +456,7 @@ def check_genuine_failure_suppresses() -> list[str]:
     script = [
         _tool_call_response("run_command", {"cmd": "exit 7"}),
         _tool_call_response("run_command", {"cmd": "exit 0"}),
-        _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
+        _tool_call_response("write_file", {"path": "buggy.py", "contents": "x = 1\n"}),
         _final_answer_response("Reproduced then edited."),
     ]
     session, stderr = _drive_turn(
@@ -493,7 +493,7 @@ def check_gate_honesty() -> list[str]:
     failures: list[str] = []
 
     fail_script = [
-        _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
+        _tool_call_response("write_file", {"path": "buggy.py", "contents": "x = 1\n"}),
         _tool_call_response("run_command", {"cmd": "exit 7"}),
         _final_answer_response("Edited; the check failed."),
     ]
@@ -508,7 +508,7 @@ def check_gate_honesty() -> list[str]:
         )
 
     pass_script = [
-        _tool_call_response("create_file", {"path": "buggy.py", "content": "x = 1\n"}),
+        _tool_call_response("write_file", {"path": "buggy.py", "contents": "x = 1\n"}),
         _tool_call_response("run_command", {"cmd": "exit 0"}),
         _final_answer_response("Edited and verified."),
     ]

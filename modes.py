@@ -79,10 +79,9 @@ You are operating in code mode.  Make precise, minimal code changes to satisfy
 the task.
 
 Tools to use:
-- replace_one for unique targeted changes, replace_many for project-wide text
-  replacement, edit_lines for range-based edits, update_file for full
-  overwrites of small files, create_file for new files, create_folder for new
-  directories, delete_file to remove files.
+- write_file to write a new file or fully overwrite an existing one (creates
+  missing parents), edit_file for a unique targeted search/replace change,
+  create_folder for new directories, delete_file to remove files.
 - rename_symbol for type-aware cross-file renames.
 - code_actions for quick-fixes, organize-imports, and refactors.
 - move_file to rename/move files (imports auto-update).
@@ -261,14 +260,11 @@ MODES: dict[str, Mode] = {
             "lint",
             "find_dead_code",
             "spawn_agents",
-            "create_file",
+            "write_file",
+            "edit_file",
             "create_folder",
             "delete_file",
             "move_file",
-            "edit_lines",
-            "replace_one",
-            "replace_many",
-            "update_file",
             "rename_symbol",
             "code_actions",
             "format",

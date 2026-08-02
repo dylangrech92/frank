@@ -230,7 +230,7 @@ def _repeat_call_check(
     *failures* (keyed on the rendered error envelope, which a cooperative model
     rarely produces twice — see evals/inline_loop_guard.py); this one owns
     repeated identical *successes* — the no-op loop where a model re-issues the
-    exact same successful call (e.g. ``replace_one`` with search == replace, or
+    exact same successful call (e.g. ``edit_file`` with search == replace, or
     the same ``read_file`` twice) over and over, making no progress. Only
     success results are steered here; errors are left to ``_loop_guard_check``
     to avoid double-suffixing.

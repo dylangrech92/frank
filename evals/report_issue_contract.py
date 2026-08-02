@@ -95,7 +95,7 @@ def check_append_and_stamp() -> list[str]:
         failures.append(f"precondition: temp log already exists at {LOG}")
         return failures
 
-    first = 'edit_lines reported success but the file was unchanged'
+    first = 'edit_file reported success but the file was unchanged'
     result = _dispatch(first)
     if result.status != 'success':
         failures.append(
@@ -180,7 +180,7 @@ def check_multiline_block_scalar() -> list[str]:
 
 def check_ambiguous_single_line() -> list[str]:
     failures: list[str] = []
-    for text in ('replace_one: old_text not found, but I had just read it', '- leading dash then: a colon'):
+    for text in ('edit_file: old_text not found, but I had just read it', '- leading dash then: a colon'):
         before = len(_entries())
         blocks_before = LOG.read_text(encoding='utf-8').count('issue: |2')
         result = _dispatch(text)
@@ -208,7 +208,7 @@ def check_ambiguous_single_line() -> list[str]:
 # than as the reported text.
 _ADVERSARIAL = (
     'edit failed:',
-    'replace_one: old_text not found',
+    'edit_file: old_text not found',
     'key:value with no space',
     'value #hash',
     '@mention at start',

@@ -17,7 +17,7 @@ from turn.steering import _is_bug_report
 # =============================================================================
 
 # Hard cap on identical tool calls within a single turn. A model stuck
-# re-issuing the exact same successful no-op (e.g. replace_one with search ==
+# re-issuing the exact same successful no-op (e.g. edit_file with search ==
 # replace) would otherwise spin forever: the success-path steer below nudges
 # first, and once this many identical (name, arguments) pairs have been
 # dispatched, the call is refused at dispatch time (see handle_user_message).
