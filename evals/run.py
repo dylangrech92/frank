@@ -34,7 +34,15 @@ EVALS_DIR = Path(__file__).resolve().parent
 
 sys.path.insert(0, str(EVALS_DIR))
 sys.path.insert(0, str(REPO_ROOT))
+import stats  # noqa: E402
 from scenarios import SCENARIOS  # noqa: E402
+
+# An eval run is not usage, so nothing it does may reach the stats ledger. Set
+# at import, before any scenario spawns, because every subprocess this module
+# starts -- live main.py runs and inline check scripts alike -- inherits this
+# environment; setting it inside main() would miss nothing today but would
+# break the moment a scenario is launched from anywhere else in this module.
+os.environ[stats.DISABLE_ENV] = "1"
 
 DEFAULT_TIMEOUT = 420
 

@@ -19,7 +19,16 @@ when no summarizer is passed.
 
 from __future__ import annotations
 
+import os
 from typing import Callable, Sequence
+
+import stats
+
+# Every eval that imports this module builds a real ``Session``, which records
+# usage on each LLM call. A stubbed call is not usage, so opt out at import:
+# ``evals/run.py`` already sets this for the suite, but an eval run directly
+# (``python3 evals/<name>.py``, how they are debugged) has no such parent.
+os.environ[stats.DISABLE_ENV] = "1"
 
 # The compaction summarizer's request always opens with a system message whose
 # content is ``compaction.COMPACTION_SYSTEM_PROMPT``; a prefix of that constant

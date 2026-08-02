@@ -17,6 +17,14 @@ stderr before recording restarts from an empty array. Treating unparseable
 content as "no history" instead would let a single bad write erase every stored
 row with no error anywhere -- the read succeeds, returns nothing, and the next
 upsert rewrites the file with one row.
+
+Setting ``CODING_AGENT_NO_STATS`` in the environment makes ``upsert`` a no-op,
+which is how a test run avoids being counted as real usage. The eval suite
+drives a real ``Session`` on purpose -- zero mocks is the point -- and a Session
+records unconditionally, so without an opt-out every eval run appends rows to
+this shared ledger. It is an environment variable rather than an argument
+because the evals reach recording down two different paths (in-process Sessions
+and ``main.py`` subprocesses), and only the environment crosses both.
 """
 
 from __future__ import annotations
@@ -31,6 +39,12 @@ from typing import Any, Dict, List, NamedTuple
 
 STATS_PATH = Path(__file__).resolve().parent / "stats.json"
 JS_PATH = Path(__file__).resolve().parent / "stats.js"
+
+# Set to any NON-EMPTY value in this process's environment => record nothing;
+# note that includes "0", so this is presence, not a parsed boolean. Named here
+# so the eval harness that sets it and the code that honours it share one
+# spelling -- a second literal is how a rename would silently stop working.
+DISABLE_ENV = "CODING_AGENT_NO_STATS"
 
 
 class CorruptStatsFile(Exception):
@@ -153,7 +167,14 @@ def upsert(
 
     The whole read-modify-write is performed under an exclusive ``flock`` on the
     file so concurrent subagent processes serialize instead of losing rows.
+
+    Returns without touching either file when ``DISABLE_ENV`` is set, so a test
+    run leaves no trace in the ledger. The check lives here, at the single write
+    site, rather than at each caller: a caller that forgot it would pollute
+    silently, and nothing downstream can tell a synthetic row from a real one.
     """
+    if os.environ.get(DISABLE_ENV):
+        return
     row = totals.as_row(session_id)
     # "a+" creates the file if absent and never truncates on open, so an
     # existing array survives until we deliberately rewrite it under the lock.
