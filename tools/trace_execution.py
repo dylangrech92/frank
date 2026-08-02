@@ -20,6 +20,7 @@ from typing import Any
 from runtime.profiling import (
     fmt_seconds,
     format_streams,
+    make_artifact_dir,
     render_top_table,
     run_measured,
     tail_lines,
@@ -258,7 +259,7 @@ class TraceExecution(Tool):
                 )
 
         # --- Create artifacts directory ---
-        artifact_dir = tempfile.mkdtemp(prefix='perf_profile_')
+        artifact_dir = make_artifact_dir()
 
         try:
             # --- Snapshot before ---

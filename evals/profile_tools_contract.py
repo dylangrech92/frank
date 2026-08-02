@@ -23,7 +23,8 @@ Covers, for ``profile_command``, ``profile_hotspots``, ``profile_memory``, and
        mutation bus (``tools._sandbox.subscribe_mutations`` — the module that
        actually owns the subscriber list; ``tools._snapshot`` re-exports only
        ``emit_mutation``, not the subscribe API);
-    7. no ``perf_profile_*`` artifact-dir leak into the OS temp dir;
+    7. no ``perf_profile_<pid>_*`` artifact-dir leak into the OS temp dir —
+       scoped to this process, since the temp dir is shared machine-wide;
     8. documented contract error codes: ``profile-result-missing`` for a
        python target that skips the bootstrap's ``finally`` via
        ``os._exit(0)``, ``is_module`` passthrough (module name, not a
@@ -328,9 +329,18 @@ def check_mutation_truthfulness() -> list[str]:
 
 
 def check_tempdir_leak() -> list[str]:
+    """Assert this process left no artifact directory behind.
+
+    Scoped to our own pid.  The OS temp dir is shared by every process on the
+    machine, so an unscoped ``perf_profile_*`` glob also matches the live
+    directory of any concurrent profiling run — which made this check fail for
+    someone else's work in progress rather than for a real leak.  ``_dispatch``
+    runs the tools in this process, so their artifact directories carry this
+    pid and nothing else does.
+    """
     failures: list[str] = []
     tmp_dir = Path(tempfile.gettempdir())
-    leaked = sorted(glob.glob(str(tmp_dir / 'perf_profile_*')))
+    leaked = sorted(glob.glob(str(tmp_dir / f'perf_profile_{os.getpid()}_*')))
     if leaked:
         failures.append(f"tempdir leak: perf_profile_* entries remained: {leaked}")
     return failures
@@ -517,7 +527,7 @@ def main() -> int:
     )
 
     # 7. tempdir-leak (checks 1-6 so far)
-    _run("no perf_profile_* tempdir leak (checks 1-6)", check_tempdir_leak)
+    _run("no perf_profile_<pid>_* tempdir leak (checks 1-6)", check_tempdir_leak)
 
     # 8. contract error codes
     _run("profile_memory os._exit(0) -> profile-result-missing", check_profile_memory_os_exit)
@@ -534,7 +544,7 @@ def main() -> int:
     _run("php profile_hotspots (xdebug-aware)", check_php_profiling)
 
     # Final leak check covering every dispatch in the whole run, not just 1-6.
-    _run("no perf_profile_* tempdir leak (full run)", check_tempdir_leak)
+    _run("no perf_profile_<pid>_* tempdir leak (full run)", check_tempdir_leak)
 
     if all_failures:
         return 1

@@ -19,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import IO, TYPE_CHECKING, Any, cast
@@ -58,6 +59,19 @@ class MeasuredRun:
     sampled_peak_rss_bytes: int
     sampled_mean_cpu_pct: float
     max_procs: int
+
+
+def make_artifact_dir() -> str:
+    """Create this process's profiler artifact directory in the OS temp dir.
+
+    The pid is part of the name because that directory is shared by every
+    process on the machine.  Without it a ``perf_profile_*`` directory carries
+    no owner, so a stale one cannot be traced back to the run that leaked it,
+    and a concurrent profiling run is indistinguishable from a leak by this
+    one.  Every profiling tool creates its artifact directory here so the
+    naming stays a single decision.
+    """
+    return tempfile.mkdtemp(prefix=f"perf_profile_{os.getpid()}_")
 
 
 # ---------------------------------------------------------------------------

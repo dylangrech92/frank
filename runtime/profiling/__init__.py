@@ -3,7 +3,7 @@
 This package consolidates the runtime profiling module. Consumer tools import
 from this package directly:
 - Subprocess runners: :func:`run_measured`, :func:`which_interpreter`,
-  :func:`php_xdebug_status`, :class:`MeasuredRun`.
+  :func:`php_xdebug_status`, :func:`make_artifact_dir`, :class:`MeasuredRun`.
 - Parser functions: :func:`parse_cpuprofile`, :func:`parse_heapprofile`,
   :func:`parse_cachegrind`.
 - Formatting helpers: :func:`fmt_bytes`, :func:`fmt_seconds`,
@@ -31,6 +31,7 @@ from .format import (
 from .parsers import parse_cpuprofile, parse_heapprofile
 from .run import (
     MeasuredRun,
+    make_artifact_dir,
     php_xdebug_status,
     run_measured,
     which_interpreter,
@@ -38,6 +39,7 @@ from .run import (
 
 __all__ = [
     "MeasuredRun",
+    "make_artifact_dir",
     "run_measured",
     "which_interpreter",
     "php_xdebug_status",

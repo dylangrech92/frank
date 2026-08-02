@@ -13,6 +13,7 @@ from typing import Any
 from runtime.profiling import (
     fmt_seconds,
     format_streams,
+    make_artifact_dir,
     php_xdebug_status,
     parse_cachegrind,
     parse_cpuprofile,
@@ -421,7 +422,7 @@ class ProfileHotspots(Tool):
                     hint='The snippet content may be invalid.',
                 )
         # --- Create artifacts directory ---
-        artifact_dir = tempfile.mkdtemp(prefix='perf_profile_')
+        artifact_dir = make_artifact_dir()
 
         try:
             # --- Snapshot before ---

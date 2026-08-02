@@ -14,6 +14,7 @@ from runtime.profiling import (
     fmt_bytes,
     fmt_seconds,
     format_streams,
+    make_artifact_dir,
     parse_cachegrind,
     parse_heapprofile,
     php_xdebug_status,
@@ -403,7 +404,7 @@ class ProfileMemory(Tool):
                 )
 
         # --- Create artifacts directory ---
-        artifact_dir = tempfile.mkdtemp(prefix='perf_profile_')
+        artifact_dir = make_artifact_dir()
 
         try:
             # --- Snapshot before ---
