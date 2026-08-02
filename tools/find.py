@@ -20,7 +20,7 @@ class Find(Tool):
     limits the search to a subdirectory relative to the project root. When
     *fuzzy* is false (the default), *query* is matched as a literal fixed string.
     When *fuzzy* is true, *query* is split on whitespace and each part is matched
-    as a case-insensitive regular expression with anything between the parts.
+    as a case-insensitive literal with anything between the parts.
 
     For symbol names use find_symbol; for usages of a known symbol use find_references.
     """
@@ -114,24 +114,24 @@ class Find(Tool):
         # Build the search pattern and rg arguments
         rg_args: list[str] = [rg, '--line-number', '--no-heading']
 
+        # -e keeps the pattern out of rg's flag parser: a query that starts with
+        # a dash ("--no-cache", "-Wall") is a search term, not a flag.
         if fuzzy:
             parts = term.split()
             escaped_parts = [re.escape(part) for part in parts]
             pattern = '.*'.join(escaped_parts)
-            rg_args.extend(['--ignore-case', pattern])
+            rg_args.extend(['--ignore-case', '-e', pattern])
         else:
-            rg_args.extend(['--fixed-strings', term])
+            rg_args.extend(['--fixed-strings', '-e', term])
 
         # Respect .gitignore (do NOT pass --no-ignore); exclude .coding_agent
         rg_args.extend(['--glob', IGNORE_GLOB])
 
-        # Always append exactly one path argument: the existing relative_path when
-        # the user supplied a path, otherwise the literal "." so ripgrep searches the
-        # working directory (not stdin) when no path is given.
-        if relative_path is not None:
-            rg_args.append(relative_path)
-        else:
-            rg_args.append(".")
+        # Always append exactly one path argument, after a "--" terminator so a
+        # dash-leading directory name is read as a path: the existing
+        # relative_path when the user supplied a path, otherwise the literal "."
+        # so ripgrep searches the working directory (not stdin).
+        rg_args.extend(['--', relative_path if relative_path is not None else '.'])
 
         result = subprocess.run(
             rg_args,

@@ -281,6 +281,17 @@ SCENARIOS: list[dict] = [
         "inline": "edit_lines.py",
     },
     {
+        "name": "find_dash_query",
+        "description": (
+            "Dispatch-level check (no LLM): find passes its query to ripgrep as a "
+            "search term rather than a flag, so a dash-leading query "
+            "('--disable-voice', '-Wall') matches literally and fuzzily and a "
+            "dash-leading directory is accepted as the path; ordinary queries and "
+            "the no-match/0 result are unaffected."
+        ),
+        "inline": "find_dash_query.py",
+    },
+    {
         "name": "loop_guard_escalation",
         "description": (
             "End-to-end check (stub LLM, no network): a model that re-issues an "
