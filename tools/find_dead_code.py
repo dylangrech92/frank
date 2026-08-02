@@ -81,7 +81,7 @@ class FindDeadCode(Tool):
     )
     action = 'sweep for dead code'
     oversize_hint = 'narrow the scan to a subdirectory or a single file'
-    alternative = 'find_references for a single known symbol'
+    alternative = 'find_symbol with action="references" for a single known symbol'
     parameters: dict[str, Any] = {
         'type': 'object',
         'properties': {

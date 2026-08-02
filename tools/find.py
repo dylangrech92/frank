@@ -22,18 +22,20 @@ class Find(Tool):
     When *fuzzy* is true, *query* is split on whitespace and each part is matched
     as a case-insensitive literal with anything between the parts.
 
-    For symbol names use find_symbol; for usages of a known symbol use find_references.
+    For symbol names use find_symbol; for usages of a known symbol use
+    find_symbol with action="references".
     """
 
     name = 'find'
     description = (
         'Searches file CONTENTS across the project using ripgrep, returning matching '
         'lines with file and line number. Use find_files to search by filename/glob; '
-        'find_symbol for symbol names; find_references for usages of a known symbol.'
+        'find_symbol for symbol names, or find_symbol with action="references" '
+        'for usages of a known symbol.'
     )
     action = 'search'
     oversize_hint = 'narrow the query or pass path to limit the scope'
-    alternative = 'find_symbol (symbol names) or find_references (usages)'
+    alternative = 'find_symbol (symbol names, or action="references" for usages)'
     parallel_safe = True  # spawns its own ripgrep subprocess, reads only
     parameters: dict[str, Any] = {
         'type': 'object',

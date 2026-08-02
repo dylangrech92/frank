@@ -285,6 +285,22 @@ SCENARIOS: list[dict] = [
         "inline": "file_ops.py",
     },
     {
+        "name": "find_symbol_actions",
+        "description": (
+            "Dispatch-level check (no LLM, no language server): find_symbol's "
+            "action parameter routes each action to its own LSP method, sends "
+            "references' includeDeclaration under the key 'context' rather than "
+            "any other name, forwards the server's own 0-based position without "
+            "the -1 shift the deleted position-taking tools applied, reports a "
+            "missing symbol as an error for every action except search, refuses "
+            "an ambiguous name without issuing a request for an arbitrary "
+            "candidate, honours path as the disambiguator, rejects an unknown "
+            "action before any LSP traffic, and renders hover contents instead "
+            "of leaking the raw envelope."
+        ),
+        "inline": "find_symbol_actions.py",
+    },
+    {
         "name": "find_dash_query",
         "description": (
             "Dispatch-level check (no LLM): find passes its query to ripgrep as a "

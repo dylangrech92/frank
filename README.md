@@ -131,7 +131,7 @@ Run from inside the target project directory — the launch CWD becomes the sand
 Frank treats every IDE operation as an LLM-driveable tool. Every launch declares a mode — `research`, `code`, `qa`, `performance_debug`, or `verify` — and the LLM receives that mode's complete tool set with full schemas from turn 0. There is no discovery step and no way to load a tool outside the declared mode; each mode carries exactly the tools its task needs, which keeps context lean without making the model guess what's callable.
 
 **Tool categories:**
-- **Navigation**: `find_symbol`, `go_to_definition`, `find_references`, `call_hierarchy`, `hover`, `document_symbols`, `signature_help`
+- **Navigation**: `find_symbol` (name search, plus `action=` for definition / references / implementations / type_definition / hover), `call_hierarchy`, `document_symbols`
 - **Editing**: `write_file` (create/new or full overwrite), `edit_file` (targeted search/replace), `rename_symbol`, `code_actions`, `format`, `move_file`
 - **Terminal**: `run_command`, `read_output`, `stop_process`
 - **Testing**: `run_tests`, `verify_scratch`

@@ -37,7 +37,6 @@ _COMMON_TOOLS: tuple[str, ...] = (
     "find_files",
     "list_files",
     "find_symbol",
-    "find_references",
     "recall",
     "remember",
     "record",
@@ -52,12 +51,13 @@ You are operating in research mode.  Gather information about the codebase and
 report findings.  This is strictly read-only.
 
 Tools to use:
-- find_symbol to locate names, then go_to_definition / go_to_implementation /
-  find_references / call_hierarchy to trace how a symbol is used.
+- find_symbol to locate a name.  The same tool answers the follow-up question
+  about a symbol it found: action="definition" / "references" /
+  "implementations" / "type_definition" / "hover".
+- call_hierarchy to trace the calls into or out of a function.
 - find for content search, find_files for filename search.
 - read_file to inspect specific ranges once you have located a symbol.
-- hover for type/signature info, document_symbols for file outlines.
-- signature_help for parameter hints.
+- document_symbols for file outlines.
 - lint, find_dead_code, and get_diagnostics for read-only reports on style
   issues, unreachable code, and compiler/LSP diagnostics.
 - spawn_agents to fan out independent research questions concurrently.
@@ -208,8 +208,7 @@ Tools to use:
   themselves (installing dependencies, checking a process is up) — use
   background=true for long-running commands, with read_output and
   stop_process as its companions to poll output and terminate it.
-- read_file / find_symbol / find_references to read the code behind every
-  hotspot before you explain it.
+- read_file / find_symbol to read the code behind every hotspot before you explain it.
 
 Constraints:
 - DO NOT modify project files.  Profiled code may itself write files — the
@@ -230,13 +229,8 @@ MODES: dict[str, Mode] = {
         name="research",
         instructions=RESEARCH_MODE,
         tools=_COMMON_TOOLS + (
-            "hover",
             "document_symbols",
-            "signature_help",
             "call_hierarchy",
-            "go_to_definition",
-            "go_to_implementation",
-            "go_to_type_definition",
             "get_diagnostics",
             "lint",
             "find_dead_code",
@@ -249,13 +243,8 @@ MODES: dict[str, Mode] = {
         name="code",
         instructions=CODE_MODE,
         tools=_COMMON_TOOLS + (
-            "hover",
             "document_symbols",
-            "signature_help",
             "call_hierarchy",
-            "go_to_definition",
-            "go_to_implementation",
-            "go_to_type_definition",
             "get_diagnostics",
             "lint",
             "find_dead_code",
@@ -279,13 +268,8 @@ MODES: dict[str, Mode] = {
         name="qa",
         instructions=QA_MODE,
         tools=_COMMON_TOOLS + (
-            "hover",
             "document_symbols",
-            "signature_help",
             "call_hierarchy",
-            "go_to_definition",
-            "go_to_implementation",
-            "go_to_type_definition",
             "get_diagnostics",
             "lint",
             "run_tests",
@@ -305,10 +289,8 @@ MODES: dict[str, Mode] = {
         name="performance_debug",
         instructions=PERFORMANCE_DEBUG_MODE,
         tools=_COMMON_TOOLS + (
-            "hover",
             "document_symbols",
             "call_hierarchy",
-            "go_to_definition",
             "profile_command",
             "profile_hotspots",
             "profile_memory",
