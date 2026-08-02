@@ -4,10 +4,11 @@ The leading underscore keeps this module out of tool discovery by the registry.
 ``update_file``, ``replace_one``, ``replace_many`` and ``edit_lines`` all have
 to resolve a path under the project root, reject non-files, refuse to write
 against a stale or never-read view of a file, and — after a successful write —
-re-stamp the read registry and emit exactly one mutation event.  Centralizing
-that surface here keeps the four tools byte-identical on their error codes,
-hints, and the record_read/emit_mutation ordering, instead of each maintaining
-its own copy.
+re-stamp the read registry and emit exactly one mutation event.  ``delete_file``
+shares the freshness gate alone: a delete has nothing to re-stamp, and it also
+accepts directories, which carry no read stamp.  Centralizing that surface here
+keeps the tools byte-identical on their error codes, hints, and the
+record_read/emit_mutation ordering, instead of each maintaining its own copy.
 
 Exports
 -------
@@ -71,7 +72,7 @@ def freshness_gate(resolved: Path, raw_path: str) -> ToolResult | None:
     freshness = check_fresh(resolved)
     if freshness == 'stale':
         return ToolResult.err(
-            f'{raw_path} changed on disk after you last read it — another process may have modified it.',
+            f'{raw_path} changed on disk after you last read it — by your own last edit or another process.',
             code='file-changed-on-disk',
             hint='Re-read the file with read_file, then re-apply your edit against the current content.',
         )

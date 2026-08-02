@@ -19,7 +19,9 @@ project, and asserts its load-bearing properties without any live LLM:
         numbers even when paging with start_line.
     (g) a length-changing edit does not re-stamp the read registry (a second
         line-anchored edit against shifted numbering is refused until re-read,
-        and the success body says so), while same-length edits chain freely.
+        the success body says so, and the refusal does not blame an unnamed
+        other process for this session's own edit), while same-length edits
+        chain freely.
 
 Exits 0 on success, 1 on any assertion failure. Runs with the repo root on
 ``sys.path`` (evals/run.py inserts it before exec'ing this file); all file work
@@ -220,6 +222,12 @@ def _run_checks(dispatch, root: Path, check) -> None:  # type: ignore[no-untyped
         res.status == 'error' and res.code == 'file-changed-on-disk',
         'second line-anchored edit after a length-changing one must be refused '
         f'until re-read, got status={res.status!r} code={res.code!r}',
+    )
+    # This session is the only writer, so blaming an unnamed other process sends
+    # the model hunting a phantom instead of re-reading (observed in the wild).
+    check(
+        'another process may have modified it' not in str(res.body),
+        f'self-inflicted shift must not be blamed on another process: {res.body!r}',
     )
     dispatch('read_file', {'path': 'shift.py'})
     res = dispatch('edit_lines', {'path': 'shift.py', 'start_line': 4, 'end_line': 4, 'new_text': 'C'})
