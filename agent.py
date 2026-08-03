@@ -117,8 +117,32 @@ from tools import _sandbox
 _sandbox.subscribe_mutations(_mutate_tracker)
 
 
-def diagnostics_inject_summary(session: Session) -> None:
-    """After a tool-mutation turn, append the LSP diagnostics summary via session.
+def diagnostics_snapshot():
+    """Capture the diagnostics baseline for a round, before any call dispatches.
+
+    The counterpart to ``_lint_pre_snapshot``: whatever the language servers had
+    already reported at this moment is pre-existing project noise, and only what
+    appears *after* it belongs to this round's edits. Taken before dispatch
+    rather than per-mutation because a file the model never touched can still be
+    broken by an edit elsewhere, and that has to stay visible.
+
+    Returns:
+        A multiset from ``STORE.snapshot_issues``, or ``None`` when the store is
+        unreachable -- which ``diagnostics_inject_summary`` treats as "nothing to
+        compare against", suppressing injection entirely rather than falling back
+        to an unattributable project-wide total.
+    """
+    try:
+        from diagnostics import STORE
+
+        return STORE.snapshot_issues()
+    except Exception as exc:  # noqa: E722
+        print(f"diagnostics-snapshot-error: {exc}", file=sys.stderr, flush=True)
+        return None
+
+
+def diagnostics_inject_summary(session: Session, baseline) -> None:
+    """After a tool-mutation turn, append the LSP diagnostics delta via session.
 
     Imports are performed lazily inside the function to avoid circular module
     imports at load time.
@@ -131,23 +155,29 @@ def diagnostics_inject_summary(session: Session) -> None:
             Collect all such URIs.
         3.  Poll STORE until every collected URI has appeared in the diagnostics
             store, up to a 2-second deadline.
-        4.  Call ``STORE.summary()`` and, when non-None, append the formatted
-            string to the last tool-result message via
+        4.  Call ``STORE.summary(baseline)`` and, when non-None, append the
+            formatted string to the last tool-result message via
             ``session.amend_last_tool_result``.
 
     Args:
         session: Active ``Session`` holding the conversation transcript.
+        baseline: This round's pre-dispatch snapshot from
+            ``diagnostics_snapshot``. ``None`` suppresses injection.
     """
+    # Drain first and unconditionally: these events belong to the round that just
+    # ended, so carrying them into the next one would attribute this round's
+    # mutations to the next round's calls. Every early return below happens after
+    # the list is already clear.
+    events = list(_TURN_MUTATIONS)
+    _TURN_MUTATIONS.clear()
+
+    if not events or baseline is None:
+        return
+
     try:
         from diagnostics import STORE
         from lsp.manager import path_to_uri
         import main as main_module
-
-        events = list(_TURN_MUTATIONS)
-        _TURN_MUTATIONS.clear()
-
-        if not events:
-            return
 
         manager = main_module.MANAGER
         seen_uris: set[str] = set()
@@ -181,7 +211,7 @@ def diagnostics_inject_summary(session: Session) -> None:
         if filtered_uris:
             STORE.wait_for_publish(filtered_uris, baselines, 2.0)
 
-        s = STORE.summary()
+        s = STORE.summary(baseline)
         if s is not None:
             session.amend_last_tool_result(s)
 
@@ -419,8 +449,10 @@ def _dispatch_round(
     per-call guards: loop-guard hard cap, reactive lint-delta, and H1/H5/S4
     mutation tracking), runs the shared rendered-result pipeline on each result
     (oversize-result guard, loop-guard / repeat-call / web-search-focus steers,
-    reactive lint-delta suffix), appends each to the transcript, then injects the
-    LSP diagnostics summary.
+    reactive lint-delta suffix), appends each to the transcript, then injects any
+    LSP diagnostics this round introduced (a delta against a pre-dispatch
+    snapshot, so pre-existing project diagnostics are never reported as if this
+    round had caused them).
 
     The round is itself bounded: once ``state.blocked_streak`` reaches
     ``_BLOCKED_STREAK_CAP`` mid-batch, the remaining calls are never dispatched —
@@ -441,6 +473,10 @@ def _dispatch_round(
     the reported problem before it keeps editing on assumption.
     """
     calls = response.tool_calls
+    # Diagnostics delta pre-image: whatever the language servers have already
+    # reported BEFORE this round dispatches is pre-existing project noise, and
+    # only what appears after it is attributable to these calls.
+    diag_baseline = diagnostics_snapshot()
     # Intermediate assistant text on a tool-call iteration that did NOT stream
     # is still worth surfacing; streamed text already reached the sink.
     if on_delta is not None and response.text:
@@ -580,7 +616,7 @@ def _dispatch_round(
         if image_path:
             pending_images.append((str(image_path), call.id))
 
-    diagnostics_inject_summary(session)
+    diagnostics_inject_summary(session, diag_baseline)
 
     for image_path, call_id in pending_images:
         _attach_screenshot(session, image_path, call_id)

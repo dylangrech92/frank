@@ -312,6 +312,18 @@ SCENARIOS: list[dict] = [
         "inline": "find_dash_query.py",
     },
     {
+        "name": "diagnostics_delta",
+        "description": (
+            "Store-level check (no LLM): the LSP diagnostics injected after a "
+            "mutation round are a delta against a pre-dispatch snapshot, so a "
+            "clean edit against a project full of pre-existing diagnostics "
+            "appends nothing, while a diagnostic the round actually introduced "
+            "is counted alone and its file named -- including breakage in a file "
+            "the round never edited."
+        ),
+        "inline": "diagnostics_delta.py",
+    },
+    {
         "name": "loop_guard_escalation",
         "description": (
             "End-to-end check (stub LLM, no network): a model that re-issues an "
