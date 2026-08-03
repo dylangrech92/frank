@@ -46,7 +46,15 @@ STEER_PREFIX = (
 # many shots — so older ones degrade to a text line naming where the file was
 # saved, which is what the model needs to cite it as evidence anyway. Applies to
 # the ASSEMBLED view only; the message list itself is never rewritten.
-MAX_IMAGES = 3
+#
+# This is ONE, not a tunable budget: the llama.cpp server this project targets
+# rejects any prompt carrying more than one image outright — "At most 1 image(s)
+# may be provided in one prompt", HTTP 400. llm.py retries 5xx only, so that 400
+# is fatal and kills the run on the SECOND screenshot of any verify session.
+# One image is the value every OpenAI-compatible backend accepts, so raising
+# this trades a working verify mode for a capability no recorded run has needed.
+# Raise it only alongside a backend that is known to accept the higher count.
+MAX_IMAGES = 1
 
 # Placeholder that replaces a pruned screenshot's image data. Names the path so
 # the model can still cite the artifact it saw earlier in the run.

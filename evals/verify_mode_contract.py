@@ -449,6 +449,31 @@ def check_screenshot_transcript_and_context() -> list[str]:
                 f"assembled context; MAX_IMAGES is {session_mod.MAX_IMAGES} — "
                 f"the pruner is not reached by assemble_context"
             )
+
+        # The BACKEND ceiling, counted on the wire the way the server counts it:
+        # image parts, not messages carrying them. This is deliberately a hard 1
+        # rather than MAX_IMAGES — the check above only proves the pruner ran,
+        # and it passed for the whole time MAX_IMAGES was 3, while the llama.cpp
+        # server rejected every prompt past the first image ("At most 1 image(s)
+        # may be provided in one prompt", HTTP 400, not retried) and killed the
+        # run on the second screenshot. A bound checked against the constant it
+        # is bounding cannot catch that; only a fact from outside can.
+        wire_images = sum(
+            1
+            for m in to_wire_messages(assembled)
+            if isinstance(m.get("content"), list)
+            for p in m["content"]
+            if isinstance(p, dict) and p.get("type") == "image_url"
+        )
+        if wire_images > 1:
+            failures.append(
+                f"the wire payload carries {wire_images} image parts after "
+                f"{ATTACHED} screenshots; every OpenAI-compatible backend this "
+                f"project targets accepts at most 1 per prompt, so this request "
+                f"would 400 and end the run. If a backend that accepts more is "
+                f"now in use, raise MAX_IMAGES and this bound together."
+            )
+
         placeholders = [
             m for m in assembled if isinstance(m.get("content"), str) and "pruned" in m["content"]
         ]
