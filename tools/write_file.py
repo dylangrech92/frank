@@ -85,7 +85,7 @@ class WriteFile(Tool):
             if stale_error is not None:
                 return stale_error
 
-            # Guard against a destructive partial-edit (TKT-1468): the model
+            # Guard against a destructive partial-edit: the model
             # sometimes calls write_file (a full overwrite) with only a code
             # snippet when it means to make a small edit, silently destroying a
             # large working file. Refuse when the new content is a tiny fraction
