@@ -852,7 +852,9 @@ def handle_user_message(
         if not response.tool_calls:
             _maybe_graph_memory_nudge(session, state)
 
-        session.append_assistant(response.text or "", tool_calls=tool_calls)
+        session.append_assistant(
+            response.text or "", tool_calls=tool_calls, reasoning=response.reasoning
+        )
 
         if not response.tool_calls:
             # No-tool-call gate cascade: bounce (empty-answer / H1) → loop again,

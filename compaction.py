@@ -61,15 +61,19 @@ def _serialize_for_estimate(
     """Flatten messages and tool schemas into one text blob for counting.
 
     Everything that occupies real context is included: each message's role and
-    content, any native ``tool_calls`` (name + arguments), tool-result linkage
-    fields, and the full JSON of every tool schema. Non-string content is
-    JSON-encoded so structured payloads are counted, not skipped.
+    content, any resent ``reasoning`` trace, any native ``tool_calls`` (name +
+    arguments), tool-result linkage fields, and the full JSON of every tool
+    schema. Non-string content is JSON-encoded so structured payloads are
+    counted, not skipped.
     """
     parts: List[str] = []
 
     for m in messages:
         parts.append(str(m.get("role", "")))
         parts.append(_flatten_content(m.get("content", "")))
+        reasoning = m.get("reasoning")
+        if reasoning:
+            parts.append(str(reasoning))
         name = m.get("name")
         if name:
             parts.append(str(name))

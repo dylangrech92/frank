@@ -150,12 +150,16 @@ class ChatResponse:
             provider reports it; ``None`` when absent (estimate-only fallback).
         completion_tokens: ``usage.completion_tokens`` from the response when
             the provider reports it; ``None`` when absent.
+        reasoning: Concatenated reasoning trace deltas from the model (when the
+            provider emits them, e.g. vLLM 0.26+); empty string when the model
+            sent none.
     """
 
     text: str = ""
     tool_calls: List[ToolCall] = field(default_factory=list)
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    reasoning: str = ""
 
 
 def _strip_outer_braces(args_str: str) -> str:
@@ -323,6 +327,7 @@ def _read_sse_response(
             ``_WALL_CLOCK_CEILING_SECONDS`` while the stream is still trickling.
     """
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     calls_by_index: dict[int, dict[str, Any]] = {}
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
@@ -367,6 +372,10 @@ def _read_sse_response(
             except Exception:
                 pass
 
+        reasoning_piece = delta.get("reasoning")
+        if reasoning_piece:
+            reasoning_parts.append(reasoning_piece)
+
         for frag in delta.get("tool_calls") or []:
             idx = frag.get("index", 0)
             slot = calls_by_index.setdefault(
@@ -392,6 +401,7 @@ def _read_sse_response(
         tool_calls=tool_calls,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        reasoning="".join(reasoning_parts),
     )
 
 
@@ -650,4 +660,5 @@ class LLMClient:
                 tool_calls=tool_calls,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                reasoning=message.get("reasoning", "") or "",
             )

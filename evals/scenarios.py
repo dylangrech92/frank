@@ -622,6 +622,23 @@ SCENARIOS: list[dict] = [
         ),
         "inline": "vision_provider_contract.py",
     },
+    {
+        "name": "llm_reasoning_roundtrip",
+        "description": (
+            "End-to-end check (real local chat-completions stub, chunked SSE, "
+            "no LLM): reasoning-trace capture and resend. Streamed "
+            "delta.reasoning pieces accumulate into ChatResponse.reasoning "
+            "without ever reaching on_delta; non-streaming message.reasoning "
+            "lands in the same field ('' when absent). Driving the real turn "
+            "loop against the recording stub: a tool_calls-bearing assistant "
+            "row carries its round's exact trace under 'reasoning' on the next "
+            "request (the field name the backend accepts inbound), a completed "
+            "turn's final answer keeps its trace across turns after history "
+            "pruning, and a reasoning-free round adds no 'reasoning' key at "
+            "all."
+        ),
+        "inline": "llm_reasoning_roundtrip.py",
+    },
 ]
 
 

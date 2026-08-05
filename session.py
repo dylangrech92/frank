@@ -389,15 +389,27 @@ class Session:
         })
         self._persist()
 
-    def append_assistant(self, text: str, tool_calls: List[ToolCall] | None = None) -> None:
+    def append_assistant(
+        self,
+        text: str,
+        tool_calls: List[ToolCall] | None = None,
+        reasoning: str | None = None,
+    ) -> None:
         """Append an assistant message and persist.
 
         Args:
             text: The assistant's textual content.
             tool_calls: Optional list of parsed ``ToolCall`` objects. When non-empty
                 the native OpenAI tool_calls key is added to the message dict.
+            reasoning: Optional reasoning trace the model emitted this round. When
+                non-empty it is stored under the ``reasoning`` key — the inbound
+                field name vLLM accepts — so the serving side's preserve_thinking
+                template can re-render it on later requests.
         """
         entry: Dict[str, Any] = {"role": "assistant", "content": text}
+
+        if reasoning:
+            entry["reasoning"] = reasoning
 
         if tool_calls:
             entry["tool_calls"] = [
