@@ -466,6 +466,24 @@ SCENARIOS: list[dict] = [
         "inline": "llm_wall_clock.py",
     },
     {
+        "name": "llm_stream_stall",
+        "description": (
+            "End-to-end check (real local sockets + stub turn loop, no LLM): "
+            "recovery from an SSE stream that stalls or dies mid-drain — the "
+            "failure shape _request_with_retry cannot reach because its loop "
+            "ends at the 2xx. Against a real stalling HTTP server: a stall "
+            "before the first token is retried once inside chat() (announced "
+            "on stderr, bounded, exactly-once on_delta preserved); a death "
+            "after text has been forwarded raises the typed StreamStalledError "
+            "with no client-side replay. Driving the real turn loop with a "
+            "scripted stub: the turn re-issues the stalled call and completes "
+            "with the real answer, and a perpetually stalling backend "
+            "propagates the error after exactly 1 + _MAX_STREAM_STALL_RETRIES "
+            "calls."
+        ),
+        "inline": "llm_stream_stall.py",
+    },
+    {
         "name": "verify_tool_wiring",
         "description": (
             "End-to-end check (stub LLM, no network): every steer the harness "
@@ -578,6 +596,26 @@ SCENARIOS: list[dict] = [
             "registry.dispatch naming both its violations at once."
         ),
         "inline": "argument_validation.py",
+    },
+    {
+        "name": "vision_provider_contract",
+        "description": (
+            "End-to-end check (two real local chat-completions stubs, no LLM): "
+            "the optional 'vision' provider block. A config without it parses to "
+            "vision=None while one with it parses both providers independently, "
+            "and the shared validator names 'vision.<key>' when a required key is "
+            "missing. With the block configured, a captured screenshot produces "
+            "exactly ONE toolless request to the vision endpoint carrying the "
+            "real PNG's bytes, the transcript gets a text row naming the saved "
+            "path (without moving the turn boundary), the call is billed to the "
+            "session's usage totals, and a real turn afterwards puts zero image "
+            "parts on the MAIN endpoint's wire while carrying the description. "
+            "Without the block the vision endpoint is never called and the image "
+            "reaches the main provider exactly as before. Every vision failure — "
+            "unreachable endpoint, empty description — appends a row stating the "
+            "image is NOT attached instead of falling back to pixels."
+        ),
+        "inline": "vision_provider_contract.py",
     },
 ]
 

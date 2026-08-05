@@ -342,6 +342,36 @@ class Session:
         self._image_refs.append(_ImageRef(index=len(self._messages) - 1, path=image_path))
         self._persist()
 
+    def append_screenshot_description(self, image_path: str, description: str) -> None:
+        """Append a screenshot's TEXT description — no pixels — naming its path.
+
+        What a configured vision provider produces instead of an attachment (see
+        ``agent._attach_screenshot``): the image never reaches the main model, so
+        this row carries prose only. The path is named because the description is
+        the model's evidence and it must be able to cite where the artifact was
+        saved.
+
+        Carries the same ``screenshot`` flag as a real attachment for the same
+        reason — it is a user-role row produced by a tool call MID-turn, not a
+        turn start, and the pruner's boundary scan would otherwise fold away the
+        tool scaffolding of the very run that took the screenshot. It is NOT
+        registered in ``_image_refs``: there is no image data to prune, so it
+        must never be counted against the image budget.
+
+        Args:
+            image_path: Absolute path to the PNG saved by the screenshot tool.
+            description: The vision provider's description of that image.
+        """
+        self._messages.append({
+            "role": "user",
+            "content": (
+                f"[screenshot saved at {image_path} — description from the vision "
+                f"model; the image itself is not attached]\n{description}"
+            ),
+            "screenshot": True,
+        })
+        self._persist()
+
     def append_assistant(self, text: str, tool_calls: List[ToolCall] | None = None) -> None:
         """Append an assistant message and persist.
 

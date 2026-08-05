@@ -406,18 +406,121 @@ def _dispatch_sequential_call(
     return result, lint_suffix
 
 
+# What the vision provider is asked for: a description a text-only coding agent
+# can verify a page against. Facts only — an invented button or an imagined error
+# is worse than no description at all, because the main model cannot tell the two
+# apart and will report the invention as evidence.
+_VISION_DESCRIBE_PROMPT = (
+    "You are describing a screenshot for a coding agent that is verifying a web "
+    "page and cannot see images. Report only what is actually visible, as fact. "
+    "Never speculate about intent, about what is off-screen, or about what the "
+    "page is supposed to look like. Cover, in this order: every piece of visible "
+    "text (verbatim wherever it is legible); the layout structure (regions, "
+    "navigation, forms, tables, buttons and the order they appear in); colours "
+    "and styling anomalies (overlapping or clipped elements, unreadable "
+    "contrast, broken alignment, unstyled content); any error message, warning, "
+    "dialog, modal or overlay, quoted exactly; and anything still loading, "
+    "empty, or rendered broken (spinners, skeletons, missing-image "
+    "placeholders). If the page is blank or shows only an error, say exactly "
+    "that and nothing more."
+)
+
+
+def _vision_client() -> LLMClient | None:
+    """Build a client for the optional ``vision`` provider, or None if unconfigured.
+
+    Rebuilt from this process's config rather than threaded down from main.py —
+    the same construction ``memory/explorer._default_client`` already does, off
+    the same ``CODING_AGENT_CONFIG`` env var main.py exports. That keeps every
+    entry point (REPL, one-shot, MCP-spawned child, subagent) on one code path
+    instead of only whichever ones remembered to pass the client along, at the
+    cost of one small JSON read per screenshot — a rounding error next to the
+    provider call it precedes.
+
+    A config that cannot be read or parsed means no vision provider is
+    configured, which is the pre-existing behaviour: images go to the main
+    provider untouched.
+    """
+    import os
+
+    from config import load as config_load
+
+    try:
+        cfg = config_load(os.environ.get("CODING_AGENT_CONFIG", "config.json"))
+    except (OSError, ValueError):
+        return None
+    if cfg.vision is None:
+        return None
+    return LLMClient(cfg.vision)
+
+
+def _describe_screenshot(
+    session: Session, client: LLMClient, data_uri: str, label: str
+) -> str | None:
+    """Ask the vision provider to describe one image; return its text or None.
+
+    A single-shot call: no tools, no history, no streaming — the same
+    out-of-band shape the compaction summarizer uses, and for the same reason
+    (this is not a turn, it is one question with one answer). The image goes to
+    THIS provider and nowhere else.
+
+    Returns None on any failure, including an empty description: a reasoning
+    model that emits only hidden reasoning and no content is a known trap, and
+    an empty string spliced into the transcript would read as "the screenshot
+    showed nothing" rather than "the description failed".
+    """
+    request = [
+        {"role": "system", "content": _VISION_DESCRIBE_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"{label}. Describe this screenshot."},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        },
+    ]
+    try:
+        response = client.chat(request, None)
+    except Exception as exc:
+        print(
+            ui.telemetry(f"vision: describe call failed ({type(exc).__name__}: {exc})"),
+            file=sys.stderr,
+        )
+        return None
+
+    # A billed call, whether or not it produced anything usable — count it the
+    # same way compaction counts its summarizer call, with zero tool calls.
+    session.record_llm_call(response.prompt_tokens, response.completion_tokens, 0)
+
+    description = (response.text or "").strip()
+    if not description:
+        print(
+            ui.telemetry("vision: describe call returned an empty description"),
+            file=sys.stderr,
+        )
+        return None
+    return description
+
+
 def _attach_screenshot(session: Session, image_path: str, call_id: str) -> None:
-    """Read a captured PNG and attach it to the transcript as a vision message.
+    """Turn a captured PNG into transcript content, at the one seam that owns it.
 
     The screenshot tool saves a file and reports its path in ``meta.image_path``;
-    turning that path into model-visible pixels happens here, at the one seam
-    that already owns appending to the transcript.
+    what that path becomes for the model is decided here, and the decision is the
+    ``vision`` config block:
 
-    A read failure is reported to the model instead of raising: the run is
-    mid-verification, the tool result already said a screenshot was captured, and
-    silently continuing would leave the model believing it can see an image it
-    never received. The message names the path so the discrepancy is legible in
-    the transcript rather than inferred from a missing row.
+    * **No vision provider** — the image is attached as pixels on a user-role
+      message and the main model sees it, exactly as before this block existed.
+    * **A vision provider** — the image is sent to THAT provider alone, in one
+      no-tools, no-history call, and only the returned TEXT is spliced into the
+      transcript (naming the saved path, so the description stays citable as
+      evidence). The main model drives the whole loop and never receives pixels,
+      which is what makes a text-only main model usable in verify mode.
+
+    Every failure — an unreadable file, a provider error, an empty description —
+    ends at the same place: a loud row telling the model the image is NOT
+    attached and NOT described. The one thing this must never do is let the model
+    believe it saw an image it never received.
     """
     try:
         data = Path(image_path).read_bytes()
@@ -430,9 +533,31 @@ def _attach_screenshot(session: Session, image_path: str, call_id: str) -> None:
         return
 
     data_uri = "data:image/png;base64," + base64.b64encode(data).decode("ascii")
-    session.append_screenshot(
-        image_path, data_uri, label=f"Screenshot for tool call {call_id}"
+    label = f"Screenshot for tool call {call_id}"
+
+    vision = _vision_client()
+    if vision is None:
+        session.append_screenshot(image_path, data_uri, label=label)
+        return
+
+    description = _describe_screenshot(session, vision, data_uri, label)
+    if description is None:
+        session.append_user(
+            f"[screenshot at {image_path} was captured but is NOT attached and "
+            f"could NOT be described: the vision provider returned no usable "
+            f"description. Do not describe its contents — capture it again or "
+            f"use a different signal.]"
+        )
+        return
+
+    print(
+        ui.telemetry(
+            f"vision: {image_path} described in {len(description)} char(s); the "
+            f"image was not attached"
+        ),
+        file=sys.stderr,
     )
+    session.append_screenshot_description(image_path, description)
 
 
 def _dispatch_round(

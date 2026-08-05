@@ -5,6 +5,13 @@
     "model": "your-model-name",
     "context_limit": 128000
   },
+  "_vision": {
+    "_comment": "Optional second provider, disabled while this key is named '_vision' — rename it to 'vision' to enable. With it, a screenshot taken in verify mode is sent to THIS endpoint alone and only its text description reaches the main model, so a text-only main model can still verify a page. Same keys as 'llm'.",
+    "base_url": "http://vision-host:8000/v1",
+    "api_key": "your-api-key-here",
+    "model": "your-vision-model-name",
+    "context_limit": 16000
+  },
   "git": {
     "allow_destructive": false
   },
