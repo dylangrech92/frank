@@ -1,0 +1,67 @@
+Method: `tracemalloc`, replaying `generate_events -> parse_events ->
+mark_duplicates` unchanged (identical to the real pipeline), then snapshotting
+immediately before and after the enrichment stage only
+(`enrich_events(events, cache)`), so the reported peak/growth is
+attributable to enrichment/caching specifically, not to data generation.
+Also computed: a deep-ish shallow-plus-one-level size of the cache dict
+itself (dict container + every key string + every value dict + every
+value dict's contents) via `sys.getsizeof`, as an allocator-independent
+cross-check on the tracemalloc numbers.
+
+=== scale 1 (3,200 records) ===
+cache_entries=3114 distinct_user_agents=3114 cache_hit_rate=0.0269
+enrich-stage traced current=1743032 peak=1773588 (bytes)
+cache container deep-ish size = 3674448 bytes (3588.3 KiB)
+total new-allocation growth attributed across all frames during enrich_events: 1743096 bytes (1702.2 KiB)
+top growth lines:
+  grind/enrich.py:22 (json.loads inside build_profile):        +827 KiB, +6228 objects
+  json/decoder.py:354 (raw_decode, stdlib, same call site):    +647 KiB, +14116 objects
+  grind/enrich.py:26 (experiments tuple() construction):       +126 KiB, +2297 objects
+  grind/enrich.py:41 (the enriched dict list itself):          +101 KiB, +1 object
+
+=== scale 5 (16,000 records) ===
+cache_entries=15568 distinct_user_agents=15568 cache_hit_rate=0.0270
+enrich-stage traced current=8610941 peak=8751950 (bytes)
+cache container deep-ish size = 18272220 bytes (17844.0 KiB)
+total new-allocation growth: 8611005 bytes (8409.2 KiB)
+top growth lines:
+  grind/enrich.py:22:      +4135 KiB, +31136 objects
+  json/decoder.py:354:     +3222 KiB, +70451 objects
+  grind/enrich.py:26:      +645 KiB,  +11781 objects
+  grind/enrich.py:41:      +405 KiB,  +1 object
+
+=== scale 10 (32,000 records) ===
+cache_entries=31134 distinct_user_agents=31134 cache_hit_rate=0.0271
+enrich-stage traced current=17303650 peak=17585784 (bytes)
+cache container deep-ish size = 36667459 bytes (35808.1 KiB)
+total new-allocation growth: 17303714 bytes (16898.2 KiB)
+top growth lines:
+  grind/enrich.py:22:      +8270 KiB, +62268 objects
+  json/decoder.py:354:     +6411 KiB, +140216 objects
+  grind/enrich.py:26:      +1278 KiB, +23357 objects
+  grind/enrich.py:41:      +939 KiB,  +1 object
+
+=== scale 20 (64,000 records) ===
+cache_entries=62266 distinct_user_agents=62266 cache_hit_rate=0.0271
+enrich-stage traced current=34610688 peak=35178279 (bytes)
+cache container deep-ish size = 73339006 bytes (71620.1 KiB)
+total new-allocation growth: 34610752 bytes (33799.6 KiB)
+top growth lines:
+  grind/enrich.py:22:      +16.2 MiB, +124532 objects
+  json/decoder.py:354:     +12.5 MiB, +280471 objects
+  grind/enrich.py:26:      +2560 KiB,  +46801 objects
+  grind/enrich.py:41:      +1877 KiB,  +1 object
+
+=== summary: linear, unbounded growth ===
+scale        1x         5x          10x         20x
+records      3,200      16,000      32,000      64,000
+cache entries 3,114     15,568      31,134      62,266    (ratio: 1.00 / 5.00 / 10.00 / 19.99)
+peak bytes   1,773,588  8,751,950   17,585,784  35,178,279 (ratio: 1.00 / 4.93 / 9.92 / 19.83)
+hit rate     2.69%      2.70%       2.71%       2.71%      (constant -- a structural property
+                                                              of the key, not scale-dependent)
+
+Cache entries and peak memory both scale ~1:1 with input size (record
+count), confirming unbounded growth with no cap or eviction. The hit rate
+staying flat at ~2.7% across a 20x range in scale rules out "it just needs
+more warm-up" -- the near-total miss rate is baked into how the key is
+constructed, not a transient cold-cache effect.

@@ -1,0 +1,4 @@
+account_id,name,currency,tz_name,opening_balance,expected_closing_balance
+ACC1001,Operating Account,USD,America/New_York,1000.00,999.70
+ACC1002,Payroll Account,USD,America/New_York,5000.00,5005.00
+ACC1003,Operating Account,EUR,America/Los_Angeles,200.00,165.00

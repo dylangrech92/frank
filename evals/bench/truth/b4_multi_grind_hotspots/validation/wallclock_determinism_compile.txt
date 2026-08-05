@@ -1,0 +1,35 @@
+=== wall-clock (unprofiled, `time python3 workload.py --scale N`) ===
+scale 1:  0.25s user 0.01s system 96% cpu 0.271 total   (budget: well under 30s)
+scale 10: 5.58s user 0.19s system 99% cpu 5.804 total   (budget: well under 5min)
+
+=== determinism (byte-for-byte identical output across repeated runs) ===
+Two independent `workload.py --scale 1` runs:
+  diff run_a.json run_b.json -> no output (files identical)
+  sha256(run_a.json) = 0b7eb57a1e98c36ea4648e34f05dd0c9de61ee5d232a567f0bcc99b117753687
+  sha256(run_b.json) = 0b7eb57a1e98c36ea4648e34f05dd0c9de61ee5d232a567f0bcc99b117753687
+  -> IDENTICAL
+
+Two independent `workload.py --scale 3` runs (non-trivial scale, exercises
+the every-37th-record duplicate injection loop multiple times):
+  diff run_c.json run_d.json -> no output (files identical)
+  sha256(run_c.json) = 5cef53fe3e0b4aa4759dff26e57f7f84c1c11f35cb400481deca7999cd714cc6
+  sha256(run_d.json) = 5cef53fe3e0b4aa4759dff26e57f7f84c1c11f35cb400481deca7999cd714cc6
+  -> IDENTICAL
+
+No wall-clock/env/filesystem dependence: generation is driven entirely by
+`random.Random(config.SEED_BASE ^ (scale * 0x1000003))`.
+
+=== compile check ===
+`python3 -m py_compile workload.py grind/*.py` -> exit 0, no output (all
+modules compile under Python 3.12).
+
+Sample scale-1 report shape (first bytes of stdout, for reference):
+{
+  "records_parsed": 3200,
+  "records_rejected": 0,
+  "duplicates_flagged": 86,
+  "profile_cache_entries": 3114,
+  "regions": [
+    {
+      "region": "us-east",
+      ...

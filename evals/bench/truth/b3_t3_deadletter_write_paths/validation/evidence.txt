@@ -1,0 +1,272 @@
+=== FACT GROUNDING: the 3 real write_dead_letter call sites ===
+main.py:78:    deadletter.write_dead_letter(event, ManualQuarantineError("quarantined by operator"))
+relay/pipeline/orchestrator.py:105:                deadletter.write_dead_letter(event, exc)
+relay/pipeline/scheduler.py:86:            deadletter.write_dead_letter(item.event, error)
+
+=== FACT GROUNDING: deadletter.py -- the only function that actually opens/writes the file ===
+     1	"""Persists permanently-failed events to the dead-letter file, and lets
+     2	an operator read them back for a manual replay."""
+     3	from __future__ import annotations
+     4	
+     5	import json
+     6	import time
+     7	from pathlib import Path
+     8	from typing import Iterator
+     9	
+    10	from relay import config
+    11	from relay.sinks import log_sink
+    12	
+    13	
+    14	def write_dead_letter(event, error: Exception) -> None:
+    15	    """Append a JSON record describing `event`'s permanent failure to
+    16	    `config.DEAD_LETTER_PATH`, and emit a matching log line."""
+    17	    record = {
+    18	        "event_id": event.event_id,
+    19	        "payload": event.payload,
+    20	        "attempts": event.attempts,
+    21	        "error_type": type(error).__name__,
+    22	        "error": str(error),
+    23	        "dead_lettered_at": time.time(),
+    24	    }
+    25	    with open(config.DEAD_LETTER_PATH, "a", encoding="utf-8") as fh:
+    26	        fh.write(json.dumps(record) + "\n")
+    27	    log_sink.log_dead_lettered(event, error)
+    28	
+    29	
+    30	def read_dead_letters(path: str | Path | None = None) -> Iterator[dict]:
+    31	    """Yield every record in the dead-letter file, oldest first.
+    32	
+    33	    Returns an empty iterator if the file does not exist yet - a demo
+    34	    run with nothing dead-lettered shouldn't need special-casing by
+    35	    every caller.
+    36	    """
+    37	    dead_letter_path = Path(path) if path else Path(config.DEAD_LETTER_PATH)
+    38	    if not dead_letter_path.exists():
+    39	        return
+    40	    with open(dead_letter_path, encoding="utf-8") as fh:
+    41	        for line in fh:
+    42	            line = line.strip()
+    43	            if line:
+    44	                yield json.loads(line)
+    45	
+    46	
+    47	def count_dead_letters(path: str | Path | None = None) -> int:
+    48	    return sum(1 for _ in read_dead_letters(path))
+
+=== FACT GROUNDING: orchestrator.py's except-RelayError block calls write_dead_letter when should_retry is False ===
+def run_pipeline(raw):
+    """Push one raw payload through every stage in `STAGE_ORDER`.
+
+    `raw` may be a plain dict (a brand new event, run from `ingest`
+    onward) or an `Event` already in flight (a retry, resumed from
+    `transform` onward since only `ingest` needs the original raw dict).
+
+    Returns the final `Event` on success, or `None` if the event was
+    dead-lettered - either immediately, or after its retries were
+    exhausted.
+    """
+    if isinstance(raw, Event):
+        event = raw
+        stages = STAGE_ORDER[1:]
+    else:
+        event = STAGE_DISPATCH["ingest"](raw)
+        stages = STAGE_ORDER[1:]
+
+    for stage_name in stages:
+        stage_fn = STAGE_DISPATCH[stage_name]
+        try:
+            event = stage_fn(event)
+        except RelayError as exc:
+            if retry.should_retry(exc, event.attempts):
+                event.bump_attempt()
+                delay = retry.backoff_for(event.attempts)
+                scheduler.schedule_retry(event, run_pipeline, delay)
+                state.mark_retried()
+                logger.info(
+                    "scheduled retry %s/%s for %s after %s",
+                    event.attempts,
+                    config.MAX_RETRIES,
+                    event.event_id,
+                    type(exc).__name__,
+                )
+            else:
+                deadletter.write_dead_letter(event, exc)
+                state.mark_dead_lettered()
+            return None
+
+    state.mark_processed(event.event_id)
+    return event
+
+=== FACT GROUNDING: scheduler.py's expire_stale calls write_dead_letter for timed-out retries ===
+     1	"""A minimal in-process scheduler for retried events.
+     2	
+     3	`schedule_retry` stores a callback alongside the event it belongs to and
+     4	returns immediately; the callback runs later, from `drain_ready`, whenever
+     5	something chooses to call it. `expire_stale` is the scheduler's other exit
+     6	door: a retry that has been waiting too long for its turn is given up on
+     7	directly, without ever running its callback.
+     8	"""
+     9	from __future__ import annotations
+    10	
+    11	import logging
+    12	import time
+    13	from dataclasses import dataclass
+    14	from typing import Callable
+    15	
+    16	from relay.errors import RetryExpiredError
+    17	from relay.sinks import deadletter, log_sink
+    18	
+    19	logger = logging.getLogger(__name__)
+    20	
+    21	
+    22	@dataclass
+    23	class _ScheduledRetry:
+    24	    event: object
+    25	    run_again: Callable[[object], object]
+    26	    ready_at: float
+    27	    scheduled_at: float
+    28	
+    29	
+    30	class Scheduler:
+    31	    def __init__(self) -> None:
+    32	        self._pending: list[_ScheduledRetry] = []
+    33	
+    34	    def schedule_retry(self, event, run_again: Callable[[object], object], delay_s: float) -> None:
+    35	        """Queue `run_again(event)` to run once `delay_s` has elapsed."""
+    36	        now = time.time()
+    37	        self._pending.append(
+    38	            _ScheduledRetry(event=event, run_again=run_again, ready_at=now + delay_s, scheduled_at=now)
+    39	        )
+    40	        log_sink.log_retry_scheduled(event, delay_s)
+    41	
+    42	    def pending_count(self) -> int:
+    43	        return len(self._pending)
+    44	
+    45	    def drain_ready(self, now: float | None = None) -> int:
+    46	        """Invoke every scheduled callback whose delay has elapsed.
+    47	
+    48	        Returns the number of callbacks invoked. A callback failing
+    49	        unexpectedly is logged and skipped rather than allowed to stop
+    50	        the rest of the batch from draining - `run_again` owns deciding
+    51	        what a failure of its own event means (retry again, dead-letter,
+    52	        or something else) and normally handles that itself.
+    53	        """
+    54	        now = time.time() if now is None else now
+    55	        ready: list[_ScheduledRetry] = []
+    56	        still_pending: list[_ScheduledRetry] = []
+    57	        for item in self._pending:
+    58	            (ready if item.ready_at <= now else still_pending).append(item)
+    59	        self._pending = still_pending
+    60	
+    61	        for item in ready:
+    62	            try:
+    63	                item.run_again(item.event)
+    64	            except Exception:  # noqa: BLE001 - one bad scheduled retry shouldn't block its siblings
+    65	                logger.exception("scheduled retry callback failed for %s", item.event.event_id)
+    66	        return len(ready)
+    67	
+    68	    def expire_stale(self, max_pending_s: float, now: float | None = None) -> int:
+    69	        """Give up on any retry that has been sitting in the queue for
+    70	        longer than `max_pending_s`, whether or not its delay has
+    71	        elapsed yet. Each one is dead-lettered directly, without ever
+    72	        running its callback. Returns the number expired.
+    73	        """
+    74	        now = time.time() if now is None else now
+    75	        cutoff = now - max_pending_s
+    76	        expiring: list[_ScheduledRetry] = []
+    77	        still_pending: list[_ScheduledRetry] = []
+    78	        for item in self._pending:
+    79	            (expiring if item.scheduled_at <= cutoff else still_pending).append(item)
+    80	        self._pending = still_pending
+    81	
+    82	        for item in expiring:
+    83	            error = RetryExpiredError(
+    84	                f"retry for {item.event.event_id} expired after {max_pending_s}s pending"
+    85	            )
+    86	            deadletter.write_dead_letter(item.event, error)
+    87	        return len(expiring)
+    88	
+    89	
+    90	scheduler = Scheduler()
+
+=== FACT GROUNDING: main.py's run_quarantine calls write_dead_letter manually from the CLI ===
+72:def run_quarantine(raw_path: str) -> None:
+73-    """Manually dead-letter one raw event, bypassing the pipeline
+74-    entirely."""
+75-    with open(raw_path, encoding="utf-8") as fh:
+76-        raw = json.load(fh)
+77-    event = Event(event_id=generate_event_id(), name="order.created", payload=raw)
+78-    deadletter.write_dead_letter(event, ManualQuarantineError("quarantined by operator"))
+79-    print(f"quarantined {event.event_id}")
+80-
+81-
+82-def run_replay() -> None:
+83-    """Re-run every currently dead-lettered event through the pipeline
+84-    from scratch (as a brand-new raw payload, not a resumed `Event`, so
+85-    it goes through `ingest` again with a fresh id).
+86-
+87-    The records are snapshotted into a list before any of them are
+88-    replayed - a repeat failure appends a new record to the same file
+89-    `read_dead_letters` reads from, and processing that append as part
+90-    of the same pass would replay forever.
+91-    """
+92-    records = list(deadletter.read_dead_letters())
+
+=== TRAP LIVENESS: log_dead_lettered is called ONLY from within write_dead_letter itself ===
+relay/sinks/log_sink.py:13:def log_dead_lettered(event, error: Exception) -> None:
+relay/sinks/deadletter.py:27:    log_sink.log_dead_lettered(event, error)
+(only call site outside its own def should be deadletter.py's write_dead_letter -- confirms it is not an independent 4th write path)
+
+=== LIVE EXECUTION PROOF: expire_stale dead-letters a timed-out retry ===
+expire_stale() returned (number expired): 1
+dead letters on disk after expiry: 1
+ -> evt-stale-1 RetryExpiredError
+
+=== FACT GROUNDING: main.py's run_demo -- the 4th write path, a QueueFullError on the bounded inbox ===
+main.py:35:from relay.storage.queue import InMemoryQueue, QueueFullError
+main.py:42:def run_demo(sample_path: Path = SAMPLE_EVENTS_PATH, settle_rounds: int = 5) -> None:
+main.py:45-61:
+    inbox: InMemoryQueue = InMemoryQueue(max_size=config.INBOX_MAX_SIZE)
+    with open(sample_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            incoming = json.loads(line)
+            try:
+                inbox.push(incoming)
+            except QueueFullError as exc:
+                overflow_event = Event(event_id=generate_event_id(), name=EVENT_ORDER_CREATED, payload=incoming)
+                deadletter.write_dead_letter(overflow_event, exc)
+                state.mark_dead_lettered()
+
+=== LIVE EXECUTION PROOF: a full inbox dead-letters overflow payloads instead of dropping them ===
+$ python3 -c "config.INBOX_MAX_SIZE = 2; import main; main.run_demo(settle_rounds=1)"
+event evt-...-1 dead-lettered: QueueFullError: queue is at its max size of 2
+event evt-...-2 dead-lettered: QueueFullError: queue is at its max size of 2
+event evt-...-3 dead-lettered: QueueFullError: queue is at its max size of 2
+event evt-...-4 dead-lettered: QueueFullError: queue is at its max size of 2
+event evt-...-6 dead-lettered: ValidationError: order ...-6: missing fields: qty; qty must be positive
+delivered ...-5
+processed: 1 delivered, 5 dead-lettered
+dead letters before/after: 0 5
+(4 of the 5 dead-letter records have error_type == QueueFullError, confirming run_demo's overflow branch actually fires and actually calls write_dead_letter -- not just a theoretical path)
+
+=== TRAP LIVENESS: drain_ready does NOT call write_dead_letter -- only expire_stale does, on the same class ===
+relay/pipeline/scheduler.py:145-166 (drain_ready): a failed callback goes through
+    except Exception:  # noqa: BLE001 - ...
+        logger.exception("scheduled retry callback failed for %s", item.event.event_id)
+-- logs and moves on, no deadletter/write_dead_letter import touched in this method.
+relay/pipeline/scheduler.py:168-187 (expire_stale): the only method on Scheduler that references
+`deadletter.write_dead_letter` at all (confirmed by grep: `deadletter\.write_dead_letter` appears
+exactly once in scheduler.py, inside expire_stale, and zero times inside drain_ready's body).
+$ grep -n "deadletter\." relay/pipeline/scheduler.py
+relay/pipeline/scheduler.py:20:from relay.sinks import deadletter, log_sink
+relay/pipeline/scheduler.py:86:            deadletter.write_dead_letter(item.event, error)
+(the only call is on line 86, inside expire_stale; drain_ready, defined above it, has none)
+
+=== TRAP LIVENESS: run_replay does not call write_dead_letter itself -- it re-enters run_pipeline, whose own except-RelayError block (path 1) is what writes, if anything does ===
+$ grep -n "write_dead_letter" main.py
+main.py:60:                deadletter.write_dead_letter(overflow_event, exc)   # run_demo's own path (4)
+main.py:89:    deadletter.write_dead_letter(event, ManualQuarantineError("quarantined by operator"))  # run_quarantine (path 3)
+(no write_dead_letter call inside run_replay's own body -- it only calls run_pipeline(dict(record["payload"])) per record)

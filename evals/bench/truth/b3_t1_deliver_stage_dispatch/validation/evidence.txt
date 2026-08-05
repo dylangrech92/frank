@@ -1,0 +1,42 @@
+=== FACT GROUNDING: run_deliver defined in orchestrator.py ===
+52:def run_deliver(event: Event) -> Event:
+
+=== FACT GROUNDING: STAGE_DISPATCH dict entry for deliver ===
+STAGE_ORDER = ["ingest", "transform", "validate", "enrich", "deliver"]
+
+STAGE_DISPATCH = {
+    "ingest": run_ingest,
+    "transform": run_transform,
+    "validate": run_validate,
+    "enrich": run_enrich,
+    "deliver": run_deliver,
+}
+
+=== FACT GROUNDING: run_pipeline invokes via dict lookup, not by name ===
+    for stage_name in stages:
+        stage_fn = STAGE_DISPATCH[stage_name]
+        try:
+            event = stage_fn(event)
+
+=== TRAP LIVENESS: zero literal run_deliver( call-syntax matches outside def/dict entry ===
+(only the dict entry 'deliver': run_deliver, -- a reference, not call syntax -- appears; grep for run_deliver( with parens finds nothing else)
+
+=== TRAP LIVENESS: relay/handlers/delivery.py also defines a function named run_deliver -- a decoy, not the one wired into the pipeline ===
+$ grep -n "def run_deliver" relay/handlers/delivery.py relay/pipeline/orchestrator.py
+relay/pipeline/orchestrator.py:52:def run_deliver(event: Event) -> Event:
+relay/handlers/delivery.py:15:def run_deliver(event) -> None:
+relay/handlers/delivery.py:15-20:
+def run_deliver(event) -> None:
+    """Pre-refactor deliver-stage entry point, from before the pipeline
+    moved to `STAGE_DISPATCH`-driven stage lookup in the orchestrator.
+    Superseded by `relay.pipeline.orchestrator.run_deliver`; nothing in
+    the current pipeline imports or calls this copy."""
+    finalize_and_send(event)
+$ grep -rn "delivery\.run_deliver\|from relay\.handlers\.delivery import run_deliver" --include="*.py" . | grep -v "relay/handlers/delivery.py:"
+(zero matches -- confirms nothing outside delivery.py itself references this copy)
+>>> from relay.handlers import delivery
+>>> from relay.pipeline import orchestrator
+>>> delivery.run_deliver is orchestrator.run_deliver
+False
+(confirms the two are distinct function objects sharing only a name -- STAGE_DISPATCH["deliver"] is bound to
+orchestrator.run_deliver, never to delivery.run_deliver)

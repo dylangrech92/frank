@@ -1,0 +1,58 @@
+{
+  "facts": [
+    {
+      "id": "b3_t1_run_deliver_defined_orchestrator",
+      "tier": "T1",
+      "weight": 3,
+      "any": [
+        "run_deliver[\\s\\S]{0,80}orchestrator\\.py",
+        "orchestrator\\.py[\\s\\S]{0,80}run_deliver",
+        "(defined|implemented|lives)[\\s\\S]{0,60}run_deliver[\\s\\S]{0,60}orchestrator\\.py"
+      ]
+    },
+    {
+      "id": "b3_t1_stage_dispatch_dict_lookup",
+      "tier": "T1",
+      "weight": 5,
+      "any": [
+        "STAGE_DISPATCH\\[[\"']?deliver[\"']?\\]",
+        "STAGE_DISPATCH[\\s\\S]{0,150}(dict|mapping|table)[\\s\\S]{0,150}(deliver|run_deliver)",
+        "(deliver|run_deliver)[\\s\\S]{0,150}STAGE_DISPATCH[\\s\\S]{0,150}(dict|mapping|lookup|key)",
+        "STAGE_DISPATCH\\s*=\\s*\\{[\\s\\S]{0,300}deliver[\\s\\S]{0,50}run_deliver"
+      ]
+    },
+    {
+      "id": "b3_t1_run_pipeline_indirect_call",
+      "tier": "T1",
+      "weight": 2,
+      "any": [
+        "run_pipeline[\\s\\S]{0,200}stage_fn\\s*=\\s*STAGE_DISPATCH\\[stage_name\\]",
+        "run_pipeline[\\s\\S]{0,250}(loop|iterat|for\\s+stage)[\\s\\S]{0,250}STAGE_DISPATCH\\[",
+        "stage_fn\\(event\\)[\\s\\S]{0,150}STAGE_DISPATCH",
+        "STAGE_DISPATCH\\[stage_name\\]\\(event\\)"
+      ]
+    }
+  ],
+  "traps": [
+    {
+      "id": "b3_t1_trap_dead_code",
+      "any": [
+        "run_deliver[\\s\\S]{0,80}(is\\s+)?(dead\\s*code|unreachable|effectively\\s+unused)\\b",
+        "\\b(dead\\s*code|unreachable|effectively\\s+unused)[\\s\\S]{0,80}run_deliver",
+        "run_deliver\\s+(is\\s+)?never\\s+(actually\\s+)?(called|invoked|used)\\b",
+        "no\\s+(direct\\s+)?call(s|ers)?\\s+to\\s+run_deliver[\\s\\S]{0,80}(dead|unreachable|unused|never\\s+(runs|executes))"
+      ],
+      "penalty": 20
+    },
+    {
+      "id": "b3_t1_trap_decoy_delivery_py",
+      "any": [
+        "run_deliver[\\s\\S]{0,100}(is\\s+)?(actually\\s+)?(defined|implemented|lives)\\s+in[\\s\\S]{0,40}(handlers[\\\\/.]+)?delivery\\.py",
+        "(handlers[\\\\/.]+)?delivery\\.py[\\s\\S]{0,100}(defines|implements|contains)[\\s\\S]{0,60}(the\\s+)?(real|actual)?\\s*run_deliver\\b(?!.{0,200}orchestrator)",
+        "the\\s+run_deliver\\s+(function\\s+)?in\\s+(handlers[\\\\/.]+)?delivery\\.py\\s+(is|gets)\\s+(the\\s+)?(one\\s+)?(actually\\s+)?(called|invoked|wired|used)"
+      ],
+      "penalty": 20
+    }
+  ],
+  "items": []
+}

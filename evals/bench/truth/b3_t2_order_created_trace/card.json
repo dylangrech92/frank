@@ -1,0 +1,97 @@
+{
+  "facts": [
+    {
+      "id": "b3_t2b_ingest_builds_event",
+      "tier": "T2",
+      "weight": 2,
+      "any": [
+        "build_order_event[\\s\\S]{0,120}ingest\\.py",
+        "ingest\\.py[\\s\\S]{0,120}build_order_event",
+        "build_order_event[\\s\\S]{0,150}(only|sole)\\s+(place|module|site)[\\s\\S]{0,100}(construct|creat)[\\s\\S]{0,50}Event"
+      ]
+    },
+    {
+      "id": "b3_t2b_transform_publishes_and_normalizes",
+      "tier": "T2",
+      "weight": 2,
+      "any": [
+        "bus\\.publish\\(EVENT_ORDER_CREATED[\\s\\S]{0,150}normalize_event",
+        "transform[\\s\\S]{0,150}bus\\.publish[\\s\\S]{0,100}EVENT_ORDER_CREATED",
+        "run_transform[\\s\\S]{0,150}normalize_event"
+      ]
+    },
+    {
+      "id": "b3_t2b_validate_then_audit",
+      "tier": "T2",
+      "weight": 2,
+      "any": [
+        "validate_order[\\s\\S]{0,150}bus\\.publish\\(EVENT_ORDER_VALIDATED",
+        "EVENT_ORDER_VALIDATED[\\s\\S]{0,150}record_validation",
+        "audit\\.py[\\s\\S]{0,150}record_validation[\\s\\S]{0,100}EVENT_ORDER_VALIDATED"
+      ]
+    },
+    {
+      "id": "b3_t2b_enrich_dynamic_plugin_load",
+      "tier": "T2",
+      "weight": 2,
+      "any": [
+        "load_plugin\\(config\\.ENRICHMENT_PLUGIN\\)",
+        "importlib\\.import_module[\\s\\S]{0,150}(plugin|enrich)",
+        "loader\\.py[\\s\\S]{0,150}importlib[\\s\\S]{0,100}import_module",
+        "enrich[\\s\\S]{0,150}(dynamic(ally)?|import_module)[\\s\\S]{0,100}plugin"
+      ]
+    },
+    {
+      "id": "b3_t2b_deliver_lands_in_file_sink",
+      "tier": "T2",
+      "weight": 3,
+      "any": [
+        "file_sink\\.py[\\s\\S]{0,150}send_to_file_sink",
+        "send_to_file_sink[\\s\\S]{0,150}delivered\\.jsonl",
+        "SINK_DISPATCH\\[[\"']?file[\"']?\\][\\s\\S]{0,100}send_to_file_sink",
+        "(default|config\\.DELIVERY_SINK)[\\s\\S]{0,150}(file[\"']?\\s*(sink)?)[\\s\\S]{0,150}(delivered\\.jsonl|file_sink)"
+      ]
+    },
+    {
+      "id": "b3_t2b_demo_reads_sample_jsonl",
+      "tier": "T2",
+      "weight": 1,
+      "any": [
+        "sample_events\\.jsonl[\\s\\S]{0,150}(InMemoryQueue|inbox|queue)",
+        "run_demo[\\s\\S]{0,150}sample_events\\.jsonl"
+      ]
+    },
+    {
+      "id": "b3_t2b_deliver_reapplies_normalize_via_alias",
+      "tier": "T2",
+      "weight": 3,
+      "any": [
+        "finalize_and_send[\\s\\S]{0,150}clean_event",
+        "clean_event\\(event\\)[\\s\\S]{0,150}(SINK_DISPATCH|sink)",
+        "delivery\\.py[\\s\\S]{0,150}clean_event[\\s\\S]{0,150}(normalize_event|alias)",
+        "(before|prior\\s+to)[\\s\\S]{0,80}(dispatch(ing)?|sending)[\\s\\S]{0,80}(sink|deliver)[\\s\\S]{0,80}clean_event"
+      ]
+    }
+  ],
+  "traps": [
+    {
+      "id": "b3_t2b_trap_log_sink_as_destination",
+      "any": [
+        "log_sink\\.py(?:(?!file_sink)[\\s\\S]){0,50}\\b(writes?|persists?|saves?)\\b[\\s\\S]{0,40}\\b(the\\s+)?(event|record|payload|order)\\b",
+        "\\b(delivered|persisted|saved)\\s+(to|in)\\s+log_sink",
+        "log_sink\\.py(?:(?!file_sink)[\\s\\S]){0,60}(final|ultimate)\\s+(destination|resting\\s+place)"
+      ],
+      "penalty": 20
+    },
+    {
+      "id": "b3_t2b_trap_webhook_default",
+      "any": [
+        "(webhook_sink|webhook_outbox\\.jsonl)[\\s\\S]{0,60}(default|by\\s+default)[\\s\\S]{0,60}(deliver|sink|written|persist)",
+        "default[\\s\\S]{0,60}(delivery\\s+)?sink[\\s\\S]{0,60}webhook",
+        "(persisted|written|delivered)[\\s\\S]{0,60}(to\\s+)?webhook_outbox\\.jsonl[\\s\\S]{0,100}(under\\s+the\\s+default|by\\s+default)"
+      ],
+      "penalty": 20
+    }
+  ],
+  "items": []
+}

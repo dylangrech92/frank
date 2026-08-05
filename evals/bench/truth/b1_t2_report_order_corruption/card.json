@@ -1,0 +1,35 @@
+{
+  "facts": [
+    {
+      "id": "b1_t2_inplace_sort_slowest_jobs",
+      "tier": "T2",
+      "weight": 10,
+      "any": [
+        "stats\\.py[\\s\\S]{0,250}\\.sort\\([\\s\\S]{0,200}(in[- ]?place|mutat)",
+        "(in[- ]?place\\s+sort|\\.sort\\()[\\s\\S]{0,250}(slowest_jobs|completion[_ ]log)",
+        "(mutat\\w*|reorder\\w*)[\\s\\S]{0,200}(shared|cached|module[- ]level)[\\s\\S]{0,200}(list|completion)"
+      ]
+    },
+    {
+      "id": "b1_t2_shared_completion_log_no_copy",
+      "tier": "T2",
+      "weight": 10,
+      "any": [
+        "(get_completion_log|_recent_completions)[\\s\\S]{0,250}(return\\w*|expose\\w*|hand\\w*\\s+back)[\\s\\S]{0,200}(direct(ly)?|reference|without\\s+(a\\s+)?copy|no\\s+copy|by\\s+reference)",
+        "(no\\s+copy|not\\s+copied|same\\s+list\\s+object|by\\s+reference)[\\s\\S]{0,250}(completion[_ ]log|_recent_completions)"
+      ]
+    }
+  ],
+  "traps": [
+    {
+      "id": "b1_t2_trap_reporting_or_persistence_blamed",
+      "any": [
+        "reporting\\.py[\\s\\S]{0,100}(is\\s+the\\s+bug|is\\s+the\\s+root\\s+cause|is\\s+the\\s+problem|is\\s+broken)",
+        "(json\\s+(serializ|persist)|_save|_load)[\\s\\S]{0,100}(is\\s+the\\s+bug|is\\s+the\\s+root\\s+cause|causes?\\s+the)[\\s\\S]{0,150}(order|chronological)",
+        "dict[\\s\\S]{0,60}(unordered|non-deterministic|no\\s+guaranteed\\s+order)[\\s\\S]{0,200}(completion|report)"
+      ],
+      "penalty": 20
+    }
+  ],
+  "items": []
+}

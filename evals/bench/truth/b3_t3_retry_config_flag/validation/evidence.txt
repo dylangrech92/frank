@@ -1,0 +1,67 @@
+=== FACT GROUNDING: config.RETRY_ENABLED definition ===
+20:RETRY_ENABLED = True
+21:MAX_RETRIES = 3
+57:    if MAX_RETRIES < 0:
+58:        raise ValueError("MAX_RETRIES must be >= 0")
+
+=== FACT GROUNDING: should_retry checks RETRY_ENABLED FIRST ===
+     1	"""Retry policy: decides whether a stage failure should be retried."""
+     2	from __future__ import annotations
+     3	
+     4	from relay import config
+     5	from relay.errors import DeliveryError, PluginLoadError, RelayError
+     6	
+     7	# Errors judged transient enough to retry. Validation and enrichment
+     8	# failures observed in production are shaped by the payload itself, so
+     9	# retrying them unchanged just fails again the same way.
+    10	RETRYABLE_EXCEPTIONS: tuple[type, ...] = (PluginLoadError, DeliveryError)
+    11	
+    12	
+    13	def should_retry(exc: RelayError, attempt: int) -> bool:
+    14	    """Return True if `exc`, raised on attempt number `attempt`
+    15	    (0-indexed), should be retried."""
+    16	    if not config.RETRY_ENABLED:
+    17	        return False
+    18	    if attempt >= config.MAX_RETRIES:
+    19	        return False
+    20	    return isinstance(exc, RETRYABLE_EXCEPTIONS)
+    21	
+    22	
+    23	def backoff_for(attempt: int) -> float:
+    24	    """Exponential backoff in seconds for the given (0-indexed) attempt,
+    25	    capped at `config.RETRY_BACKOFF_MAX_S`."""
+    26	    return min(config.RETRY_BACKOFF_BASE_S * (2**attempt), config.RETRY_BACKOFF_MAX_S)
+    27	
+    28	
+    29	def attempts_remaining(attempt: int) -> int:
+    30	    """How many more retries are available after attempt number
+    31	    `attempt`, ignoring `config.RETRY_ENABLED`."""
+    32	    return max(config.MAX_RETRIES - attempt, 0)
+
+=== LIVE EXECUTION PROOF: should_retry(exc, attempt) behavior under RETRY_ENABLED True/False, retryable/non-retryable exceptions ===
+RETRY_ENABLED=True, PluginLoadError, attempt=1 (< MAX_RETRIES=3): True
+RETRY_ENABLED=False, PluginLoadError, attempt=1 (< MAX_RETRIES=3): False
+RETRY_ENABLED=True, EnrichmentError (not retryable), attempt=1: False
+RETRY_ENABLED=True, PluginLoadError, attempt=3 (== MAX_RETRIES=3, exhausted): False
+
+RETRYABLE_EXCEPTIONS = (<class 'relay.errors.PluginLoadError'>, <class 'relay.errors.DeliveryError'>)
+MAX_RETRIES = 3
+
+=== TRAP LIVENESS: REPLAY_ENABLED is a same-file, similarly-named, DIFFERENT flag -- it gates main.py's CLI replay command, not should_retry ===
+relay/config.py:20:RETRY_ENABLED = True
+relay/config.py:33:REPLAY_ENABLED = True
+$ grep -rn "REPLAY_ENABLED\|RETRY_ENABLED" --include="*.py" .
+./relay/config.py:20:RETRY_ENABLED = True
+./relay/config.py:33:REPLAY_ENABLED = True
+./relay/pipeline/retry.py:16:    if not config.RETRY_ENABLED:
+./main.py:103:    if not config.REPLAY_ENABLED:
+(confirms should_retry in retry.py only ever reads RETRY_ENABLED; REPLAY_ENABLED is read exactly once,
+in main.py's run_replay, and nowhere near the automatic in-pipeline retry path)
+main.py:93-106:
+def run_replay() -> None:
+    """Re-run every currently dead-lettered event through the pipeline
+    from scratch ..."""
+    if not config.REPLAY_ENABLED:
+        print("replay is disabled")
+        return
+    records = list(deadletter.read_dead_letters())

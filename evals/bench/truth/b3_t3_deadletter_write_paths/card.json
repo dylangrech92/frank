@@ -1,0 +1,93 @@
+{
+  "facts": [
+    {
+      "id": "b3_t3b_orchestrator_except_block",
+      "tier": "T3",
+      "weight": 3,
+      "any": [
+        "orchestrator\\.py[\\s\\S]{0,150}write_dead_letter",
+        "run_pipeline[\\s\\S]{0,200}except\\s+RelayError[\\s\\S]{0,200}write_dead_letter",
+        "should_retry[\\s\\S]{0,200}(False|else)[\\s\\S]{0,150}write_dead_letter"
+      ]
+    },
+    {
+      "id": "b3_t3b_scheduler_expire_stale",
+      "tier": "T3",
+      "weight": 3,
+      "any": [
+        "expire_stale[\\s\\S]{0,150}write_dead_letter",
+        "scheduler\\.py[\\s\\S]{0,150}write_dead_letter",
+        "expire_stale[\\s\\S]{0,150}(stale|expired|too\\s+long|RETRY_STALE_TIMEOUT_S)"
+      ]
+    },
+    {
+      "id": "b3_t3b_manual_quarantine",
+      "tier": "T3",
+      "weight": 2,
+      "any": [
+        "run_quarantine[\\s\\S]{0,150}write_dead_letter",
+        "main\\.py[\\s\\S]{0,150}write_dead_letter",
+        "quarantine[\\s\\S]{0,150}(operator|manual(ly)?)[\\s\\S]{0,150}write_dead_letter"
+      ]
+    },
+    {
+      "id": "b3_t3b_all_funnel_through_deadletter_module",
+      "tier": "T3",
+      "weight": 2,
+      "any": [
+        "deadletter\\.py[\\s\\S]{0,150}(actual|real)\\s+(file\\s+)?write",
+        "deadletter\\.write_dead_letter[\\s\\S]{0,150}(DEAD_LETTER_PATH|actually\\s+writes|opens?\\s+the\\s+file)",
+        "write_dead_letter[\\s\\S]{0,150}(single|only|one)\\s+(function|place)[\\s\\S]{0,100}(writes?|persists?)"
+      ]
+    },
+    {
+      "id": "b3_t3b_run_demo_queue_overflow",
+      "tier": "T3",
+      "weight": 3,
+      "any": [
+        "run_demo[\\s\\S]{0,200}QueueFullError[\\s\\S]{0,150}write_dead_letter",
+        "QueueFullError[\\s\\S]{0,200}write_dead_letter",
+        "(inbox|queue)[\\s\\S]{0,150}(full|overflow)[\\s\\S]{0,150}dead[-\\s]?letter(ed)?",
+        "main\\.py[\\s\\S]{0,200}run_demo[\\s\\S]{0,150}(QueueFullError|queue\\s+full)[\\s\\S]{0,150}dead[-\\s]?letter"
+      ]
+    },
+    {
+      "id": "b3_t3b_drain_ready_does_not_deadletter",
+      "tier": "T3",
+      "weight": 2,
+      "any": [
+        "drain_ready[\\s\\S]{0,200}(does\\s*n[o']?t|never|without)[\\s\\S]{0,100}(write_dead_letter|dead[-\\s]?letter)",
+        "drain_ready[\\s\\S]{0,150}(logged?|logs)\\s+and\\s+skip",
+        "drain_ready[\\s\\S]{0,150}\\bskip(s|ped)?\\b[\\s\\S]{0,100}(rather\\s+than|instead\\s+of|without)"
+      ]
+    }
+  ],
+  "traps": [
+    {
+      "id": "b3_t3b_trap_log_sink_writes_deadletter",
+      "any": [
+        "log_dead_lettered(?:(?!write_dead_letter|never|n't|\\bnot\\b|only\\s+(emits?|logs?))[\\s\\S]){0,60}\\b(writes?|persists?|saves?)\\b[\\s\\S]{0,40}\\b(the\\s+)?(dead[-\\s]?letter|file|record)\\b",
+        "log_sink\\.py(?:(?!write_dead_letter|deadletter\\.py|never|n't|\\bnot\\b|only\\s+(emits?|logs?))[\\s\\S]){0,60}\\b(writes?|persists?)\\b[\\s\\S]{0,40}dead[-\\s]?letter",
+        "\\b(a|another|fourth)\\s+(call\\s+site|write\\s+path)[\\s\\S]{0,60}log_dead_lettered"
+      ],
+      "penalty": 20
+    },
+    {
+      "id": "b3_t3b_trap_replay_as_own_path",
+      "any": [
+        "run_replay[\\s\\S]{0,120}(is\\s+)?(a\\s+)?(distinct|separate|another|fourth|fifth)\\s+(write\\s+path|code\\s+path|call\\s+site)",
+        "(fourth|fifth)\\s+(write\\s+)?path[\\s\\S]{0,100}run_replay",
+        "run_replay[\\s\\S]{0,150}(itself\\s+)?(writes?|calls)\\s+write_dead_letter\\b"
+      ],
+      "penalty": 20
+    },
+    {
+      "id": "b3_t3b_trap_drain_ready_deadletters",
+      "any": [
+        "drain_ready(?:(?!\\bnot\\b|n't|never|does\\s*n[o']?t|without|skip)[\\s\\S]){0,150}write_dead_letter"
+      ],
+      "penalty": 20
+    }
+  ],
+  "items": []
+}

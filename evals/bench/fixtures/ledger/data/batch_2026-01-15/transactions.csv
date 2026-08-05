@@ -1,0 +1,11 @@
+txn_id,account_id,timestamp,amount,category,description
+TX-000001,ACC1001,2026-01-15T09:00:00Z,-0.10,fee,monthly maintenance fee
+TX-000002,ACC1001,2026-01-15T09:05:00Z,-0.10,fee,monthly maintenance fee
+TX-000003,ACC1001,2026-01-15T09:10:00Z,-0.10,fee,monthly maintenance fee
+TX-000004,ACC1002,2026-01-15T10:00:00Z,-150.00,payroll,biweekly payroll run
+TX-000005,ACC1002,2026-01-15T10:30:00Z,100.00,adjustment,payroll correction
+TX-000006,ACC1002,2026-01-15T11:00:00Z,-20.00,fee,wire transfer fee
+TX-000007,ACC1002,2026-01-15T13:00:00Z,75.00,sales,invoice 4180
+TX-000008,ACC1003,2026-01-15T12:00:00Z,-50.00,transfer,intercompany transfer to EU desk
+TX-000009,ACC1003,2026-01-15T14:00:00Z,25.00,sales,invoice 92
+TX-000010,ACC1003,2026-01-15T16:45:00Z,-10.00,fee,card processing fee

@@ -1,0 +1,256 @@
+=== FACT GROUNDING: load_plugin raises PluginLoadError ===
+"""Loads the configured enrichment plugin by name.
+
+The plugin name comes from `config.ENRICHMENT_PLUGIN` at call time rather
+than a static import, so a new plugin module can be dropped into
+`relay/plugins/` and enabled by editing configuration alone.
+"""
+from __future__ import annotations
+
+import importlib
+import pkgutil
+
+from relay.errors import PluginLoadError
+
+_PLUGIN_PACKAGE = "relay.plugins"
+
+_cache: dict[str, object] = {}
+
+
+def list_available_plugin_names() -> list[str]:
+    """List module names under `relay/plugins/` that could be passed to
+    `load_plugin`. Does not check that each one actually exposes a
+    `PLUGIN` entry point - that's only verified at load time."""
+    import relay.plugins as plugins_pkg
+
+    return sorted(
+        info.name
+        for info in pkgutil.iter_modules(plugins_pkg.__path__)
+        if info.name != "loader"
+    )
+
+
+def load_plugin(name: str):
+    """Import `relay.plugins.<name>` and return its `PLUGIN` entry
+    point.
+
+    Successful loads are cached by name for the lifetime of the process,
+    so a misconfigured `config.ENRICHMENT_PLUGIN` pays the
+    `PluginLoadError` cost on every call, but a working one only imports
+    once.
+
+    Raises `PluginLoadError` if the module does not exist or does not
+    expose a `PLUGIN` object.
+    """
+    if name in _cache:
+        return _cache[name]
+
+    module_name = f"{_PLUGIN_PACKAGE}.{name}"
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise PluginLoadError(f"no such enrichment plugin: {name}") from exc
+    try:
+        plugin = module.PLUGIN
+    except AttributeError as exc:
+        raise PluginLoadError(f"plugin {name} has no PLUGIN entry point") from exc
+
+    _cache[name] = plugin
+    return plugin
+
+
+
+=== FACT GROUNDING: builtin_enricher.enrich raises EnrichmentError on missing postal_code ===
+     1	"""The default enrichment plugin: adds a shipping region derived from a
+     2	postal code, and a flat handling fee based on order size."""
+     3	from __future__ import annotations
+     4	
+     5	from relay.errors import EnrichmentError
+     6	from relay.handlers.transform import normalize_event
+     7	
+     8	_POSTAL_REGIONS = {
+     9	    "9": "west",
+    10	    "8": "west",
+    11	    "7": "central",
+    12	    "6": "central",
+    13	    "5": "central",
+    14	    "4": "east",
+    15	    "3": "east",
+    16	    "2": "east",
+    17	    "1": "east",
+    18	    "0": "east",
+    19	}
+    20	
+    21	_SMALL_ORDER_FEE_CENTS = 150
+    22	_LARGE_ORDER_QTY_THRESHOLD = 20
+    23	
+    24	
+    25	def region_for_postal_code(postal_code: str) -> str:
+    26	    if not postal_code:
+    27	        return "unknown"
+    28	    return _POSTAL_REGIONS.get(postal_code[0], "unknown")
+    29	
+    30	
+    31	def handling_fee_cents(qty: int) -> int:
+    32	    """Small orders carry a flat handling fee; large orders are assumed
+    33	    to already justify their own freight arrangement."""
+    34	    if qty >= _LARGE_ORDER_QTY_THRESHOLD:
+    35	        return 0
+    36	    return _SMALL_ORDER_FEE_CENTS
+    37	
+    38	
+    39	def enrich(event) -> None:
+    40	    normalize_event(event)
+    41	    postal = event.payload.get("postal_code")
+    42	    if not postal:
+    43	        raise EnrichmentError(f"order {event.event_id} has no postal_code to enrich from")
+    44	    event.payload["region"] = region_for_postal_code(postal)
+    45	    event.payload["handling_fee_cents"] = handling_fee_cents(event.payload.get("qty", 0))
+    46	
+    47	
+    48	class _BuiltinEnricherPlugin:
+    49	    enrich = staticmethod(enrich)
+    50	
+    51	
+    52	PLUGIN = _BuiltinEnricherPlugin()
+
+=== FACT GROUNDING: run_pipeline's except RelayError block ===
+def run_pipeline(raw):
+    """Push one raw payload through every stage in `STAGE_ORDER`.
+
+    `raw` may be a plain dict (a brand new event, run from `ingest`
+    onward) or an `Event` already in flight (a retry, resumed from
+    `transform` onward since only `ingest` needs the original raw dict).
+
+    Returns the final `Event` on success, or `None` if the event was
+    dead-lettered - either immediately, or after its retries were
+    exhausted.
+    """
+    if isinstance(raw, Event):
+        event = raw
+        stages = STAGE_ORDER[1:]
+    else:
+        event = STAGE_DISPATCH["ingest"](raw)
+        stages = STAGE_ORDER[1:]
+
+    for stage_name in stages:
+        stage_fn = STAGE_DISPATCH[stage_name]
+        try:
+            event = stage_fn(event)
+        except RelayError as exc:
+            if retry.should_retry(exc, event.attempts):
+                event.bump_attempt()
+                delay = retry.backoff_for(event.attempts)
+                scheduler.schedule_retry(event, run_pipeline, delay)
+                state.mark_retried()
+                logger.info(
+                    "scheduled retry %s/%s for %s after %s",
+                    event.attempts,
+                    config.MAX_RETRIES,
+                    event.event_id,
+                    type(exc).__name__,
+                )
+            else:
+                deadletter.write_dead_letter(event, exc)
+                state.mark_dead_lettered()
+            return None
+
+    state.mark_processed(event.event_id)
+    return event
+
+=== FACT GROUNDING: RETRYABLE_EXCEPTIONS = (PluginLoadError, DeliveryError) -- EnrichmentError excluded ===
+     1	"""Retry policy: decides whether a stage failure should be retried."""
+     2	from __future__ import annotations
+     3	
+     4	from relay import config
+     5	from relay.errors import DeliveryError, PluginLoadError, RelayError
+     6	
+     7	# Errors judged transient enough to retry. Validation and enrichment
+     8	# failures observed in production are shaped by the payload itself, so
+     9	# retrying them unchanged just fails again the same way.
+    10	RETRYABLE_EXCEPTIONS: tuple[type, ...] = (PluginLoadError, DeliveryError)
+    11	
+    12	
+    13	def should_retry(exc: RelayError, attempt: int) -> bool:
+    14	    """Return True if `exc`, raised on attempt number `attempt`
+    15	    (0-indexed), should be retried."""
+    16	    if not config.RETRY_ENABLED:
+    17	        return False
+    18	    if attempt >= config.MAX_RETRIES:
+    19	        return False
+    20	    return isinstance(exc, RETRYABLE_EXCEPTIONS)
+    21	
+    22	
+    23	def backoff_for(attempt: int) -> float:
+    24	    """Exponential backoff in seconds for the given (0-indexed) attempt,
+    25	    capped at `config.RETRY_BACKOFF_MAX_S`."""
+    26	    return min(config.RETRY_BACKOFF_BASE_S * (2**attempt), config.RETRY_BACKOFF_MAX_S)
+    27	
+    28	
+    29	def attempts_remaining(attempt: int) -> int:
+    30	    """How many more retries are available after attempt number
+    31	    `attempt`, ignoring `config.RETRY_ENABLED`."""
+    32	    return max(config.MAX_RETRIES - attempt, 0)
+
+=== FACT GROUNDING: exception hierarchy confirms both are RelayError subclasses ===
+8:class RelayError(Exception):
+12:class ValidationError(RelayError):
+17:class EnrichmentError(RelayError):
+22:class PluginLoadError(RelayError):
+27:class DeliveryError(RelayError):
+31:class ManualQuarantineError(RelayError):
+36:class RetryExpiredError(RelayError):
+
+=== TRAP LIVENESS: check_b3_traps_live.py output for this task (from earlier run in scratch) ===
+[LIVE] b3_t2_enrich_error_handling: triggered=['b3_t2c_trap_enrichmenterror_retried_too']
+(adversarial sentence: 'EnrichmentError is retried just like PluginLoadError, up to the
+ configured retry limit, before being dead-lettered.' -- confirmed to fire the trap regex)
+
+=== FACT GROUNDING: flag_large_order -- a third EVENT_ORDER_ENRICHED handler that raises a plain (non-RelayError) ValueError ===
+relay/handlers/audit.py:36-50:
+@bus.on(EVENT_ORDER_ENRICHED)
+def flag_large_order(event) -> None:
+    """Raise a plain (non-`RelayError`) alert for orders large enough to
+    need manual compliance sign-off, registered on the bus the same way
+    as the rest of this module's handlers.
+
+    Because this runs as a bus-published handler rather than as a stage
+    function called directly by the orchestrator, a raised exception
+    here is caught by `EventBus.publish` itself and never reaches
+    `run_pipeline`'s `except RelayError` block at all -- on top of not
+    being a `RelayError` in the first place.
+    """
+    qty = event.payload.get("qty", 0)
+    if qty >= _LARGE_ORDER_QTY_ALERT_THRESHOLD:
+        raise ValueError(f"order {event.event_id} needs manual compliance sign-off (qty={qty})")
+
+=== FACT GROUNDING: EventBus.publish catches every handler's exception itself, broadly, and returns them instead of propagating ===
+relay/bus.py:33-47 (publish):
+    def publish(self, event_name: str, event: object) -> list[Exception]:
+        errors: list[Exception] = []
+        for handler in self._handlers.get(event_name, []):
+            try:
+                handler(event)
+            except Exception as exc:  # noqa: BLE001 - handlers own their errors
+                logger.warning(
+                    "handler %s failed for %s: %s",
+                    getattr(handler, "__qualname__", repr(handler)),
+                    event_name,
+                    exc,
+                )
+                errors.append(exc)
+        return errors
+relay/pipeline/orchestrator.py:47-49 (run_enrich):
+    bus.publish(EVENT_ORDER_ENRICHED, event)
+    return event
+(run_enrich never inspects publish's returned errors list -- so a flag_large_order failure never
+propagates as a Python exception at all, and therefore never reaches run_pipeline's except RelayError block)
+
+=== LIVE EXECUTION PROOF: flag_large_order's ValueError is caught by bus.publish, not propagated ===
+$ python3 -c "bus.publish(EVENT_ORDER_ENRICHED, Event(qty=300, ...))"
+WARNING:relay.bus:handler flag_large_order failed for order.enriched: order evt-test-large needs manual compliance sign-off (qty=300)
+errors returned by bus.publish: [ValueError('order evt-test-large needs manual compliance sign-off (qty=300)')]
+type of first error: ValueError
+(confirms: (1) the ValueError is raised, (2) EventBus.publish catches it and logs a warning rather than
+letting it propagate, (3) it is returned in the errors list -- which run_enrich discards -- so no exception
+ever reaches run_pipeline's except RelayError block; the event is neither retried nor dead-lettered)

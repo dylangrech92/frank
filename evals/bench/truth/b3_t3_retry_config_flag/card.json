@@ -1,0 +1,66 @@
+{
+  "facts": [
+    {
+      "id": "b3_t3a_retry_enabled_is_the_flag",
+      "tier": "T3",
+      "weight": 3,
+      "any": [
+        "config\\.RETRY_ENABLED",
+        "RETRY_ENABLED[\\s\\S]{0,120}(flag|switch|toggle)",
+        "(flag|switch|toggle)[\\s\\S]{0,120}RETRY_ENABLED"
+      ]
+    },
+    {
+      "id": "b3_t3a_checked_first_in_should_retry",
+      "tier": "T3",
+      "weight": 3,
+      "any": [
+        "should_retry[\\s\\S]{0,150}if\\s+not\\s+config\\.RETRY_ENABLED",
+        "if\\s+not\\s+config\\.RETRY_ENABLED[\\s\\S]{0,100}return\\s+False",
+        "retry\\.py[\\s\\S]{0,150}RETRY_ENABLED[\\s\\S]{0,150}(first|before)",
+        "RETRY_ENABLED[\\s\\S]{0,150}(checked|tested)\\s+(first|before)"
+      ]
+    },
+    {
+      "id": "b3_t3a_removal_breaks_killswitch",
+      "tier": "T3",
+      "weight": 3,
+      "any": [
+        "(remov(e|ed|ing)|delet(e|ed|ing))[\\s\\S]{0,200}(RETRY_ENABLED\\s+check|check\\s+for\\s+RETRY_ENABLED)[\\s\\S]{0,250}(always|no\\s+way|can(no|')?t)\\s+.{0,80}(disabl|turn\\s+off|kill)",
+        "no\\s+(way|longer\\s+a\\s+way)\\s+(to\\s+)?(globally\\s+)?disable\\s+retr[\\s\\S]{0,150}RETRY_ENABLED",
+        "(fall(s|ing)?\\s+through|falls\\s+back)\\s+to[\\s\\S]{0,100}(MAX_RETRIES|attempt\\s*>=)"
+      ]
+    },
+    {
+      "id": "b3_t3a_max_retries_is_a_cap_not_switch",
+      "tier": "T3",
+      "weight": 2,
+      "any": [
+        "MAX_RETRIES[\\s\\S]{0,150}\\b(caps?|limit|threshold|ceiling)\\b",
+        "\\b(caps?|limit|threshold|ceiling)\\b[\\s\\S]{0,150}MAX_RETRIES",
+        "MAX_RETRIES(?:(?!RETRY_ENABLED)[\\s\\S]){0,150}\\bhow\\s+many\\b"
+      ]
+    }
+  ],
+  "traps": [
+    {
+      "id": "b3_t3a_trap_max_retries_as_killswitch",
+      "any": [
+        "MAX_RETRIES(?:(?!RETRY_ENABLED)[\\s\\S]){0,60}\\b(is|acts?\\s+as)\\s+the\\s+(governing|kill[-\\s]?switch|gatekeeper)\\b",
+        "MAX_RETRIES(?:(?!RETRY_ENABLED)[\\s\\S]){0,60}\\bgoverns?\\s+whether\\b",
+        "(governing|kill[-\\s]?switch)\\s+(flag\\s+)?is\\s+MAX_RETRIES\\b"
+      ],
+      "penalty": 20
+    },
+    {
+      "id": "b3_t3a_trap_replay_enabled_confusion",
+      "any": [
+        "REPLAY_ENABLED[\\s\\S]{0,100}govern[s]?\\s+whether[\\s\\S]{0,80}retried",
+        "REPLAY_ENABLED[\\s\\S]{0,100}(is|acts?\\s+as)\\s+the\\s+(governing|kill[-\\s]?switch)\\b",
+        "(governing|kill[-\\s]?switch)\\s+flag\\s+is\\s+REPLAY_ENABLED"
+      ],
+      "penalty": 20
+    }
+  ],
+  "items": []
+}

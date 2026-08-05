@@ -1,0 +1,30 @@
+Method: stdlib `trace.Trace(count=True)` line-counter over `workload.py`,
+run in a SCRATCH COPY of the fixture (evals/bench/fixtures/grind copied
+verbatim to a throwaway directory; the committed fixture itself was never
+modified or instrumented). Sanity check included: dedup.py's line counts
+are also inspected in the same run to prove the tracer is actually live
+(nonzero counts elsewhere), so a zero count for legacy.py is meaningful and
+not an artifact of a broken tracer.
+
+=== scale 1 ===
+legacy.py lines executed (nonzero count): 4
+  HIT lines: [(1, 1), (9, 1), (11, 1), (14, 1)]
+sanity check -- dedup.py lines executed (nonzero count): 15 (nonzero proves tracer is live)
+
+=== scale 10 ===
+legacy.py lines executed (nonzero count): 4
+  HIT lines: [(1, 1), (9, 1), (11, 1), (14, 1)]
+sanity check -- dedup.py lines executed (nonzero count): 15 (nonzero proves tracer is live)
+
+Interpretation: legacy.py's 4 hit lines are line 1 (module docstring), line
+9 (`from __future__ import annotations`), line 11 (the `from .records
+import ParsedEvent` import), and line 14 (the `def
+reconcile_batch_legacy(...):` statement itself, which executes once at
+*import* time to bind the function object -- standard Python module-load
+behavior, not a call). None of lines 22-33 (the function's actual
+triple-nested-loop body) executed at either scale. This confirms the decoy
+is reachable (imported, not orphaned -- static analysis alone would not
+flag it as dead) but never invoked, because
+`grind/pipeline.py:run()` only calls it behind `if
+config.ENABLE_LEGACY_RECONCILE:`, and that flag is `False`
+(grind/config.py).

@@ -1,0 +1,51 @@
+=== FACT GROUNDING: normalize_event definition + bus registration ===
+"""Payload normalization for order events."""
+from __future__ import annotations
+
+from relay.bus import bus
+from relay.events import EVENT_ORDER_CREATED
+
+
+@bus.on(EVENT_ORDER_CREATED)
+def normalize_event(event) -> None:
+    """Normalize field casing and whitespace so downstream stages can
+
+=== FACT GROUNDING: bus.publish(EVENT_ORDER_CREATED triggers it ===
+33:        bus.publish(EVENT_ORDER_CREATED, event)
+
+=== FACT GROUNDING: builtin_enricher.py caller ===
+6:from relay.handlers.transform import normalize_event
+40:    normalize_event(event)
+
+=== FACT GROUNDING: premium_enricher.py caller ===
+22:    from relay.handlers.transform import normalize_event
+24:    normalize_event(event)
+
+=== FACT GROUNDING: discount_enricher.py caller ===
+28:    from relay.handlers.transform import normalize_event
+30:    normalize_event(event)
+
+=== FACT GROUNDING: compat/legacy.py alias + delivery.py using the alias ===
+relay/compat/legacy.py:11:from relay.handlers.transform import normalize_event as clean_event  # noqa: F401
+relay/handlers/delivery.py:5:from relay.compat.legacy import clean_event
+relay/handlers/delivery.py:22:    clean_event(event)
+
+=== TRAP LIVENESS: geoip_lookup.py decoy is never imported anywhere ===
+6:def normalize_event(payload: dict) -> dict:
+importers of geoip_lookup (grep for 'from relay.plugins.geoip_lookup\|import geoip_lookup'):
+(no output above means zero importers anywhere in the codebase -- confirmed decoy)
+
+=== FACT GROUNDING: compat/legacy.py's second alias (sanitize_order) + webhook_sink.py using it ===
+relay/compat/legacy.py:12:from relay.handlers.transform import normalize_event as sanitize_order  # noqa: F401
+relay/sinks/webhook_sink.py:11:from relay.compat.legacy import sanitize_order
+relay/sinks/webhook_sink.py:26:    sanitize_order(event)
+(a second, independent alias of normalize_event under a different old name, distinct from clean_event above --
+neither webhook_sink.py's import line nor its call site mentions normalize_event by that name)
+
+=== LIVE EXECUTION PROOF: sanitize_order in webhook_sink.py actually normalizes the payload before writing ===
+$ python3 -c "config.DELIVERY_SINK='webhook'; delivery.finalize_and_send(event_with_messy_fields)"
+payload before: {'sku': '  wg-100 ', 'qty': '4', 'customer_id': ' cust-9 '}
+payload after (webhook path): {'sku': 'WG-100', 'qty': 4, 'customer_id': 'cust-9'}
+(sku uppercased/stripped, qty coerced to int, customer_id stripped -- identical normalization to what
+clean_event/normalize_event does on the file-sink path, proving sanitize_order is the same function under
+a different imported name, not a lookalike)

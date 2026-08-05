@@ -1,0 +1,76 @@
+{
+  "facts": [
+    {
+      "id": "b3_t2a_registered_on_bus",
+      "tier": "T2",
+      "weight": 3,
+      "any": [
+        "@bus\\.on\\(EVENT_ORDER_CREATED\\)[\\s\\S]{0,80}normalize_event",
+        "normalize_event[\\s\\S]{0,120}(registered|subscribed)[\\s\\S]{0,80}(bus|EVENT_ORDER_CREATED)",
+        "bus\\.publish\\(EVENT_ORDER_CREATED[\\s\\S]{0,150}normalize_event",
+        "transform\\.py[\\s\\S]{0,150}(decorat|register)[\\s\\S]{0,100}normalize_event"
+      ]
+    },
+    {
+      "id": "b3_t2a_builtin_enricher_caller",
+      "tier": "T2",
+      "weight": 2,
+      "any": [
+        "builtin_enricher\\.py[\\s\\S]{0,150}normalize_event",
+        "normalize_event[\\s\\S]{0,150}builtin_enricher\\.py"
+      ]
+    },
+    {
+      "id": "b3_t2a_premium_enricher_caller",
+      "tier": "T2",
+      "weight": 2,
+      "any": [
+        "premium_enricher\\.py[\\s\\S]{0,150}normalize_event",
+        "normalize_event[\\s\\S]{0,150}premium_enricher\\.py"
+      ]
+    },
+    {
+      "id": "b3_t2a_discount_enricher_caller",
+      "tier": "T2",
+      "weight": 2,
+      "any": [
+        "discount_enricher\\.py[\\s\\S]{0,150}normalize_event",
+        "normalize_event[\\s\\S]{0,150}discount_enricher\\.py"
+      ]
+    },
+    {
+      "id": "b3_t2a_aliased_clean_event_path",
+      "tier": "T2",
+      "weight": 3,
+      "any": [
+        "clean_event\\s*=\\s*normalize_event",
+        "compat[\\\\/.]legacy[\\s\\S]{0,150}clean_event[\\s\\S]{0,100}normalize_event",
+        "delivery\\.py[\\s\\S]{0,150}clean_event[\\s\\S]{0,150}(alias|legacy|compat)",
+        "clean_event[\\s\\S]{0,120}(alias|re-?export)[\\s\\S]{0,120}normalize_event"
+      ]
+    },
+    {
+      "id": "b3_t2a_aliased_sanitize_order_path",
+      "tier": "T2",
+      "weight": 3,
+      "any": [
+        "sanitize_order\\s*=\\s*normalize_event",
+        "compat[\\\\/.]legacy[\\s\\S]{0,150}sanitize_order[\\s\\S]{0,100}normalize_event",
+        "webhook_sink\\.py[\\s\\S]{0,150}sanitize_order[\\s\\S]{0,150}(alias|legacy|compat)",
+        "sanitize_order[\\s\\S]{0,120}(alias|re-?export)[\\s\\S]{0,120}normalize_event"
+      ]
+    }
+  ],
+  "traps": [
+    {
+      "id": "b3_t2a_trap_geoip_decoy",
+      "any": [
+        "geoip_lookup\\.py[\\s\\S]{0,100}\\b(is\\s+imported|gets\\s+imported|is\\s+loaded|is\\s+called|is\\s+used\\s+by|is\\s+one\\s+of\\s+the\\s+(real\\s+)?callers)\\b",
+        "callers?\\s+of\\s+normalize_event[\\s\\S]{0,150}includes?[\\s\\S]{0,60}geoip_lookup",
+        "geoip_lookup[\\s\\S]{0,100}\\b(same|shared|identical)\\s+(function|implementation)\\s+as\\b"
+      ],
+      "penalty": 20
+    }
+  ],
+  "items": []
+}

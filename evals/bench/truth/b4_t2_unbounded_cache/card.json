@@ -1,0 +1,48 @@
+{
+  "facts": [
+    {
+      "id": "t2_cache_named_as_driver",
+      "tier": "T2",
+      "weight": 30,
+      "any": [
+        "enrich\\.py.{0,80}cache",
+        "cache.{0,80}enrich\\.py",
+        "profile cache",
+        "enrich_events.{0,80}cache",
+        "build_profile.{0,80}cache"
+      ]
+    },
+    {
+      "id": "t2_unbounded_growth_with_input",
+      "tier": "T2",
+      "weight": 30,
+      "any": [
+        "(unbounded|no (size )?cap|no eviction|never (evict|remov|shrink|clear)|no ceiling|not bounded|grows? (with|as|proportional))",
+        "grows? (almost )?(linearly|1:1|one.to.one).{0,60}(input|scale|record|volume)",
+        "(scales?|growing|grows?).{0,40}(linearly|proportional).{0,60}(input|record|scale|volume)"
+      ]
+    },
+    {
+      "id": "t2_high_cardinality_key_root_cause",
+      "tier": "T2",
+      "weight": 40,
+      "any": [
+        "user_agent.{0,150}(random|unique|build.?number|cardinality|rarely (the )?same|almost never (repeat|the same))",
+        "(random|unique|build.?number).{0,150}user_agent",
+        "cache (hit rate|miss rate).{0,60}(2\\.6|2\\.7|97|low|near.?zero|nearly zero)",
+        "(2\\.6|2\\.7|97)%.{0,80}(cache|hit|miss)",
+        "key(ed)? (by|on) user_agent.{0,120}(random|unique|almost (every|always)|near.?unique)"
+      ]
+    }
+  ],
+  "traps": [
+    {
+      "id": "legacy_reconcile_named_as_memory_driver",
+      "any": [
+        "(legacy\\.py|reconcile_batch_legacy).{0,80}(memory|leak|driv(e|ing)|hot ?spot|dominant|biggest (cost|driver|consumer)|consumes the most|should be optimi[sz]ed|needs? optimi[sz]ing)",
+        "(memory|leak|driv(e|ing)|hot ?spot|dominant|biggest (cost|driver|consumer)|consumes the most).{0,80}(legacy\\.py|reconcile_batch_legacy)"
+      ],
+      "penalty": 20
+    }
+  ]
+}

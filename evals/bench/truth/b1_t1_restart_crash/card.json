@@ -1,0 +1,37 @@
+{
+  "facts": [
+    {
+      "id": "b1_t1_seq_counter_resume",
+      "tier": "T1",
+      "weight": 10,
+      "any": [
+        "store\\.py[\\s\\S]{0,300}(len\\(self\\._jobs\\)|len\\(.{0,20}jobs\\))[\\s\\S]{0,200}(seq|sequence)",
+        "(seq(uence)?\\s*counter|_seq_counter)[\\s\\S]{0,250}(resum|reload|restart|reinitializ|rebuild)[\\s\\S]{0,250}(len\\(|count\\s+of|number\\s+of)[\\s\\S]{0,150}(jobs?|pending)",
+        "(resum|reload|reinitializ|rebuild)[\\s\\S]{0,200}(seq(uence)?\\s*counter)[\\s\\S]{0,250}(should|instead|rather\\s+than)[\\s\\S]{0,200}max"
+      ]
+    },
+    {
+      "id": "b1_t1_seq_collision_heap_crash",
+      "tier": "T1",
+      "weight": 10,
+      "any": [
+        "seq\\s*(number)?\\s*(collis|duplicat|reus|clash)",
+        "(duplicate|reused|colliding|collided)\\s+seq[\\s\\S]{0,250}(heap|priorityqueue|heappush|heappop)",
+        "(heapq\\.heappop|heappop|heap)[\\s\\S]{0,250}(typeerror|not\\s+supported\\s+between\\s+instances|compar\\w*)[\\s\\S]{0,250}job",
+        "TypeError[\\s\\S]{0,200}('<'|not\\s+supported\\s+between\\s+instances)[\\s\\S]{0,200}Job"
+      ]
+    }
+  ],
+  "traps": [
+    {
+      "id": "b1_t1_trap_job_needs_lt",
+      "any": [
+        "(add|implement|define)[\\s\\S]{0,80}__lt__[\\s\\S]{0,150}(job|Job)",
+        "(job|Job)[\\s\\S]{0,100}(sortable|comparable)[\\s\\S]{0,200}(fix|solution|resolve|the\\s+way\\s+to)",
+        "(root cause|the bug|the issue)[\\s\\S]{0,150}(job|Job)[\\s\\S]{0,100}(not|isn't|aren't)\\s+(comparable|sortable|orderable)"
+      ],
+      "penalty": 20
+    }
+  ],
+  "items": []
+}

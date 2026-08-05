@@ -1,0 +1,72 @@
+{
+  "facts": [
+    {
+      "id": "t1_canonicalize_path_hotspot",
+      "tier": "T1",
+      "weight": 30,
+      "rank": 1,
+      "any": [
+        "canonicalize_path",
+        "normalize\\.py.{0,40}(hot|top|dominant|highest|biggest|most expensive)",
+        "(hot|top|dominant|highest|biggest|most expensive).{0,40}normalize\\.py"
+      ]
+    },
+    {
+      "id": "t2_stdlib_json_cost",
+      "tier": "T2",
+      "weight": 15,
+      "rank": 2,
+      "any": [
+        "raw_decode",
+        "json\\.decoder",
+        "json\\.loads.{0,60}(cost|time|expensive|hot|second|significant)",
+        "(cost|time|expensive|hot|second|significant).{0,60}json\\.loads"
+      ]
+    },
+    {
+      "id": "t2_redundant_parse_cause_site",
+      "tier": "T2",
+      "weight": 20,
+      "any": [
+        "enrich\\.py.{0,120}(re-?pars|re-?decod|redundant|twice|again|duplicate.{0,10}(pars|decod))",
+        "build_profile.{0,120}(re-?pars|re-?decod|redundant|twice|again)",
+        "(re-?pars|re-?decod|redundant|twice|again).{0,120}(enrich\\.py|build_profile)",
+        "enrich_events.{0,120}(re-?pars|re-?decod|redundant|already (been )?(pars|decod))",
+        "metadata_json.{0,120}(re-?pars|re-?decod|twice|already (been )?(pars|decod))"
+      ]
+    },
+    {
+      "id": "t3_dedup_quadratic_hotspot",
+      "tier": "T3",
+      "weight": 20,
+      "rank": 3,
+      "any": [
+        "mark_duplicates",
+        "dedup\\.py.{0,60}(o\\(n\\^?2\\)|o\\(n\\u00b2\\)|quadratic|n squared|n\\^2)",
+        "(o\\(n\\^?2\\)|quadratic|n squared|n\\^2).{0,60}dedup\\.py",
+        "seen\\.append.{0,80}(list|linear scan)"
+      ]
+    },
+    {
+      "id": "t3_scale_dependent_ranking_shift",
+      "tier": "T3",
+      "weight": 15,
+      "any": [
+        "(mark_duplicates|dedup).{0,200}(scale ?10|10x|10\\u00d7|ten.?fold|10.times|higher volume|larger (input|scale)|grows? (with|as)|at scale)",
+        "(scale ?10|10x|10\\u00d7|ten.?fold|at 10x|at higher volume).{0,200}(mark_duplicates|dedup)",
+        "(negligible|cheap|small|minor|third|not (a|the) (top|main)).{0,150}(scale ?1\\b|today|baseline|current).{0,300}(dominant|top|biggest|first|becomes the (top|main)|overtak)",
+        "(dominant|top|biggest|becomes the (top|main)).{0,200}(scale ?10|10x|higher volume)"
+      ]
+    }
+  ],
+  "traps": [
+    {
+      "id": "legacy_reconcile_named_as_bottleneck",
+      "any": [
+        "(legacy\\.py|reconcile_batch_legacy).{0,80}(hot ?spot|bottleneck|dominant|top cost|biggest cost|most expensive|costly|consumes the most|should be optimi[sz]ed|needs? optimi[sz]ing|priority to fix|top offender|primary driver|main driver|worth fixing|fix (this )?first|optimi[sz]e (this|it) first)",
+        "(hot ?spot|bottleneck|dominant|top cost|biggest cost|most expensive|costly|consumes the most|should be optimi[sz]ed|needs? optimi[sz]ing|priority to fix|top offender|primary driver|main driver|worth fixing|fix (this )?first|optimi[sz]e (this|it) first).{0,80}(legacy\\.py|reconcile_batch_legacy)"
+      ],
+      "penalty": 20
+    }
+  ]
+}

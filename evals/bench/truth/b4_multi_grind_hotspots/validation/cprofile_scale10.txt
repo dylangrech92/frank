@@ -1,0 +1,57 @@
+Command: cProfile over `workload.py --scale 10`, cwd = fixtures/grind, sorted
+by cumulative then by internal (self) time. 32,000 records, 0 rejected.
+
+         27632737 function calls (27631543 primitive calls) in 8.422 seconds
+
+   Ordered by: cumulative time
+   List reduced from 496 to 20 due to restriction <20>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000    8.427    8.427 <frozen runpy>:262(run_path)
+     35/2    0.000    0.000    8.426    4.213 {built-in method builtins.exec}
+        1    0.000    0.000    8.426    8.426 <frozen runpy>:91(_run_module_code)
+        1    0.000    0.000    8.426    8.426 <frozen runpy>:65(_run_code)
+        1    0.000    0.000    8.426    8.426 workload.py:1(<module>)
+        1    0.069    0.069    8.418    8.418 workload.py:24(main)
+        1    0.002    0.002    8.344    8.344 grind/pipeline.py:13(run)
+        1    3.481    3.481    3.490    3.490 grind/dedup.py:19(mark_duplicates)         <- T3, now #1
+        1    0.006    0.006    2.563    2.563 grind/parse.py:41(parse_events)
+    32000    0.047    0.000    2.555    0.000 grind/parse.py:12(parse_event)
+        1    0.104    0.104    1.949    1.949 grind/generator.py:197(generate_events)
+    32000    0.795    0.000    1.853    0.000 grind/normalize.py:74(canonicalize_path)   <- T1
+    32000    0.104    0.000    1.320    0.000 grind/generator.py:157(_build_metadata)
+    63134    0.020    0.000    0.733    0.000 json/__init__.py:299(loads)
+    63134    0.081    0.000    0.704    0.000 json/decoder.py:333(decode)
+    63134    0.593    0.000    0.593    0.000 json/decoder.py:344(raw_decode)            <- T2
+  2037787    0.316    0.000    0.404    0.000 grind/normalize.py:60(_char_class)
+    32001    0.017    0.000    0.396    0.000 json/__init__.py:183(dumps)
+    32001    0.016    0.000    0.376    0.000 json/encoder.py:183(encode)
+  1239536    0.245    0.000    0.373    0.000 random.py:242(_randbelow_with_getrandbits)
+
+=== BY TOTTIME (self time) ===
+         27632737 function calls (27631543 primitive calls) in 8.422 seconds
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    3.481    3.481    3.490    3.490 grind/dedup.py:19(mark_duplicates)          <- T3, #1 (41.3% of total)
+    32000    0.795    0.000    1.853    0.000 grind/normalize.py:74(canonicalize_path)    <- T1, #2 (9.4%)
+    63134    0.593    0.000    0.593    0.000 json/decoder.py:344(raw_decode)              <- T2, #3 (7.0%)
+    32001    0.352    0.000    0.352    0.000 json/encoder.py:205(iterencode)              (generation noise)
+  6722776    0.333    0.000    0.333    0.000 {method 'append' of 'list' objects}
+  2037787    0.316    0.000    0.404    0.000 grind/normalize.py:60(_char_class)
+  1239536    0.245    0.000    0.373    0.000 random.py:242(_randbelow_with_getrandbits)
+    32000    0.224    0.000    0.326    0.000 grind/generator.py:131(_build_history)
+  4075602    0.179    0.000    0.179    0.000 {method 'lower' of 'str' objects}
+    32000    0.172    0.000    0.291    0.000 grind/normalize.py:40(_decode_percent)
+
+Ranking by tottime at scale 10: T3 (3.481s, 41.3% of 8.422s total)
+>> T1 (0.795s, 9.4%) > T2 stdlib raw_decode (0.593s, 7.0%).
+
+Confirmed scale-dependent ranking shift:
+  scale 1:  T1 (14.5%) > T2 (8.4%)  > T3 (7.6%)   -- T3 is #3, cheap.
+  scale 10: T3 (41.3%) > T1 (9.4%)  > T2 (7.0%)   -- T3 is #1, dominant.
+
+T3 absolute cost grew ~87x (0.040s -> 3.481s) while record count only grew
+10x -- consistent with the O(n^2) `if key in seen: ... else: seen.append`
+list-membership pattern in dedup.py (10x records -> ~100x comparisons).
+T1 and T2 both grew roughly linearly with record count (~10.5x and ~13.5x
+respectively), as expected for per-record work.

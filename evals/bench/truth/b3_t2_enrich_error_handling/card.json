@@ -1,0 +1,96 @@
+{
+  "facts": [
+    {
+      "id": "b3_t2c_load_plugin_raises_pluginloaderror",
+      "tier": "T2",
+      "weight": 2,
+      "any": [
+        "load_plugin[\\s\\S]{0,150}(raise|raises)[\\s\\S]{0,50}PluginLoadError",
+        "PluginLoadError[\\s\\S]{0,150}(no\\s+such\\s+enrichment\\s+plugin|no\\s+PLUGIN\\s+entry\\s+point|module\\s+(does\\s+not\\s+exist|cannot\\s+be\\s+imported))"
+      ]
+    },
+    {
+      "id": "b3_t2c_enrich_raises_enrichmenterror",
+      "tier": "T2",
+      "weight": 2,
+      "any": [
+        "postal_code[\\s\\S]{0,150}(raise|raises)[\\s\\S]{0,50}EnrichmentError",
+        "EnrichmentError[\\s\\S]{0,150}(no\\s+postal_code|missing\\s+postal_code)",
+        "builtin_enricher[\\s\\S]{0,150}EnrichmentError"
+      ]
+    },
+    {
+      "id": "b3_t2c_orchestrator_catches_relayerror",
+      "tier": "T2",
+      "weight": 2,
+      "any": [
+        "except\\s+RelayError[\\s\\S]{0,150}should_retry",
+        "orchestrator\\.py[\\s\\S]{0,150}except\\s+RelayError",
+        "run_pipeline[\\s\\S]{0,150}(catches?|catching)[\\s\\S]{0,100}RelayError"
+      ]
+    },
+    {
+      "id": "b3_t2c_pluginloaderror_is_retried",
+      "tier": "T2",
+      "weight": 2,
+      "any": [
+        "RETRYABLE_EXCEPTIONS[\\s\\S]{0,120}PluginLoadError",
+        "PluginLoadError[\\s\\S]{0,150}(is\\s+)?retr(y|ied|yable)",
+        "PluginLoadError[\\s\\S]{0,150}scheduled?\\s+(for\\s+)?retry"
+      ]
+    },
+    {
+      "id": "b3_t2c_enrichmenterror_deadletters_immediately",
+      "tier": "T2",
+      "weight": 2,
+      "any": [
+        "EnrichmentError(?:(?!PluginLoadError|DeliveryError)[\\s\\S]){0,150}dead[-\\s]?letter(ed)?\\s+immediately",
+        "EnrichmentError(?:(?!PluginLoadError|DeliveryError)[\\s\\S]){0,150}\\bnot\\s+retr(y|ied|yable)\\b",
+        "EnrichmentError(?:(?!PluginLoadError|DeliveryError)[\\s\\S]){0,150}\\bisn't\\s+retr",
+        "EnrichmentError[\\s\\S]{0,100}not\\s+(in|among)\\s+RETRYABLE_EXCEPTIONS"
+      ]
+    },
+    {
+      "id": "b3_t2c_flag_large_order_raises_valueerror",
+      "tier": "T2",
+      "weight": 3,
+      "any": [
+        "flag_large_order[\\s\\S]{0,150}(raise|raises)[\\s\\S]{0,50}ValueError",
+        "ValueError[\\s\\S]{0,150}(qty|quantity)[\\s\\S]{0,150}(compliance|large\\s+order)",
+        "audit\\.py[\\s\\S]{0,150}flag_large_order[\\s\\S]{0,150}ValueError"
+      ]
+    },
+    {
+      "id": "b3_t2c_bus_swallows_flag_large_order_error",
+      "tier": "T2",
+      "weight": 3,
+      "any": [
+        "flag_large_order[\\s\\S]{0,200}(bus\\.publish|EventBus\\.publish)[\\s\\S]{0,150}(catch|catches|caught|swallow|swallows|swallowed)",
+        "(bus\\.publish|EventBus\\.publish)[\\s\\S]{0,200}(catch|catches|caught)[\\s\\S]{0,150}ValueError",
+        "flag_large_order[\\s\\S]{0,200}(never\\s+reaches?|does\\s*n[o']?t\\s+reach)[\\s\\S]{0,100}orchestrator",
+        "flag_large_order[\\s\\S]{0,200}(logged|log\\s+line)[\\s\\S]{0,150}(no|not)[\\s\\S]{0,50}retry"
+      ]
+    }
+  ],
+  "traps": [
+    {
+      "id": "b3_t2c_trap_enrichmenterror_retried_too",
+      "any": [
+        "EnrichmentError(?:(?!PluginLoadError|DeliveryError)[\\s\\S]){0,60}\\b(gets?|is|will\\s+be)\\s+retried\\b",
+        "EnrichmentError(?:(?!PluginLoadError|DeliveryError)[\\s\\S]){0,60}\\bis\\s+retryable\\b",
+        "(both|same\\s+way)[\\s\\S]{0,40}EnrichmentError[\\s\\S]{0,40}PluginLoadError[\\s\\S]{0,60}\\bretried\\b"
+      ],
+      "penalty": 20
+    },
+    {
+      "id": "b3_t2c_trap_flag_large_order_hits_relayerror_handler",
+      "any": [
+        "flag_large_order(?:(?!\\bnot\\b|n't|never|does\\s*n[o']?t|without|skip)[\\s\\S]){0,150}(caught|handled)\\s+by[\\s\\S]{0,60}except\\s+RelayError",
+        "flag_large_order(?:(?!\\bnot\\b|n't|never|does\\s*n[o']?t|without|skip)[\\s\\S]){0,150}\\b(gets?|is)\\s+(dead[-\\s]?lettered|retried)\\b",
+        "(ValueError|flag_large_order)[\\s\\S]{0,80}(same\\s+way|like\\s+the\\s+others|just\\s+like)[\\s\\S]{0,80}\\bretried\\b"
+      ],
+      "penalty": 20
+    }
+  ],
+  "items": []
+}

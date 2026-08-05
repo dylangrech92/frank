@@ -1,0 +1,151 @@
+{
+  "facts": [],
+  "traps": [],
+  "items": [
+    {
+      "id": "b5_t1_swallowed_io_error",
+      "kind": "bug",
+      "tier": "T1",
+      "any": [
+        "_read_csv_rows",
+        "importer\\.py[\\s\\S]{0,300}(except\\s+OSError|except\\s+Exception)[\\s\\S]{0,200}return",
+        "importer\\.py[\\s\\S]{0,300}(swallow|discard|silent|hid(e|den|ing)|suppress)[\\s\\S]{0,300}(i/?\\s?o\\s*error|oserror|exception|permission|unreadable)",
+        "(permission[- ]denied|unreadable|corrupt(ed)?)[\\s\\S]{0,200}(csv|import)[\\s\\S]{0,200}(silent|no\\s*(error|log)|not\\s+logged)"
+      ]
+    },
+    {
+      "id": "b5_t1_dead_validate_swift_bic",
+      "kind": "dead",
+      "tier": "T1",
+      "any": [
+        "validate_swift_bic",
+        "validators\\.py[\\s\\S]{0,200}(swift|bic)[\\s\\S]{0,200}(dead|unused|never\\s+call|no\\s+caller|not\\s+call)",
+        "(dead|unused|unreferenced|never[- ]called)[\\s\\S]{0,200}(swift|bic)[\\s\\S]{0,100}function"
+      ]
+    },
+    {
+      "id": "b5_t1_unreachable_classify_amount",
+      "kind": "dead",
+      "tier": "T1",
+      "any": [
+        "classify_amount",
+        "validators\\.py[\\s\\S]{0,200}unreachable[\\s\\S]{0,200}(branch|else|code|path)",
+        "unreachable[\\s\\S]{0,150}(else|branch)[\\s\\S]{0,150}(classify_amount|\"unknown\"|'unknown')"
+      ]
+    },
+    {
+      "id": "b5_t1_unused_strict_duplicate_check",
+      "kind": "dead",
+      "tier": "T1",
+      "any": [
+        "strict_duplicate_check",
+        "config\\.py[\\s\\S]{0,200}(unused|dead|never\\s+(used|read|checked)|no\\s+effect|not\\s+used)[\\s\\S]{0,150}(flag|config|option)",
+        "(unused|dead|no-op|has\\s+no\\s+effect)[\\s\\S]{0,150}config\\s+flag"
+      ]
+    },
+    {
+      "id": "b5_t2_mutable_default_running_totals",
+      "kind": "bug",
+      "tier": "T2",
+      "any": [
+        "summarize_by_category",
+        "running_totals",
+        "aggregator\\.py[\\s\\S]{0,250}mutable\\s+default[\\s\\S]{0,150}(argument|arg|parameter)",
+        "default\\s+(argument|arg|value)[\\s\\S]{0,150}(dict|\\{\\})[\\s\\S]{0,250}(accumulat|persist|leak|carr(y|ies)\\s+over|shared\\s+across)",
+        "(aggregate|category\\s+total)[\\s\\S]{0,200}(leak|accumulat|carr(y|ies)\\s+over)[\\s\\S]{0,200}(batch|call)"
+      ]
+    },
+    {
+      "id": "b5_t2_inplace_sort_top_movers",
+      "kind": "bug",
+      "tier": "T2",
+      "any": [
+        "top_movers",
+        "aggregator\\.py[\\s\\S]{0,250}(sort\\(\\)|\\.sort\\()[\\s\\S]{0,200}(in[- ]place|mutat)",
+        "(in[- ]place\\s+sort|sorts?[\\s\\S]{0,80}in\\s+place)[\\s\\S]{0,250}(corrupt|mutat|shared)",
+        "recent_activity[\\s\\S]{0,250}(no\\s+longer|not)\\s+chronological",
+        "batch\\.transactions[\\s\\S]{0,200}(sort|mutat|corrupt)"
+      ]
+    },
+    {
+      "id": "b5_t2_float_equality_reconcile",
+      "kind": "bug",
+      "tier": "T2",
+      "any": [
+        "reconcile",
+        "aggregator\\.py[\\s\\S]{0,200}(float|floating[- ]point)[\\s\\S]{0,200}(equal|==)",
+        "==[\\s\\S]{0,150}(float|currency|balance)[\\s\\S]{0,200}(precision|round(ing)?|drift|epsilon)",
+        "(computed_total|computed)\\s*==\\s*(account\\.)?expected_closing_balance"
+      ]
+    },
+    {
+      "id": "b5_t3_cache_keyed_by_name",
+      "kind": "bug",
+      "tier": "T3",
+      "any": [
+        "AccountCache",
+        "cache\\.py[\\s\\S]{0,250}(key(ed)?|indexed)[\\s\\S]{0,150}name[\\s\\S]{0,200}(not\\s+unique|collis|duplicat|shared|same\\s+name)",
+        "cache[\\s\\S]{0,250}(stale|wrong|incorrect)[\\s\\S]{0,150}(account|entry|entries)[\\s\\S]{0,150}(same\\s+name|shared\\s+name|name\\s+collision)",
+        "account_cache\\.lookup|cache\\.lookup"
+      ]
+    },
+    {
+      "id": "b5_t3_pagination_offbyone_exact_multiple",
+      "kind": "bug",
+      "tier": "T3",
+      "any": [
+        "get_page",
+        "paginator\\.py[\\s\\S]{0,250}(off[- ]by[- ]one|drop(s|ped)?)[\\s\\S]{0,200}(record|item|row)",
+        "(page\\s*size|page_size)[\\s\\S]{0,200}(divide|multiple|evenly)[\\s\\S]{0,200}(drop|miss(ing)?|lost)",
+        "(last|final)\\s+(page|record)[\\s\\S]{0,200}(drop|miss(ing)?|exclud)"
+      ]
+    },
+    {
+      "id": "b5_t3_dst_stale_cached_offset",
+      "kind": "bug",
+      "tier": "T3",
+      "any": [
+        "cached_utc_offset_minutes",
+        "apply_cached_offset",
+        "timezones\\.py[\\s\\S]{0,250}(stale|cached)[\\s\\S]{0,200}(offset|timezone|dst)",
+        "daily_totals[\\s\\S]{0,250}(dst|daylight\\s+saving)[\\s\\S]{0,250}(wrong|incorrect|off\\s+by)",
+        "(dst|daylight\\s+saving)[\\s\\S]{0,250}(boundary|transition|change)[\\s\\S]{0,250}(wrong\\s+day|wrong\\s+date|off\\s+by\\s+an?\\s+hour|off\\s+by\\s+a\\s+day)",
+        "(double|twice|reappli)[\\s\\S]{0,200}(timezone|tz)[\\s\\S]{0,200}conversion"
+      ]
+    },
+    {
+      "id": "b5_decoy_getattr_handler_dispatch",
+      "kind": "decoy",
+      "tier": "decoy",
+      "any": [
+        "handle_csv[\\s\\S]{0,150}(dead|unused|never\\s+call|no\\s+caller)",
+        "handle_json[\\s\\S]{0,150}(dead|unused|never\\s+call|no\\s+caller)",
+        "handle_text[\\s\\S]{0,150}(dead|unused|never\\s+call|no\\s+caller)",
+        "handlers\\.py[\\s\\S]{0,200}(dead|unused|unreachable)[\\s\\S]{0,200}(function|code|handler)",
+        "(dead|unused|unreachable)[\\s\\S]{0,150}(handle_csv|handle_json|handle_text|handlers\\.py)"
+      ]
+    },
+    {
+      "id": "b5_decoy_safe_call_reraise",
+      "kind": "decoy",
+      "tier": "decoy",
+      "any": [
+        "safe_call[\\s\\S]{0,200}(swallow|hid(e|den|ing)|suppress|silent(ly)?)[\\s\\S]{0,200}(exception|error)",
+        "errors\\.py[\\s\\S]{0,200}(swallow|hid(e|den|ing)|suppress)[\\s\\S]{0,200}exception",
+        "(swallow|hid(e|den|ing)|suppress)[\\s\\S]{0,150}exception[\\s\\S]{0,150}safe_call"
+      ]
+    },
+    {
+      "id": "b5_decoy_registered_field_validators",
+      "kind": "decoy",
+      "tier": "decoy",
+      "any": [
+        "_validate_account_id_field[\\s\\S]{0,150}(dead|unused|never\\s+call|no\\s+caller)",
+        "_validate_currency_field[\\s\\S]{0,150}(dead|unused|never\\s+call|no\\s+caller)",
+        "_validate_txn_id_field[\\s\\S]{0,150}(dead|unused|never\\s+call|no\\s+caller)",
+        "FIELD_VALIDATORS[\\s\\S]{0,200}(dead|unused|unreachable)",
+        "(dead|unused|unreachable)[\\s\\S]{0,150}(field\\s+validator|registered\\s+validator)"
+      ]
+    }
+  ]
+}

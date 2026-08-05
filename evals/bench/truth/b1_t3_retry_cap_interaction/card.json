@@ -1,0 +1,36 @@
+{
+  "facts": [
+    {
+      "id": "b1_t3_should_retry_offbyone",
+      "tier": "T3",
+      "weight": 10,
+      "any": [
+        "retry\\.py[\\s\\S]{0,250}should_retry[\\s\\S]{0,200}(<\\s*self\\.max_retries|off[- ]by[- ]one|one\\s+(fewer|less)\\s+(retry|attempt))",
+        "(attempts?\\s*<\\s*(self\\.)?max_retries)[\\s\\S]{0,200}(should\\s+be|instead\\s+of|not)[\\s\\S]{0,100}<=",
+        "(only|just)\\s+3\\s+(total\\s+)?attempts?[\\s\\S]{0,200}(instead\\s+of|expected|not\\s+4)\\s*4?"
+      ]
+    },
+    {
+      "id": "b1_t3_worker_cap_inverted",
+      "tier": "T3",
+      "weight": 10,
+      "any": [
+        "(worker\\.py|_run_with_retries)[\\s\\S]{0,300}(cap|clamp|max_delay)[\\s\\S]{0,250}(invert|backwards|wrong\\s+way|swapped|flipped|reversed)",
+        "(raw_delay\\s*<\\s*.{0,30}max_delay|if\\s+raw_delay\\s*<)[\\s\\S]{0,250}(delay\\s*=\\s*.{0,30}max_delay)",
+        "(small|short)\\s+delays?[\\s\\S]{0,250}(maxed\\s+out|clamped\\s+up|forced\\s+to\\s+max|needlessly\\s+max)[\\s\\S]{0,300}(large|long)\\s+delays?[\\s\\S]{0,200}(uncapped|exceed|not\\s+capped|no\\s+cap)",
+        "(condition|comparison|if\\s+statement)[\\s\\S]{0,150}(backwards|inverted|flipped|wrong\\s+way\\s+round)[\\s\\S]{0,250}(max_delay|cap)"
+      ]
+    }
+  ],
+  "traps": [
+    {
+      "id": "b1_t3_trap_backoff_formula_blamed",
+      "any": [
+        "(compute_backoff|backoff_factor)[\\s\\S]{0,100}(is\\s+the\\s+bug|is\\s+the\\s+root\\s+cause|is\\s+wrong|has\\s+an?\\s+incorrect\\s+formula)",
+        "(backoff_factor|base_delay)[\\s\\S]{0,100}(is\\s+too\\s+(high|large)|is\\s+misconfigured|should\\s+be\\s+(lower|smaller))"
+      ],
+      "penalty": 20
+    }
+  ],
+  "items": []
+}

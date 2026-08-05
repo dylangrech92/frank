@@ -1,0 +1,152 @@
+=== FACT GROUNDING: ingest builds fresh Event (sole construction site) ===
+     1	"""Turns raw external payloads into `Event` objects.
+     2	
+     3	This is the only module that constructs an `Event` with a freshly
+     4	generated id from raw input; every other stage receives an event that
+     5	already exists.
+     6	"""
+     7	from __future__ import annotations
+     8	
+     9	from relay.events import Event, EVENT_ORDER_CREATED
+    10	from relay.utils.ids import generate_event_id
+    11	
+    12	
+    13	def build_order_event(raw: dict) -> Event:
+    14	    """Wrap a raw dict, as received from an external producer, in an
+    15	    `Event` with a freshly generated id."""
+    16	    return Event(event_id=generate_event_id(), name=EVENT_ORDER_CREATED, payload=dict(raw))
+
+=== FACT GROUNDING: transform -> validate -> enrich -> deliver, in orchestrator.py ===
+def run_ingest(raw: dict) -> Event:
+    with metrics.timer("stage.ingest"):
+        return ingest.build_order_event(raw)
+
+
+def run_transform(event: Event) -> Event:
+    with metrics.timer("stage.transform"):
+        bus.publish(EVENT_ORDER_CREATED, event)
+    return event
+
+
+def run_validate(event: Event) -> Event:
+    with metrics.timer("stage.validate"):
+        validate.validate_order(event)
+        bus.publish(EVENT_ORDER_VALIDATED, event)
+    return event
+
+
+def run_enrich(event: Event) -> Event:
+    with metrics.timer("stage.enrich"):
+        plugin = loader.load_plugin(config.ENRICHMENT_PLUGIN)
+        plugin.enrich(event)
+    bus.publish(EVENT_ORDER_ENRICHED, event)
+    return event
+
+
+def run_deliver(event: Event) -> Event:
+    with metrics.timer("stage.deliver"):
+        delivery.finalize_and_send(event)
+    return event
+
+
+=== FACT GROUNDING: audit handlers fire on EVENT_ORDER_VALIDATED / EVENT_ORDER_ENRICHED ===
+"""Audit-log handlers for the order lifecycle.
+
+Neither function here changes the event; both exist purely to leave a
+structured trail of what happened, at the two stage boundaries that
+aren't already covered by `transform.normalize_event`.
+"""
+from __future__ import annotations
+
+import logging
+
+from relay.bus import bus
+from relay.events import EVENT_ORDER_ENRICHED, EVENT_ORDER_VALIDATED
+
+_audit_log = logging.getLogger("relay.audit")
+
+
+@bus.on(EVENT_ORDER_VALIDATED)
+def record_validation(event) -> None:
+    """Audit-log every order that passes validation."""
+    _audit_log.info("order %s validated (sku=%s)", event.event_id, event.payload.get("sku"))
+
+
+@bus.on(EVENT_ORDER_ENRICHED)
+def record_enrichment(event) -> None:
+    """Audit-log the region an order was enriched with."""
+    _audit_log.info(
+
+=== FACT GROUNDING: enrich stage dynamically imports the plugin ===
+49:        module = importlib.import_module(module_name)
+
+=== FACT GROUNDING: default sink resolves to file_sink -> delivered.jsonl ===
+relay/config.py:14:# One of the keys in `relay.handlers.delivery.SINK_DISPATCH`. The demo
+relay/config.py:17:DELIVERY_SINK = "file"
+relay/handlers/delivery.py:9:SINK_DISPATCH = {
+relay/handlers/delivery.py:17:    sink `config.DELIVERY_SINK` selects.
+relay/handlers/delivery.py:19:    Raises `DeliveryError` if `config.DELIVERY_SINK` doesn't name a
+relay/handlers/delivery.py:23:    send = SINK_DISPATCH.get(config.DELIVERY_SINK)
+relay/handlers/delivery.py:25:        raise DeliveryError(f"no such delivery sink: {config.DELIVERY_SINK!r}")
+relay/config.py:10:OUTPUT_PATH = "delivered.jsonl"
+relay/sinks/file_sink.py:13:    """Append `event` to `config.OUTPUT_PATH`. Raises `DeliveryError` if
+relay/sinks/file_sink.py:22:        with open(config.OUTPUT_PATH, "a", encoding="utf-8") as fh:
+
+=== TRAP LIVENESS: log_sink.py never opens/writes any event data file ===
+2:from __future__ import annotations
+4:import logging
+(log_sink.py has no 'open(' call anywhere -- it only calls logger.info/warning, confirmed below)
+     1	"""Human-readable operational logging for the pipeline."""
+     2	from __future__ import annotations
+     3	
+     4	import logging
+     5	
+     6	logger = logging.getLogger("relay.pipeline")
+     7	
+     8	
+     9	def log_delivered(event) -> None:
+    10	    logger.info("delivered %s (%d attempt(s))", event.event_id, event.attempts + 1)
+    11	
+    12	
+    13	def log_dead_lettered(event, error: Exception) -> None:
+    14	    """Emit a warning log line for an event that has been dead-lettered."""
+    15	    logger.warning("event %s dead-lettered: %s: %s", event.event_id, type(error).__name__, error)
+    16	
+    17	
+    18	def log_retry_scheduled(event, delay_s: float) -> None:
+    19	    logger.info("retry %d scheduled for %s in %.2fs", event.attempts, event.event_id, delay_s)
+
+=== FACT GROUNDING: finalize_and_send re-normalizes via the clean_event alias before dispatching to a sink ===
+relay/handlers/delivery.py:1-30:
+"""Final-mile helpers for the deliver stage."""
+from __future__ import annotations
+
+from relay import config
+from relay.compat.legacy import clean_event
+from relay.errors import DeliveryError
+from relay.sinks import file_sink, webhook_sink
+
+SINK_DISPATCH = {
+    "file": file_sink.send_to_file_sink,
+    "webhook": webhook_sink.send_to_webhook_sink,
+}
+
+
+def finalize_and_send(event) -> None:
+    """Run the last normalization pass, then hand `event` to whichever
+    sink `config.DELIVERY_SINK` selects.
+
+    Raises `DeliveryError` if `config.DELIVERY_SINK` doesn't name a
+    known sink.
+    """
+    clean_event(event)
+(clean_event is the aliased normalize_event imported from relay.compat.legacy -- confirms the payload is
+normalized a second time, right before dispatch, not just once back at the transform stage)
+
+=== TRAP LIVENESS: the webhook sink is registered in SINK_DISPATCH but not reached under the default config ===
+relay/config.py:17:DELIVERY_SINK = "file"
+SINK_DISPATCH.get(config.DELIVERY_SINK) resolves to file_sink.send_to_file_sink under the default config;
+webhook_sink.send_to_webhook_sink is only reached if DELIVERY_SINK is changed away from "file".
+$ python3 -c "main.run_demo(); print(Path('webhook_outbox.jsonl').exists())"
+False
+(confirms webhook_outbox.jsonl is never created by a default `python3 main.py demo` run)
