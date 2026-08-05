@@ -16,10 +16,16 @@ from typing import Callable
 
 import compaction
 import ui
-from llm import ChatResponse, LLMClient, OverCapError
+from llm import ChatResponse, LLMClient, OverCapError, StreamStalledError
 from session import Session
 from turn.outcome import _over_cap_giveup
 from turn.state import _TurnState
+
+# How many times one logical LLM call may be re-issued after its SSE stream
+# died mid-drain (StreamStalledError). Kept small: a transient backend hiccup
+# recovers on the first retry, a wedged backend won't recover on any — and
+# each stalled attempt can already burn the full per-read-gap timeout.
+_MAX_STREAM_STALL_RETRIES = 2
 
 
 def _record_llm_usage(
@@ -87,10 +93,16 @@ def _run_llm_with_compaction(
     """Compact the assembled context under cap, then make one chat call.
 
     Runs the full pre-flight compaction ladder (summarizer loop with a thrash
-    guard, then the free force_fold last resort), makes exactly one
-    ``client.chat`` call, and folds the response's usage into the session/turn
-    stats. When the provider rejects the request with ``OverCapError`` despite
-    the estimate, it compacts once and retries the whole cycle.
+    guard, then the free force_fold last resort), makes one ``client.chat``
+    call per attempt, and folds the successful response's usage into the
+    session/turn stats. When the provider rejects the request with ``OverCapError`` despite
+    the estimate, it compacts once and retries the whole cycle. When the SSE
+    stream dies without a complete response (``StreamStalledError``), the call
+    is re-issued up to ``_MAX_STREAM_STALL_RETRIES`` times — the context is
+    unchanged by the failed call, and this is the one caller that may retry
+    past forwarded deltas: fragments already streamed belong to the abandoned
+    response, the retried call re-delivers the whole answer, and the telemetry
+    line between them makes the discard visible.
 
     Returns the ``ChatResponse`` on success, or the over-cap give-up string
     (already delivered to the transcript/on_delta) when compaction is exhausted
@@ -101,6 +113,7 @@ def _run_llm_with_compaction(
     # compactions that failed to reduce the context (further calls won't
     # converge) and fall through to the force_fold last resort.
     max_non_shrink = 2
+    stream_stalls = 0
 
     while True:
         # Pre-flight: keep the assembled request at or below the shared cap,
@@ -217,6 +230,25 @@ def _run_llm_with_compaction(
             # Same reasoning as the pre-flight compaction path above: the
             # baseline this real measurement was keyed to no longer applies.
             session.last_prompt_tokens = None
+            continue
+        except StreamStalledError as exc:
+            # The SSE stream died without a complete response (llm.py already
+            # burned its own pre-first-token attempt). The failed call changed
+            # nothing in the session, so re-issuing it is safe; any fragments
+            # already streamed belong to the abandoned response and the retried
+            # call re-delivers the whole answer. state.streamed resets at the
+            # top of the try, so the answer-already-streamed accounting starts
+            # fresh with the retry.
+            stream_stalls += 1
+            if stream_stalls > _MAX_STREAM_STALL_RETRIES:
+                raise
+            print(
+                ui.telemetry(
+                    f"llm stream stalled ({exc}); re-issuing call "
+                    f"(retry {stream_stalls}/{_MAX_STREAM_STALL_RETRIES})"
+                ),
+                file=sys.stderr,
+            )
             continue
 
         state.est = est

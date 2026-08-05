@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 import requests
 from config import LLMConfig
@@ -15,10 +16,14 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
 
 # One retry, ~1s backoff, on 5xx and connection-level errors (F5). Never
-# retried: 4xx responses, and anything past the point a 2xx response has
-# started streaming deltas to on_delta — which includes a wall-clock ceiling
-# breach, raised only after the stream is already underway (see
-# LLMClient._request_with_retry and _read_sse_response).
+# retried: 4xx responses, a wall-clock ceiling breach (ResponseCeilingError —
+# the model is generating too long; a retry reproduces it), and anything past
+# the point a 2xx stream has forwarded text to on_delta (replaying would
+# deliver part of the answer twice; that failure surfaces as
+# StreamStalledError so the caller — who owns the delivery contract — can
+# decide). A 2xx stream that dies BEFORE the first text delta is invisible to
+# the caller, so chat() re-issues it once itself (see the stream-attempt loop
+# there).
 _MAX_ATTEMPTS = 2
 _RETRY_BACKOFF_SECONDS = 1.0
 
@@ -95,6 +100,22 @@ class ResponseCeilingError(Exception):
     tool-call fragments — so the caller can see the size of the abandoned
     generation. Never retried: it is raised only after a 2xx stream has already
     started forwarding deltas to ``on_delta`` (see LLMClient._request_with_retry).
+    """
+
+    pass
+
+
+class StreamStalledError(Exception):
+    """Raised when an SSE stream died mid-drain and the client cannot safely retry.
+
+    Two ways in (see ``LLMClient.chat``): the stream stalled before the first
+    token on both attempts, or it died after assistant text had already been
+    forwarded to ``on_delta`` — re-issuing the request here would deliver part
+    of the answer twice. The conversation context is unchanged by the failed
+    call, so a caller whose delivery contract tolerates the already-forwarded
+    fragments may re-issue the call itself (turn/llm_call.py does, announcing
+    the discard on stderr); every other caller should treat this as the call
+    failing.
     """
 
     pass
@@ -438,7 +459,6 @@ class LLMClient:
             RuntimeError: On a 5xx or connection-level failure that persists
                 through the retry.
         """
-        last_exc: Exception | None = None
         for attempt in range(_MAX_ATTEMPTS):
             is_last_attempt = attempt == _MAX_ATTEMPTS - 1
             request_started = time.monotonic()
@@ -451,8 +471,13 @@ class LLMClient:
                     timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
                 )
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
-                last_exc = exc
                 if not is_last_attempt:
+                    # Announced because on the non-streaming path post() waits
+                    # out the whole generation, so one silent attempt can be
+                    # _READ_TIMEOUT_SECONDS of stderr silence — a liveness
+                    # watchdog reading this process must see the retry happen.
+                    print(f"llm: request failed with no response ({exc}); retrying",
+                          file=sys.stderr)
                     time.sleep(_RETRY_BACKOFF_SECONDS)
                     continue
                 raise RuntimeError(f"connection error: {exc}") from exc
@@ -460,6 +485,7 @@ class LLMClient:
             if resp.status_code >= 500:
                 if not is_last_attempt:
                     resp.close()
+                    print(f"llm: HTTP {resp.status_code}; retrying", file=sys.stderr)
                     time.sleep(_RETRY_BACKOFF_SECONDS)
                     continue
                 body_text = resp.text
@@ -468,7 +494,7 @@ class LLMClient:
             return resp, request_started
 
         # Unreachable: the loop above always either returns or raises.
-        raise RuntimeError(f"request failed after retry: {last_exc}")
+        raise RuntimeError("request failed after retry")
 
     def chat(
         self,
@@ -499,6 +525,11 @@ class LLMClient:
             *context_length_exceeded* or *maximum context length*.
         ResponseCeilingError: When a streaming response keeps trickling past the
             whole-call wall-clock ceiling (streaming path only; not retried).
+        StreamStalledError: When the SSE stream died mid-drain and retrying
+            here is unsafe — either it stalled before the first token on both
+            attempts, or text had already been forwarded to ``on_delta``. The
+            context is unchanged; the caller may re-issue the call if its
+            delivery contract tolerates the already-forwarded fragments.
         RuntimeError: For all other non-2xx responses, including the HTTP status
             and response body text.
     """
@@ -536,40 +567,87 @@ class LLMClient:
             "Authorization": f"Bearer {self.config.api_key}",
         }
 
-        resp, request_started = self._request_with_retry(url, body, headers, want_stream)
+        # A streaming attempt that dies mid-drain (per-read-gap timeout, severed
+        # connection, truncated chunked body) is past the reach of
+        # _request_with_retry, whose loop ends at the 2xx. Recovery depends on
+        # whether the sink has seen anything: before the first text delta a
+        # fresh attempt is invisible to the caller, so one is made here —
+        # announced on stderr, because a silent retry is a ~10-minute gap that
+        # reads as a hang to anything supervising this process by output
+        # liveness. Once text HAS been forwarded, replaying would deliver part
+        # of the answer twice, so the decision moves up: StreamStalledError
+        # tells the caller the context is intact and a re-issue is its call
+        # (turn/llm_call.py owns that retry).
+        stream_attempts = 0
+        while True:
+            resp, request_started = self._request_with_retry(url, body, headers, want_stream)
 
-        if resp.status_code >= 400:
-            body_text = resp.text
-            detail = f"HTTP {resp.status_code}: {body_text}"
-            if resp.status_code == 400 and (
-                "context_length_exceeded" in body_text.lower()
-                or "maximum context length" in body_text.lower()
-            ):
-                raise OverCapError(f"context too long: {detail}")
-            raise RuntimeError(detail)
+            if resp.status_code >= 400:
+                body_text = resp.text
+                detail = f"HTTP {resp.status_code}: {body_text}"
+                if resp.status_code == 400 and (
+                    "context_length_exceeded" in body_text.lower()
+                    or "maximum context length" in body_text.lower()
+                ):
+                    raise OverCapError(f"context too long: {detail}")
+                raise RuntimeError(detail)
 
-        content_type = resp.headers.get("Content-Type", "")
-        if on_delta is not None and want_stream and content_type.startswith("text/event-stream"):
-            return _read_sse_response(resp.iter_lines(), on_delta, request_started)
+            content_type = resp.headers.get("Content-Type", "")
+            if on_delta is not None and want_stream and content_type.startswith("text/event-stream"):
+                sink = on_delta
+                forwarded = 0
 
-        data = resp.json()
+                def counted_delta(piece: str, _sink: Callable[[str], None] = sink) -> None:
+                    nonlocal forwarded
+                    forwarded += len(piece)
+                    _sink(piece)
 
-        choices = data.get("choices", [])
-        usage = data.get("usage") or {}
-        prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
+                try:
+                    return _read_sse_response(resp.iter_lines(), counted_delta, request_started)
+                except (
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError,
+                ) as exc:
+                    stream_attempts += 1
+                    elapsed = time.monotonic() - request_started
+                    if forwarded:
+                        raise StreamStalledError(
+                            f"stream died after {elapsed:.1f}s with {forwarded} "
+                            f"assistant-text character(s) already forwarded: {exc}"
+                        ) from exc
+                    if stream_attempts >= 2:
+                        raise StreamStalledError(
+                            f"stream stalled before the first token on "
+                            f"{stream_attempts} attempts (last after {elapsed:.1f}s): {exc}"
+                        ) from exc
+                    print(
+                        f"llm: stream stalled before the first token "
+                        f"({elapsed:.1f}s: {exc}); retrying",
+                        file=sys.stderr,
+                    )
+                    continue
 
-        if not choices:
-            return ChatResponse(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+            data = resp.json()
 
-        message = choices[0].get("message", {})
-        text = message.get("content", "") or ""
-        tool_calls_raw = message.get("tool_calls") or []
-        tool_calls = [_tool_call_from_dict(tc) for tc in tool_calls_raw]
+            choices = data.get("choices", [])
+            usage = data.get("usage") or {}
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
 
-        return ChatResponse(
-            text=text,
-            tool_calls=tool_calls,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-        )
+            if not choices:
+                return ChatResponse(
+                    prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
+                )
+
+            message = choices[0].get("message", {})
+            text = message.get("content", "") or ""
+            tool_calls_raw = message.get("tool_calls") or []
+            tool_calls = [_tool_call_from_dict(tc) for tc in tool_calls_raw]
+
+            return ChatResponse(
+                text=text,
+                tool_calls=tool_calls,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
