@@ -275,7 +275,9 @@ def check_drift_guard() -> list[str]:
 
     Also checks, as the same "does the static harness config match
     modes.py truth" drift class:
-    - every registered tool belongs to at least one mode (no orphans)
+    - every registered tool belongs to at least one mode's tools tuple OR is
+      named in ``modes.CONDITIONAL_TOOLS`` (no orphans, no unlisted
+      conditional names, no conditional name redundantly already declared)
     - no mode declares an unknown tool name
     - mcp_server.py's five literal mode strings (passed positionally to
       _run_agent(...), read via AST since mcp_server.py deliberately does
@@ -288,11 +290,17 @@ def check_drift_guard() -> list[str]:
 
     failures: list[str] = []
     try:
-        from modes import MODES
+        from modes import CONDITIONAL_TOOLS, MODES
         import tools.registry as registry
 
         registry.discover()
         all_tool_names = set(registry._registry)
+
+        conditional_unknown = CONDITIONAL_TOOLS - all_tool_names
+        if conditional_unknown:
+            failures.append(
+                f"modes.CONDITIONAL_TOOLS names unregistered tool(s): {sorted(conditional_unknown)}"
+            )
 
         covered: set[str] = set()
         for mode_name, mode in MODES.items():
@@ -340,9 +348,21 @@ def check_drift_guard() -> list[str]:
 
             covered.update(mode.tools)
 
-        orphans = all_tool_names - covered
+        # A CONDITIONAL_TOOLS name is deliberately absent from every mode.tools
+        # tuple (see modes.py) — it is reachable only via activate_mode's
+        # extra_tools, opted in by a caller that knows the outside condition
+        # (main.py, for 'vision', on whether config.json has a vision block).
+        # Excluded from orphans for that reason, not because it is unreachable.
+        orphans = all_tool_names - covered - CONDITIONAL_TOOLS
         if orphans:
             failures.append(f"tool(s) registered but not reachable from any mode: {sorted(orphans)}")
+
+        conditional_redundant = CONDITIONAL_TOOLS & covered
+        if conditional_redundant:
+            failures.append(
+                f"modes.CONDITIONAL_TOOLS names {sorted(conditional_redundant)}, already present "
+                f"in a mode's static tools tuple — conditional membership is redundant there"
+            )
 
         # mcp_server.py's literal mode strings, read via AST (that file does
         # not import modes.py on purpose, so this is a real drift check, not

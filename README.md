@@ -57,7 +57,7 @@ Edit `config.json` and set the `llm` block to point at any OpenAI-compatible end
 }
 ```
 
-An optional `vision` block — a sibling of `llm`, with the same keys, pointing at a vision-capable endpoint — keeps images off the main model entirely: a screenshot taken in `verify` mode is sent to that provider alone and only its text description is spliced into the conversation, so a text-only main model can still drive a browser verification. Leave it out and screenshots are attached to the main model as before.
+An optional `vision` block — a sibling of `llm`, with the same keys, pointing at a vision-capable endpoint — keeps images off the main model entirely: a screenshot taken in `verify` mode is sent to that provider alone and only its text description is spliced into the conversation, so a text-only main model can still drive a browser verification. Configuring it also adds a `vision` tool, available in every mode, that the model can call on demand to ask about any local image file. Leave the block out and screenshots are attached to the main model as before, with no `vision` tool available.
 
 The rest of the config (linters, language servers, debug adapters) comes pre-filled with sensible defaults. See `config.example.json` for all options.
 

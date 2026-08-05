@@ -41,6 +41,20 @@ d. Every vision failure is loud: an unreachable endpoint and an empty
    row stating the image is NOT attached, never a silent fallback to pixels and
    never a row that lets the model believe it saw something.
 
+e. The on-demand ``vision`` tool (``tools/vision.py``) is advertised in every
+   mode's tool set when a ``vision`` block is configured, and in none when it is
+   not — the same conditional-registration mechanism (``modes.CONDITIONAL_TOOLS``,
+   ``registry.activate_mode``'s ``extra_tools``) main.py drives off ``cfg.vision``.
+
+f. A scripted call to the ``vision`` tool sends exactly ONE image to the VISION
+   stub alone, asking the configured vision model with no tools; the tool result
+   carries the stub's text verbatim; the MAIN stub sees zero requests. A
+   *question* argument reaches the provider's prompt.
+
+g. A vision-stub failure — HTTP 500, or 200 with empty content — makes the
+   ``vision`` tool return a loud ``ToolResult`` error, never a silent empty
+   success.
+
 Exits 0 on success, prints ``FAIL: <reason>`` to stderr and exits 1 otherwise.
 Runs with the repo root on ``sys.path`` (evals/run.py inserts it before exec'ing
 this file); it also adds the repo root itself if not already present, so the
@@ -111,9 +125,10 @@ class _ProviderServer(http.server.ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, reply_text: str) -> None:
+    def __init__(self, reply_text: str, status: int = 200) -> None:
         super().__init__(("127.0.0.1", 0), _ProviderHandler)
         self.reply_text = reply_text
+        self.status = status  # non-200 models a provider that is up but erroring
         self.requests: list[dict] = []
         self._lock = threading.Lock()
 
@@ -145,10 +160,21 @@ class _ProviderHandler(http.server.BaseHTTPRequestHandler):
         server: _ProviderServer = self.server  # type: ignore[assignment]
         server.record(body)
 
-        if body.get("stream"):
+        if server.status != 200:
+            self._respond_error(server.status)
+        elif body.get("stream"):
             self._respond_sse(server.reply_text)
         else:
             self._respond_json(server.reply_text)
+
+    def _respond_error(self, status: int) -> None:
+        payload = json.dumps({"error": "stub failure"}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
 
     def _respond_json(self, text: str) -> None:
         payload = json.dumps(
@@ -196,8 +222,8 @@ class _ProviderHandler(http.server.BaseHTTPRequestHandler):
 
 
 @contextlib.contextmanager
-def _serving(reply_text: str):
-    server = _ProviderServer(reply_text)
+def _serving(reply_text: str, status: int = 200):
+    server = _ProviderServer(reply_text, status=status)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -280,6 +306,12 @@ def _project(main_url: str, vision_url: str | None):
     reads back, so pointing it at this config is what makes the run use these
     stub endpoints — and is also why the repo's own config.json can never be
     reached from here, whatever it happens to contain.
+
+    Mirrors main.py's own translation from ``cfg.vision`` to
+    ``activate_mode``'s ``extra_tools``: the ``vision`` tool is opted into
+    "verify" here exactly when *vision_url* is not None, never unconditionally
+    — so a caller of this context manager gets the ``vision`` tool in the
+    active set if and only if a real config-driven launch would.
     """
     import tools.registry as registry
     from evals._stub import disable_memory_hooks
@@ -292,7 +324,8 @@ def _project(main_url: str, vision_url: str | None):
     cfg_path = tmp / "config.json"
     _write_config(cfg_path, main_url, vision_url)
     os.environ["CODING_AGENT_CONFIG"] = str(cfg_path)
-    registry.activate_mode("verify")
+    extra_tools: tuple[str, ...] = ("vision",) if vision_url is not None else ()
+    registry.activate_mode("verify", extra_tools=extra_tools)
     os.chdir(tmp)
     try:
         yield tmp, cfg_path
@@ -710,11 +743,204 @@ def check_vision_failures_are_loud() -> list[str]:
     return failures
 
 
+def check_vision_tool_conditional_per_mode() -> list[str]:
+    """e. 'vision' is advertised in every mode's tools iff config.vision is set.
+
+    Drives the same translation main.py performs (``cfg.vision is not None`` ->
+    ``extra_tools=("vision",)``) off two real configs, one per side, so this
+    checks the mechanism main.py actually calls, not just activate_mode's own
+    plumbing.
+    """
+    import tools.registry as registry
+    from config import load as config_load
+    from modes import MODES
+
+    failures: list[str] = []
+    saved_mode = registry.current_mode()
+    tmp = Path(tempfile.mkdtemp(prefix="vision-registration-"))
+    no_vision_cfg = tmp / "no-vision.json"
+    with_vision_cfg = tmp / "with-vision.json"
+    _write_config(no_vision_cfg, "http://main-host:1/v1", None)
+    _write_config(with_vision_cfg, "http://main-host:1/v1", "http://vision-host:2/v1")
+
+    try:
+        for mode_name in sorted(MODES):
+            cfg = config_load(no_vision_cfg)
+            extra: tuple[str, ...] = ("vision",) if cfg.vision is not None else ()
+            registry.activate_mode(mode_name, extra_tools=extra)
+            names = {s["function"]["name"] for s in registry.schemas()}
+            if "vision" in names:
+                failures.append(
+                    f"mode {mode_name!r} advertises 'vision' from a config with no "
+                    f"'vision' block — must be byte-identical to a build that never "
+                    f"shipped the tool"
+                )
+
+            cfg = config_load(with_vision_cfg)
+            extra = ("vision",) if cfg.vision is not None else ()
+            registry.activate_mode(mode_name, extra_tools=extra)
+            names = {s["function"]["name"] for s in registry.schemas()}
+            if "vision" not in names:
+                failures.append(
+                    f"mode {mode_name!r} does not advertise 'vision' from a config "
+                    f"WITH a 'vision' block"
+                )
+    finally:
+        if saved_mode is not None:
+            registry.activate_mode(saved_mode)
+
+    return failures
+
+
+def check_vision_tool_routes_one_image() -> list[str]:
+    """f. A scripted 'vision' tool call routes exactly one image to VISION alone."""
+    import tools.registry as registry
+    from session import Session
+
+    failures: list[str] = []
+    png_b64 = base64.b64encode(_png_bytes()).decode("ascii")
+
+    with _serving(_MAIN_TEXT) as main_stub, _serving(_VISION_TEXT) as vision_stub:
+        with _project(main_stub.base_url, vision_stub.base_url) as (tmp, _cfg_path):
+            session = Session(str(tmp), "main-model", "You are a verification agent.")
+            try:
+                (tmp / "photo.png").write_bytes(_png_bytes())
+
+                result = registry.dispatch("vision", {"image_path": "photo.png"})
+                if result.status != "success":
+                    failures.append(
+                        f"the vision tool call failed: {result.code} — {result.body!r}"
+                    )
+                    return failures
+                if result.body != _VISION_TEXT:
+                    failures.append(
+                        f"the tool result body is {result.body!r}, expected the "
+                        f"vision stub's text {_VISION_TEXT!r}"
+                    )
+
+                if len(vision_stub.requests) != 1:
+                    failures.append(
+                        f"the vision endpoint received {len(vision_stub.requests)} "
+                        f"request(s), expected exactly 1"
+                    )
+                    return failures
+                if main_stub.requests:
+                    failures.append(
+                        f"the main endpoint received {len(main_stub.requests)} "
+                        f"request(s) for an on-demand vision tool call"
+                    )
+
+                ask = vision_stub.requests[0]
+                parts = _image_parts(ask)
+                if len(parts) != 1:
+                    failures.append(
+                        f"the tool's describe request carries {len(parts)} image "
+                        f"part(s), expected exactly 1"
+                    )
+                else:
+                    url = (parts[0].get("image_url") or {}).get("url", "")
+                    if url != "data:image/png;base64," + png_b64:
+                        failures.append(
+                            "the tool's describe request's data URI is not the "
+                            f"target file's bytes: {url[:64]!r}…"
+                        )
+                if ask.get("model") != "vision-model":
+                    failures.append(
+                        f"the tool asked model {ask.get('model')!r}, not the "
+                        f"configured vision model"
+                    )
+                if ask.get("tools"):
+                    failures.append(
+                        f"the tool's describe call offered tools: {ask['tools']!r} "
+                        f"— it is a single-shot question, not a turn"
+                    )
+
+                # A *question* argument must reach the provider's prompt, not
+                # just swap in a differently-worded generic description.
+                result2 = registry.dispatch(
+                    "vision", {"image_path": "photo.png", "question": "What color is the pixel?"}
+                )
+                if result2.status != "success":
+                    failures.append(
+                        f"the vision tool call with a question failed: "
+                        f"{result2.code} — {result2.body!r}"
+                    )
+                elif "What color is the pixel?" not in _body_text(vision_stub.requests[-1]):
+                    failures.append(
+                        "the question argument never reached the vision provider's "
+                        f"prompt: {_body_text(vision_stub.requests[-1])!r}"
+                    )
+            finally:
+                session.close()
+
+    return failures
+
+
+def check_vision_tool_failures_are_loud() -> list[str]:
+    """g. A vision-stub failure (500, or 200/empty) is a loud tool error."""
+    import tools.registry as registry
+    from session import Session
+
+    failures: list[str] = []
+
+    with _serving(_MAIN_TEXT) as main_stub:
+        with _serving("", status=500) as failing_stub:
+            with _project(main_stub.base_url, failing_stub.base_url) as (tmp, _cfg_path):
+                session = Session(str(tmp), "main-model", "You are a verification agent.")
+                try:
+                    (tmp / "photo.png").write_bytes(_png_bytes())
+                    result = registry.dispatch("vision", {"image_path": "photo.png"})
+                    if result.status != "error":
+                        failures.append(
+                            f"a 500 from the vision stub produced status="
+                            f"{result.status!r}, body={result.body!r} — expected a "
+                            f"loud 'error', never a silent success"
+                        )
+                    elif not result.code:
+                        failures.append("a failed vision call carries no error code")
+                    if main_stub.requests:
+                        failures.append(
+                            f"the main endpoint received {len(main_stub.requests)} "
+                            f"request(s) while the vision call was failing"
+                        )
+                finally:
+                    session.close()
+
+        with _serving("") as blank_stub:
+            with _project(main_stub.base_url, blank_stub.base_url) as (tmp, _cfg_path):
+                session = Session(str(tmp), "main-model", "You are a verification agent.")
+                try:
+                    (tmp / "photo.png").write_bytes(_png_bytes())
+                    result = registry.dispatch("vision", {"image_path": "photo.png"})
+                    if result.status != "error":
+                        failures.append(
+                            f"an empty description from the vision stub produced "
+                            f"status={result.status!r}, body={result.body!r} — an "
+                            f"empty string must never read as a silent success"
+                        )
+                    elif not result.code:
+                        failures.append(
+                            "an empty-description vision call carries no error code"
+                        )
+                    if len(blank_stub.requests) != 1:
+                        failures.append(
+                            f"the blank vision endpoint saw "
+                            f"{len(blank_stub.requests)} request(s), expected 1"
+                        )
+                finally:
+                    session.close()
+
+    return failures
+
+
 CHECKS = [
     ("config-block-parses", check_config_block_parses),
     ("vision-takes-image-main-gets-text", check_vision_takes_image_main_gets_text),
     ("no-vision-block-keeps-pixels", check_no_vision_block_keeps_pixels),
     ("vision-failures-are-loud", check_vision_failures_are_loud),
+    ("vision-tool-conditional-per-mode", check_vision_tool_conditional_per_mode),
+    ("vision-tool-routes-one-image", check_vision_tool_routes_one_image),
+    ("vision-tool-failures-are-loud", check_vision_tool_failures_are_loud),
 ]
 
 
@@ -745,8 +971,10 @@ def main() -> int:
     print(
         "PASS: a configured vision provider takes the only copy of the image and "
         "returns text the main provider receives as prose, an unconfigured one "
-        "leaves the legacy pixel path byte-for-byte intact, and every vision "
-        "failure tells the model the image was never attached"
+        "leaves the legacy pixel path byte-for-byte intact, every vision failure "
+        "tells the model the image was never attached, and the on-demand vision "
+        "tool follows the same rules — conditional registration, one image routed "
+        "to VISION alone, loud on failure"
     )
     return 0
 

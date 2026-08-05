@@ -415,8 +415,14 @@ def main() -> None:
     print(ui.telemetry(f"config: {os.path.abspath(args.config)}"), file=sys.stderr)
 
     discover()
+    # 'vision' is a conditional tool (modes.CONDITIONAL_TOOLS): it exists in no
+    # mode's static tuple, so a config with no 'vision' block activates a mode
+    # exactly as it did before this tool existed. Opting it in here, at the one
+    # place cfg is known, is what makes that byte-identical-when-unconfigured
+    # guarantee real rather than assumed.
+    vision_extra: tuple[str, ...] = ("vision",) if cfg.vision is not None else ()
     try:
-        activate_mode(args.mode)
+        activate_mode(args.mode, extra_tools=vision_extra)
     except ValueError as exc:
         print(ui.error(str(exc)), file=sys.stderr)
         sys.exit(2)

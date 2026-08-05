@@ -104,6 +104,20 @@ def _collapse_persisted_images(messages: List[Dict[str, Any]]) -> None:
         entry["content"] = f"{label} {placeholder}".strip() if label else placeholder
 
 
+# The process-wide "current" Session, set by the constructor below. Single-
+# session app (mirrors the module-global pattern tools.registry uses for the
+# active mode — see its ``_active_mode`` comment): exactly one Session drives
+# a process, so "most recently constructed" is "the current one". Lets a tool
+# that needs to bill against session usage (the on-demand ``vision`` tool)
+# reach the session without threading it through every tool's ``run()``.
+_current: "Session | None" = None
+
+
+def current() -> "Session | None":
+    """Return this process's Session, or None before one has been constructed."""
+    return _current
+
+
 class Session:
     """A conversation transcript stored with full fidelity on disk.
 
@@ -216,6 +230,9 @@ class Session:
         self._stats_run_started: float = time.monotonic()
 
         session_lock.acquire(self._lock_path, self.session_id)
+
+        global _current
+        _current = self
 
     @classmethod
     def resume(

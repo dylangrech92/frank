@@ -2,7 +2,8 @@
 
 A mode fixes the exact tool set placed in the request ``tools`` array (full
 schemas, from turn 0) and the instruction block prepended to the system
-message. There is no tool discovery: the tools named here are the complete
+message. There is no tool discovery: the tools named here, plus whatever
+``CONDITIONAL_TOOLS`` the launcher opts into (see below), are the complete
 toolset for that mode, and nothing else is ever callable.
 """
 
@@ -18,6 +19,20 @@ class Mode:
     name: str
     instructions: str
     tools: tuple[str, ...]
+
+
+# Tools that exist in every mode's *reach* but not in any mode's static
+# ``tools`` tuple above — membership depends on something outside modes.py
+# entirely, so it cannot be baked into a fixed-at-import-time tuple. Today
+# this is exactly one tool: ``vision``, gated on whether config.json carries a
+# ``vision`` block (tools/vision.py, config.Config.vision). A caller opts a
+# name in via ``activate_mode(name, extra_tools=(...))``; leaving extra_tools
+# empty (the default) is what keeps a config with no vision block byte-
+# identical to a build that never shipped the tool. Recorded here so the
+# drift guard (evals/mode_wiring.py's orphan check) knows a name absent from
+# every mode.tools tuple is this, deliberately, and not a registered tool no
+# mode can ever reach.
+CONDITIONAL_TOOLS: frozenset[str] = frozenset({"vision"})
 
 
 # Tools available in every mode. Memory tools (recall/remember/record/forget)
@@ -157,7 +172,7 @@ Workflow:
    action that mutates the DOM: refs go stale the moment the page changes.
 5. Gather DETERMINISTIC evidence first: snapshot state, console_logs,
    network_requests statuses, the current URL, http_request for direct API
-   cross-checks.  Reach for vision only when the claim is inherently visual.
+   cross-checks.  Reach for a screenshot only when the claim is inherently visual.
 6. Choose each verdict from the EVIDENCE, not from how the brief is framed:
    'pass' needs evidence you captured THIS run that the behavior is correct;
    'fail' needs evidence that the asserted condition is false — the behavior is

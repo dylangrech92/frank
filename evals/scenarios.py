@@ -613,7 +613,12 @@ SCENARIOS: list[dict] = [
             "Without the block the vision endpoint is never called and the image "
             "reaches the main provider exactly as before. Every vision failure — "
             "unreachable endpoint, empty description — appends a row stating the "
-            "image is NOT attached instead of falling back to pixels."
+            "image is NOT attached instead of falling back to pixels. Also covers "
+            "the on-demand 'vision' tool: advertised in every mode iff the block "
+            "is configured, in none when it is not; a scripted call routes exactly "
+            "one image to the vision stub alone and returns its text; a stub "
+            "failure (500 or empty content) is a loud tool error, never a silent "
+            "success."
         ),
         "inline": "vision_provider_contract.py",
     },

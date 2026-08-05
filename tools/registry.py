@@ -173,31 +173,42 @@ def discover() -> None:
             _registry[instance.name] = instance
 
 
-def activate_mode(name: str) -> tuple[str, ...]:
+def activate_mode(name: str, extra_tools: tuple[str, ...] = ()) -> tuple[str, ...]:
     """Activate mode *name*, replacing the active tool set wholesale.
 
     Auto-discovers if the registry has not been populated yet, then verifies
-    every tool the mode names actually resolves in ``_registry`` — an unknown
-    name raises ``ValueError`` naming both the mode and the bad name, since a
-    mode referencing a tool that does not exist is a harness bug, not a
-    runtime condition to degrade gracefully from. Idempotent: reactivating the
-    same (or another) mode simply recomputes the active set.
+    every tool the mode names — plus every name in *extra_tools* — actually
+    resolves in ``_registry``; an unknown name raises ``ValueError`` naming
+    both the mode and the bad name, since a mode referencing a tool that does
+    not exist is a harness bug, not a runtime condition to degrade gracefully
+    from. Idempotent: reactivating the same (or another) mode simply
+    recomputes the active set.
 
     Args:
         name: A key of ``modes.MODES``.
+        extra_tools: Names to add to *name*'s static tool set for this
+            activation only — how a tool whose availability depends on
+            something outside modes.py (see ``modes.CONDITIONAL_TOOLS``, e.g.
+            ``vision`` gated on config.json's optional ``vision`` block) gets
+            into the active set without being baked into every mode's fixed
+            tuple. Empty (the default) reproduces the mode's tools exactly as
+            declared — the byte-identical-when-unconfigured guarantee lives in
+            the caller passing nothing here, not in this function guessing.
 
     Returns:
-        The mode's tool names, in the order declared in ``modes.py``.
+        The active tool names: *name*'s declared tools followed by any of
+        *extra_tools* not already among them, in that order.
 
     Raises:
-        ValueError: If *name* is not a known mode, or if the mode names a
-            tool that is not registered.
+        ValueError: If *name* is not a known mode, or if the mode or
+            *extra_tools* names a tool that is not registered.
     """
     if not _registry:
         discover()
 
     mode = get_mode(name)
-    unknown = [t for t in mode.tools if t not in _registry]
+    tool_names = mode.tools + tuple(t for t in extra_tools if t not in mode.tools)
+    unknown = [t for t in tool_names if t not in _registry]
     if unknown:
         raise ValueError(
             f"mode {name!r} names unknown tool(s): {', '.join(unknown)}"
@@ -205,8 +216,8 @@ def activate_mode(name: str) -> tuple[str, ...]:
 
     global _active_mode, _active_tools
     _active_mode = mode.name
-    _active_tools = frozenset(mode.tools)
-    return mode.tools
+    _active_tools = frozenset(tool_names)
+    return tool_names
 
 
 def current_mode() -> str | None:
