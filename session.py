@@ -206,13 +206,8 @@ class Session:
         # results) instead of re-estimating the whole transcript. Reset to
         # None by the caller whenever compaction reshapes the assembled
         # context, since the recorded length no longer lines up.
-        # ``token_estimate_ratio`` is an EMA (alpha 0.3) of observed
-        # real/estimated ratios, seeded neutral at 1.0, that calibrates the
-        # fallback chars/4-or-tiktoken estimator toward the provider's actual
-        # tokenizer over the life of the session.
         self.last_prompt_tokens: int | None = None
         self.last_prompt_context_len: int = 0
-        self.token_estimate_ratio: float = 1.0
         # Per-turn execution report (files changed, verification runs, gate
         # outcome, usage) written by the agent loop at the start of every
         # turn; consumed by one-shot ``--json`` mode to build the S4 result

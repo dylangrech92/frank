@@ -37,25 +37,21 @@ def _record_llm_usage(
 ) -> None:
     """Fold a completed chat response's token usage into session + turn stats.
 
-    S2 calibration (real ``prompt_tokens`` vs the estimate, remembered together
-    with where this context ended so the next trigger check can compose real +
-    delta), S4 per-turn usage accumulation on ``turn_report``, and the
-    cumulative stats.json row. Usage fields stay ``None`` all turn on providers
-    that never report usage.
+    S2 real ``prompt_tokens`` usage remembered together with where this context
+    ended so the next trigger check can compose real + delta, S4 per-turn usage
+    accumulation on ``turn_report``, and the cumulative stats.json row. Usage
+    fields stay ``None`` all turn on providers that never report usage.
     """
     if response.prompt_tokens is not None:
-        # S2 — calibrate the fallback estimator toward this request's real
-        # usage, then remember it (plus where this context ended) so the next
-        # pre-flight trigger check can compose real + delta instead of
-        # re-estimating the whole transcript from scratch.
-        compaction.update_calibration(session, response.prompt_tokens, est)
+        # S2 — remember the real prompt_tokens (plus where this context ended)
+        # so the next pre-flight trigger check can compose real + delta instead
+        # of re-estimating the whole transcript from scratch.
         session.last_prompt_tokens = response.prompt_tokens
         session.last_prompt_context_len = len(context)
         print(
             ui.telemetry(
                 f"usage: actual prompt_tokens={response.prompt_tokens} "
-                f"vs estimated ~{est} tokens (delta {response.prompt_tokens - est:+d}) "
-                f"[ema {session.token_estimate_ratio:.2f}]"
+                f"vs estimated ~{est} tokens (delta {response.prompt_tokens - est:+d})"
             ),
             file=sys.stderr,
         )
@@ -108,7 +104,6 @@ def _run_llm_with_compaction(
     (already delivered to the transcript/on_delta) when compaction is exhausted
     — the caller returns that string as the turn's answer.
     """
-    max_compactions = 5
     # Thrash guard: bail out of the summarizer loop after this many consecutive
     # compactions that failed to reduce the context (further calls won't
     # converge) and fall through to the force_fold last resort.
@@ -133,13 +128,13 @@ def _run_llm_with_compaction(
             print(
                 ui.telemetry(
                     f"trigger: ~{trigger} tokens (real {session.last_prompt_tokens} "
-                    f"+ calibrated delta, ema {session.token_estimate_ratio:.2f})"
+                    f"+ delta)"
                 ),
                 file=sys.stderr,
             )
         non_shrink_streak = 0
         while trigger > state.cap:
-            if state.compactions >= max_compactions or not compaction.compact(
+            if not compaction.compact(
                 session, client, state.window, state.comp_cfg
             ):
                 # Summarization exhausted (budget or nothing foldable) — break
@@ -219,7 +214,7 @@ def _run_llm_with_compaction(
         except OverCapError:
             # Provider rejected on length despite the estimate — compact and
             # retry; if summarization can't help, fall back to force_fold.
-            if state.compactions < max_compactions and compaction.compact(
+            if compaction.compact(
                 session, client, state.window, state.comp_cfg
             ):
                 state.compactions += 1

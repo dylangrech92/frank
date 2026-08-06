@@ -126,28 +126,25 @@ def trigger_estimate(
 ) -> int:
     """Return the compaction-trigger signal for the assembled *context*.
 
-    ``prompt_tokens`` from the most recent provider response only measures the
-    prompt of *that* request — the context has grown since (that response's
-    own text plus whatever tool results followed it). So when a real
-    measurement is available, the signal is composed as::
+    ``prompt_tokens`` from the most recent provider response is a real
+    measurement of that request's prompt size. The context has grown since
+    (that response's own text plus whatever tool results followed it), so when
+    a real measurement is available the signal is composed as::
 
-        trigger = last_real_prompt_tokens + calibrated_estimate(messages appended since)
+        trigger = last_real_prompt_tokens + estimate_tokens(messages appended since)
 
     rather than trusting the real number alone (stale) or re-estimating the
     whole transcript (throws away the real measurement). ``session``'s
     ``last_prompt_context_len`` marks where that measurement's context ended;
-    everything in *context* beyond it is new and only estimated. The estimate
-    of that delta (and the whole-context fallback estimate below) is scaled by
-    ``session.token_estimate_ratio``, the EMA-calibrated real/estimated ratio,
-    so both paths drift toward the provider's real tokenizer over time.
+    everything in *context* beyond it is new and only estimated.
 
-    Falls back to the plain (calibrated) estimate of the whole context when no
-    real measurement exists yet, or when the recorded baseline no longer fits
+    Falls back to the plain estimate of the whole context when no real
+    measurement exists yet, or when the recorded baseline no longer fits
     *context* (e.g. right after a compaction reshaped it — callers reset
     ``last_prompt_tokens`` to None in that case).
 
     Args:
-        session: The active Session carrying the usage/calibration state.
+        session: The active Session carrying the usage state.
         context: The just-assembled message list for the upcoming request.
         tools: Tool schemas for the upcoming request (counted in the fallback
             estimate; omitted from the delta estimate since the real
@@ -161,33 +158,9 @@ def trigger_estimate(
         and session.last_prompt_context_len <= len(context)
     ):
         new_messages = context[session.last_prompt_context_len:]
-        delta_est = estimate_tokens(new_messages) if new_messages else 0
-        return session.last_prompt_tokens + int(delta_est * session.token_estimate_ratio)
+        return session.last_prompt_tokens + (estimate_tokens(new_messages) if new_messages else 0)
 
-    return int(estimate_tokens(context, tools) * session.token_estimate_ratio)
-
-
-def update_calibration(
-    session: "Session", real_tokens: int, estimated_tokens: int, alpha: float = 0.3
-) -> None:
-    """Update the session's real-vs-estimate EMA ratio with a new observation.
-
-    Skipped when *estimated_tokens* is non-positive (nothing to divide by;
-    the ratio stays at its previous value until a usable observation arrives).
-
-    Args:
-        session: The active Session whose ``token_estimate_ratio`` is updated.
-        real_tokens: The real ``prompt_tokens`` reported for a request.
-        estimated_tokens: The raw (uncalibrated) estimate computed for the
-            same request's assembled context.
-        alpha: EMA smoothing factor; higher weighs the new observation more.
-    """
-    if estimated_tokens <= 0:
-        return
-    observed_ratio = real_tokens / estimated_tokens
-    session.token_estimate_ratio = (
-        alpha * observed_ratio + (1 - alpha) * session.token_estimate_ratio
-    )
+    return estimate_tokens(context, tools)
 
 
 def compute_cap(window: int, compaction_cfg: Dict[str, Any] | None = None) -> int:
@@ -219,16 +192,22 @@ def compute_cap(window: int, compaction_cfg: Dict[str, Any] | None = None) -> in
 # ---------------------------------------------------------------------------
 
 
-COMPACTION_SYSTEM_PROMPT = """You are compacting a long software-engineering conversation so it fits the model's context window. Produce a faithful, information-dense summary of everything so far, organized into EXACTLY these six sections, each under its exact markdown heading and in this order:
+COMPACTION_SYSTEM_PROMPT = """You are handing off the current engineering task to the next agent. That agent will ONLY have this summary as the source of info regarding the conversation; anything not written here is forgotten. Condense everything necessary so work continues without missing a beat.
+
+Input (when present):
+- "Previous summary of even earlier turns" — your last memory. Carry it forward; change only what the new turns change. If absent, you are the first to compact this session.
+- "Conversation since that summary" — the turns since then. Reference only; never reply to them or address the user.
+
+Produce one living document with these sections, each under its exact markdown heading and in this order:
 
 ## Task
 The user's overall goal(s) and any explicit requirements or constraints.
 
 ## State
-What has been accomplished so far and the current state of the work.
+What has been accomplished so far and the current state of the work — only what is relevant to active work.
 
 ## Files-touched
-Every file created, edited, or examined, each with a one-line note on what changed or why it mattered. Preserve exact paths.
+Every file created, edited, or examined, each with a one-line note on what changed or why it mattered. Exact paths, verbatim.
 
 ## Open
 Unresolved problems, TODOs, failing tests, or questions still outstanding.
@@ -237,9 +216,15 @@ Unresolved problems, TODOs, failing tests, or questions still outstanding.
 Key technical decisions taken and the reasoning behind them.
 
 ## Last
-What was happening most recently, in enough detail that work can resume seamlessly.
+What was happening most recently and the immediate next step — in enough detail that work resumes seamlessly.
 
-Rules: keep exact file paths, function/class names, error messages, and concrete values. Drop pleasantries and repetition. Never invent anything that is not present in the conversation. Output only the six sections."""
+Rules:
+- Include verbatim any identifier needed to continue: file paths, function/class names, error messages, shell commands, URLs, IDs, key values. Never paraphrase these.
+- Acknowledge failed attempts and dead ends in terse bullets so the next agent does not retry them.
+- Omit any section that is empty or describes fully-resolved, settled work — the next agent should see only what it needs to continue.
+- Never invent anything not present in the conversation.
+- Before outputting, draft the summary in your thinking space and collapse it to the tersest version that keeps every identifier and open thread.
+- Output ONLY the document."""
 
 
 # How many trailing messages compaction preserves verbatim. Everything older —
@@ -290,7 +275,7 @@ def _fold_boundary(
     messages: List[Dict[str, Any]],
     summary_covers: int,
     keep_recent: int,
-    budget: int,
+    budget: int | None,
 ) -> int | None:
     """Choose the fold boundary: summarize ``[summary_covers:cut]``, keep ``[cut:]``.
 
@@ -310,7 +295,7 @@ def _fold_boundary(
         messages: The full ``session._messages`` list.
         summary_covers: Watermark — messages before this are already summarized.
         keep_recent: Minimum number of trailing messages to preserve verbatim.
-        budget: Token ceiling for the region handed to the summarizer.
+        budget: Token ceiling for the region handed to the summarizer, or ``None`` for no ceiling (``force_fold``).
 
     Returns:
         The exclusive fold boundary ``cut`` (``> summary_covers``), or ``None``
@@ -326,7 +311,7 @@ def _fold_boundary(
         tokens = estimate_tokens([messages[i]])
         # Always fold at least one message (a lone over-budget row cannot be
         # split); otherwise stop once adding the next row would breach budget.
-        if total + tokens > budget and cut > summary_covers:
+        if budget is not None and total + tokens > budget and cut > summary_covers:
             break
         total += tokens
         cut = i + 1
@@ -461,9 +446,10 @@ def force_fold(session: "Session", compaction_cfg=None) -> bool:
     cfg = compaction_cfg or {}
     keep_recent = int(cfg.get("force_keep_recent_messages", DEFAULT_FORCE_KEEP_RECENT))
     msgs = session._messages
-    # No summarizer call, so no input budget — fold as far as _fold_boundary
-    # allows (it still walks the boundary back off an orphaning tool row).
-    cut = _fold_boundary(msgs, session._summary_covers, keep_recent, float("inf"))
+    # No summarizer call, so no input budget — pass None so _fold_boundary
+    # imposes no ceiling (there is no summarizer call). The boundary still walks
+    # back off an orphaning tool row.
+    cut = _fold_boundary(msgs, session._summary_covers, keep_recent, None)
     if cut is None:
         return False
     session.set_summary(session._summary or _FORCE_FOLD_MARKER, cut)

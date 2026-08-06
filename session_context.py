@@ -4,6 +4,13 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List
 
+_HANDOVER_FRAME = (
+    "You hit your context limit mid-task and are continuing the same task "
+    "— this is not a new conversation. The summary below is the hand-over "
+    "from your earlier work. Trust it: do not re-verify or repeat completed "
+    "work; resume from the ## Last and ## Open sections.\n\n"
+)
+
 
 def _prune_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Collapse completed prior turns to ``[user, final answer]`` for the sent view.
@@ -110,7 +117,8 @@ def assemble_context(
 
     if session._summary:
         content = (
-            "Summary of the earlier conversation "
+            _HANDOVER_FRAME
+            + "Summary of the earlier conversation "
             "(older turns compacted to fit context):\n\n" + session._summary
         )
         # When compaction has folded the current turn's own user message into
