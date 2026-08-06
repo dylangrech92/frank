@@ -77,6 +77,34 @@ def _record_llm_usage(
     )
 
 
+def _remeasure(
+    session: Session,
+    state: "_TurnState",
+    tool_schemas: list[dict],
+    step: str | None = None,
+) -> tuple[list[dict], int, int]:
+    """Re-assemble the context and re-estimate its token signal.
+
+    The single measurement atom used at the top of each loop pass and after
+    every compaction/force-fold step. Returns the assembled ``context``, its
+    raw ``estimate_tokens`` figure, and the ``trigger_estimate`` to compare
+    against ``state.cap``. ``step`` tags the telemetry line with the step
+    counter (``"post-compaction"`` / ``"force-fold"``) or is ``None`` for the
+    plain pre-flight measurement.
+    """
+    context = session.assemble_context()
+    est = compaction.estimate_tokens(context, tool_schemas)
+    trigger = compaction.trigger_estimate(session, context, tool_schemas)
+    tag = "" if step is None else f" [{step} #{state.compactions}]"
+    print(
+        ui.telemetry(
+            f"context: {len(context)} messages, ~{est} tokens (cap {state.cap}){tag}"
+        ),
+        file=sys.stderr,
+    )
+    return context, est, trigger
+
+
 def _run_llm_with_compaction(
     session: Session,
     client: LLMClient,
@@ -113,17 +141,11 @@ def _run_llm_with_compaction(
     while True:
         # Pre-flight: keep the assembled request at or below the shared cap,
         # compacting older turns before the call is ever made.
-        context = session.assemble_context()
-        est = compaction.estimate_tokens(context, tool_schemas)
+        context, est, trigger = _remeasure(session, state, tool_schemas)
         # S2 — usage-driven trigger: real prompt_tokens from the last response
-        # (plus a calibrated estimate of what was appended since) when
-        # available, otherwise the calibrated fallback estimate. See
+        # plus an estimate of what was appended since, when available;
+        # otherwise the plain whole-context estimate. See
         # compaction.trigger_estimate for the composition rationale.
-        trigger = compaction.trigger_estimate(session, context, tool_schemas)
-        print(
-            ui.telemetry(f"context: {len(context)} messages, ~{est} tokens (cap {state.cap})"),
-            file=sys.stderr,
-        )
         if session.last_prompt_tokens is not None:
             print(
                 ui.telemetry(
@@ -142,20 +164,10 @@ def _run_llm_with_compaction(
                 break
             state.compactions += 1
             # Compaction reshaped the assembled context (summary spliced in),
-            # so the prior real-usage baseline's index no longer lines up —
-            # fall back to the calibrated estimate until the next response.
+            # so the prior real-usage baseline's index no longer lines up.
             session.last_prompt_tokens = None
-            context = session.assemble_context()
-            est = compaction.estimate_tokens(context, tool_schemas)
             prev_trigger = trigger
-            trigger = compaction.trigger_estimate(session, context, tool_schemas)
-            print(
-                ui.telemetry(
-                    f"context: {len(context)} messages, ~{est} tokens "
-                    f"(cap {state.cap}) [post-compaction #{state.compactions}]"
-                ),
-                file=sys.stderr,
-            )
+            context, est, trigger = _remeasure(session, state, tool_schemas, "post-compaction")
             # Thrash guard: stop paying for summarizer calls that aren't
             # reducing the context. Two consecutive no-reduction compactions
             # mean further calls won't converge — fall through to force_fold.
@@ -172,16 +184,7 @@ def _run_llm_with_compaction(
         if trigger > state.cap and compaction.force_fold(session, state.comp_cfg):
             state.compactions += 1
             session.last_prompt_tokens = None
-            context = session.assemble_context()
-            est = compaction.estimate_tokens(context, tool_schemas)
-            trigger = compaction.trigger_estimate(session, context, tool_schemas)
-            print(
-                ui.telemetry(
-                    f"context: {len(context)} messages, ~{est} tokens "
-                    f"(cap {state.cap}) [force-fold #{state.compactions}]"
-                ),
-                file=sys.stderr,
-            )
+            context, est, trigger = _remeasure(session, state, tool_schemas, "force-fold")
         if trigger > state.cap:
             return _over_cap_giveup(session, state, on_delta)
 
